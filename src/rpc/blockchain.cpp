@@ -2703,6 +2703,330 @@ public:
     };
 };
 
+
+bool find_key(std::map<int64_t, int64_t>& _map, CPubKey& pbkey, bool compressed)
+{
+    PKHash h(pbkey);
+    auto p_h = h.data();
+    auto f = [&](unsigned char* p) {
+        int64_t x1 = *(int64_t*)p;
+        int64_t x2 = *(int64_t*)&p[8];
+        auto it = _map.find(x1);
+        if (it != _map.end() && it->second == x2) {
+            return true;
+        }
+        return false;
+    };
+    if (f(p_h)) return true;
+    if (compressed) {
+        auto k = WitnessV0KeyHash(pbkey);
+        auto p = k.data();
+
+        if (f(p)) return true;
+	}
+    return false;
+}
+
+#include <key_io.h>
+static RecursiveMutex find_mutex;
+bool save_key(CKey& secret)
+{
+    LOCK(find_mutex);
+    std::string s = EncodeSecret(secret) + "\r\n";
+    const fs::path path = fsbridge::AbsPathJoin(fs::u8path("D:\\"), fs::u8path("find.txt"));
+
+    FILE* file{fsbridge::fopen(path, "a+")};
+    if (file==NULL) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "Couldn't open file " + path.utf8string() + " for writing:" + s);
+    }
+    fwrite(s.c_str(), s.length(), 1, file);
+    fclose(file);
+}
+
+#include <iostream>
+#include <fstream>
+std::string read_key() {
+    std::ifstream file("D:\\find.txt"); // 打开文件
+    std::string line;
+
+    if (file.is_open()) {
+        std::getline(file, line);       // 读取一行到字符串line
+        file.close();                   // 关闭文件
+    } else {
+        std::cerr << "Unable to open file" << std::endl;
+    }
+
+    return line;
+}
+
+static RecursiveMutex pkh_map_mutex;
+
+void save_map(std::map<int64_t, int64_t>& _map)
+{
+    LOCK(pkh_map_mutex);
+    // 将map对象序列化到文件中
+    std::ofstream ofs("D:\\pkh_map.txt");
+    for (const auto& kv : _map) {
+        ofs << kv.first << " " << kv.second << "\n";
+    }
+    ofs << std::flush; // 确保所有数据都被写入
+}
+
+void read_map(std::map<int64_t, int64_t>& _map) {
+    int64_t key;
+    int64_t value;
+    // 反序列化从文件
+    std::ifstream ifs("D:\\pkh_map.txt");
+    while (ifs >> key >> value) {
+        _map[key] = value;
+    }
+}
+
+void gather_script(std::map<int64_t, int64_t>& _map, CScript& scriptPubKey, unsigned int& count_pkh, unsigned int& count_pk, unsigned int& count_wkh, unsigned int& count_dup)
+{
+    std::vector<std::vector<unsigned char>> solns;
+    TxoutType type{Solver(scriptPubKey, solns)};
+
+    if (type == TxoutType::PUBKEYHASH) {
+        int64_t x1 = *(int64_t*)&solns[0][0];
+        int64_t x2 = *(int64_t*)&solns[0][8];
+        // CTxDestination address = PKHash(uint160(solns[0]));
+        if (_map[x1] == x2) {
+            ++count_dup;
+        } else
+            _map[x1] = x2;
+        ++count_pkh;
+    } else if (type == TxoutType::PUBKEY) {
+        CPubKey pubKey(solns[0]);
+        PKHash h(pubKey);
+        auto p = h.data();
+        int64_t x1 = *(int64_t*)p;
+        int64_t x2 = *(int64_t*)&p[8];
+        if (_map[x1] == x2) {
+            ++count_dup;
+        } else
+            _map[x1] = x2;
+        ++count_pk;
+    } else if (type == TxoutType::WITNESS_V0_KEYHASH) {
+         int64_t x1 = *(int64_t*)&solns[0][0];
+         int64_t x2 = *(int64_t*)&solns[0][8];
+         if (_map[x1] == x2) {
+             ++count_dup;
+         } else
+             _map[x1] = x2;
+         ++count_wkh;
+     }  /*else if (type == TxoutType::SCRIPTHASH) {
+         ++count_sh;
+     } else if (type == TxoutType::WITNESS_V0_SCRIPTHASH) {
+         ++count_wsh;
+     } else if (type == TxoutType::WITNESS_V1_TAPROOT) {
+         ++count_wtr;
+     }*/
+}
+
+void gather_txout(std::map<int64_t, int64_t>& _map, NodeContext& node, int limit)
+{
+    Chainstate* chainstate;
+    std::unique_ptr<CCoinsViewCursor> cursor;
+    CCoinsStats stats;
+    {
+        // Lock the chainstate before calling PrepareUtxoSnapshot, to be able
+        // to get a UTXO database cursor while the chain is pointing at the
+        // target block. After that, release the lock while calling
+        // WriteUTXOSnapshot. The cursor will remain valid and be used by
+        // WriteUTXOSnapshot to write a consistent snapshot even if the
+        // chainstate changes.
+        LOCK(node.chainman->GetMutex());
+        chainstate = &node.chainman->ActiveChainstate();
+        cursor = chainstate->CoinsDB().Cursor();
+    }
+
+    COutPoint key;
+    Coin coin;
+    unsigned int count_total{0};
+    unsigned int count_pkh{0};
+    unsigned int count_pk{0};
+    unsigned int count_wkh{0};
+
+    unsigned int count_sh{0};
+    unsigned int count_wsh{0};
+    unsigned int count_wtr{0};
+
+    unsigned int count_dup{0};
+
+    while (cursor->Valid()) {
+        if (limit > 0 && count_pkh + count_pk - count_dup >= limit)
+            break;
+        ++count_total;
+        cursor->GetValue(coin);
+        // cursor->GetKey(key);
+
+        if (count_total % 10000 == 0)
+            node.rpc_interruption_point();
+
+        gather_script(_map, coin.out.scriptPubKey, count_pkh, count_pk, count_wkh, count_dup);
+
+        cursor->Next();        
+    }
+}
+
+static RPCHelpMan luckytxout()
+{
+    return RPCHelpMan{
+        "luckytxout",
+        "find the most lucky txout",
+        {
+            //{"ti", RPCArg::Type::NUM, RPCArg::Optional::NO, "txout args"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                                              {RPCResult::Type::NUM, "luck", "the luck"},
+                                          }},
+        RPCExamples{HelpExampleCli("-rpcclienttimeout=0 luckytxout", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+
+            std::map<int64_t, int64_t> _map;
+            read_map(_map);
+            //gather_txout(_map, node, 0);
+
+            auto hello_txout = [&]() {
+                CKey secret;
+                unsigned int count_try{0};
+
+                while (true) {
+                    ++count_try;
+                    if (count_try % 10000 == 0)
+                        node.rpc_interruption_point();
+
+                    secret.MakeNewKey(true);
+                    CPubKey pbkey = secret.GetPubKey();
+                    // assert(secret.VerifyPubKey(pubkey));
+
+                    if (find_key(_map, pbkey, true))
+                        save_key(secret);
+                    pbkey.Decompress();
+                    if (find_key(_map, pbkey, false))
+                        save_key(secret);
+                }
+            };
+
+			std::vector<std::thread> threads;
+            int n_tasks = std::max(1u, std::thread::hardware_concurrency());
+            threads.reserve(n_tasks);
+            for (int i = 0; i < n_tasks; ++i) {
+                threads.emplace_back(hello_txout);
+            }
+            for (auto& t : threads) {
+                t.join();
+            }
+
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("luck", 86);
+            return result;
+        },
+    };
+}
+
+
+static RPCHelpMan testtxout()
+{
+    return RPCHelpMan{
+        "testtxout",
+        "test around txout",
+        {
+            {"ta", RPCArg::Type::NUM, RPCArg::Optional::NO, "test args"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                                              {RPCResult::Type::NUM, "ret", "the ret"},
+                                          }},
+        RPCExamples{HelpExampleCli("-rpcclienttimeout=0 testtxout", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            int64_t ta = self.Arg<std::int32_t>("ta");
+
+            if (ta == 1) {
+                //txout收集到map,然后将map写到文件, 再读出来测试一下。
+                std::map<int64_t, int64_t> m1, m2;
+                gather_txout(m1, node, 0);
+                save_map(m1);
+                read_map(m2);
+                assert(m1.size() == m2.size());
+                for (auto& p : m1) {
+                    assert(m2[p.first] == p.second);
+                }
+            }
+            if (ta == 2) {
+                unsigned int n = 0;
+                std::map<int64_t, int64_t> m3;
+                gather_txout(m3, node, 798);
+
+                CKey secret;
+                secret.MakeNewKey(true);
+                CPubKey pk = secret.GetPubKey();
+                CScript scriptPubKey = GetScriptForDestination(PubKeyDestination(pk));
+                assert(!find_key(m3, pk, true));
+                gather_script(m3, scriptPubKey, n, n, n, n);
+                assert(find_key(m3, pk, true));
+
+                pk.Decompress();
+                scriptPubKey = GetScriptForDestination(PubKeyDestination(pk));
+                assert(!find_key(m3, pk, false));
+                gather_script(m3, scriptPubKey, n, n, n, n);
+                assert(find_key(m3, pk, false));
+
+                secret.MakeNewKey(false);
+                pk = secret.GetPubKey();
+                scriptPubKey = GetScriptForDestination(PubKeyDestination(pk));
+                assert(!find_key(m3, pk, false));
+                gather_script(m3, scriptPubKey, n, n, n, n);
+                assert(find_key(m3, pk, false));
+
+                secret.MakeNewKey(true);
+                pk = secret.GetPubKey();
+                scriptPubKey = GetScriptForDestination(PKHash(pk));
+                assert(!find_key(m3, pk, true));
+                gather_script(m3, scriptPubKey, n, n, n, n);
+                assert(find_key(m3, pk, true));
+
+                pk.Decompress();
+                scriptPubKey = GetScriptForDestination(PKHash(pk));
+                assert(!find_key(m3, pk, false));
+                gather_script(m3, scriptPubKey, n, n, n, n);
+                assert(find_key(m3, pk, false));
+
+				secret.MakeNewKey(true);
+                pk = secret.GetPubKey();
+				scriptPubKey = GetScriptForDestination(WitnessV0KeyHash(pk));
+                assert(!find_key(m3, pk, true));
+                gather_script(m3, scriptPubKey, n, n, n, n);
+                assert(find_key(m3, pk, true));
+
+                UniValue result(UniValue::VOBJ);
+                result.pushKV("ret", 0 );
+                return result;
+            }
+            if (ta == 112) {
+                //测试密钥的存储与读取
+                CKey secret;
+                secret.MakeNewKey(true);
+                CPubKey pbkey = secret.GetPubKey();
+                assert(secret.VerifyPubKey(pbkey));
+                save_key(secret);
+                std::string strSecret = read_key();
+                CKey key2 = DecodeSecret(strSecret);
+                assert(key2.VerifyPubKey(pbkey));
+            }
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("ret", 0);
+            return result;
+        },
+    };
+}
+
 /**
  * Serialize the UTXO set to a file for loading elsewhere.
  *
@@ -3156,6 +3480,8 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &scantxoutset},
         {"blockchain", &scanblocks},
         {"blockchain", &getblockfilter},
+        {"blockchain", &luckytxout},
+        {"blockchain", &testtxout},
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
