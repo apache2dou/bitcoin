@@ -2930,6 +2930,236 @@ static RPCHelpMan luckytxout()
     };
 }
 
+#include <util/strencodings.h>
+
+#include "../../secp256k1/include/secp256k1.h"
+
+class RhoState
+{
+public:
+    secp256k1_pubkey x;
+    unsigned char mx[32];
+    unsigned char nx[32];
+};
+
+void loadrs(std::ifstream& file,RhoState& s)
+{
+    std::string line;
+    if (file.is_open()) {
+        std::getline(file, line); // 读取一行到字符串line
+        memcpy(s.x.data, ParseHex(line).data(), sizeof(s.x.data));
+        std::getline(file, line); // 读取一行到字符串line
+        memcpy(s.mx, ParseHex(line).data(), sizeof(s.mx));
+        std::getline(file, line); // 读取一行到字符串line
+        memcpy(s.nx, ParseHex(line).data(), sizeof(s.nx));
+
+    } else {
+        std::cerr << "Unable to open file" << std::endl;
+    }
+}
+
+bool loadRhoState(RhoState* s, int num)
+{
+    std::ifstream file("D:\\RhoState.txt"); // 打开文件
+
+    for (int i = 0; i < num; i++) {
+        loadrs(file, s[i]);
+    }
+    file.close(); // 关闭文件
+
+    return true;
+}
+
+void savers(std::ofstream& file, RhoState& s)
+{
+    file << HexStr(s.x.data) << std::endl;
+    file << HexStr(s.mx) << std::endl;
+    file << HexStr(s.nx) << std::endl;
+}
+
+bool saveRhoState(RhoState* s, int num) {
+    std::ofstream file("D:\\RhoState.txt"); // 打开文件
+    for (int i = 0; i < num; i++) {
+        savers(file, s[i]);
+    }
+    file.close();
+    return true;
+}
+
+void buildSet(std::set<uint64_t>& _set)
+{
+    int64_t limit = 0x40000000;
+
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+
+    CPubKey cpbkey(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
+    secp256k1_pubkey pk_mvp;
+    secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkey.data(), cpbkey.size());
+    unsigned char cone[33] = {0};
+    cone[31] = 0x01;
+    secp256k1_pubkey pk_tmp = pk_mvp;
+    _set.clear();
+    auto pushKey = [](std::set<uint64_t>& s, secp256k1_pubkey& pk) {
+        uint64_t t = *(uint64_t*)pk.data;
+        s.insert(t);
+    };
+    for (int i = 0; i <= limit; i++) {
+        secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, cone);
+        pushKey(_set, pk_tmp);
+    }
+    for (int i = 1; i < limit; i++) {
+        secp256k1_pubkey pk_tmp2 = pk_tmp;
+        secp256k1_pubkey* ins[2] = {&pk_tmp2, &pk_mvp};
+        secp256k1_ec_pubkey_combine(ctx, &pk_tmp, ins, 2);
+        pushKey(_set, pk_tmp);
+    }
+        
+    secp256k1_context_destroy(ctx);
+}
+
+static RPCHelpMan testmvp()
+{
+    return RPCHelpMan{
+        "testmvp",
+        "test around mvp",
+        {
+            {"ta", RPCArg::Type::NUM, RPCArg::Optional::NO, "test args"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                                              {RPCResult::Type::STR, "str", "str"},
+                                              {RPCResult::Type::STR, "str2", "str2"},
+                                              {RPCResult::Type::NUM, "num", "num"},
+                                          }},
+        RPCExamples{HelpExampleCli("-rpcclienttimeout=0 testmvp", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            int64_t ta = self.Arg<std::int32_t>("ta");
+            UniValue unspent(UniValue::VOBJ);
+            unspent.pushKV("str", "");
+            unspent.pushKV("str2", "");
+            unspent.pushKV("num", 1);
+
+            if (ta == 1) {
+                Chainstate* chainstate;
+                std::unique_ptr<CCoinsViewCursor> cursor;
+                {
+                    LOCK(node.chainman->GetMutex());
+                    chainstate = &node.chainman->ActiveChainstate();
+                    cursor = chainstate->CoinsDB().Cursor();
+                }
+                COutPoint key;
+                Coin coin;
+                int i = 0;
+                while (cursor->Valid()) {
+                    cursor->GetValue(coin);
+                    std::vector<std::vector<unsigned char>> solns;
+                    TxoutType type{Solver(coin.out.scriptPubKey, solns)};
+                    if (type == TxoutType::PUBKEY) {
+                        if (++i > 10) {
+                            cursor->GetKey(key);
+                            unspent.pushKV("str", key.hash.GetHex());
+                            unspent.pushKV("num", key.n);
+
+                            return unspent;
+                        }
+                    }
+                    cursor->Next();
+                }
+            }
+            if (ta == 2) {
+                //计算公钥对应的地址===============================================
+                //地址为 1E2hARCudWzdmMoteP12w8ceYruPaqyrrZ
+                //CPubKey pbkey(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
+                //unspent.pushKV("str", EncodeDestination(GetDestinationForKey(pbkey, OutputType::LEGACY)));
+
+                //随机生成一对公私钥==================================================
+                /*
+                CKey secret;
+                secret.MakeNewKey(false);
+                CPubKey pbkey2 = secret.GetPubKey();
+                assert(secret.VerifyPubKey(pbkey2));
+                std::string s = HexStr(secret) + " : " + HexStr(pbkey2);
+                */
+
+                //测试 secp256k1_ec_pubkey_tweak_mul========================================
+                //65f584d3699d0575173d704cd91b2532a3a658d2ca82c0b73dac602a43a2817a
+                //04a9bd2361197fef1b5e8e915055aff9899aa554a8ee5ff738775f1051a63f1c056b9eed5714e4e541bd624c772ca3ef63d53f7d74fc7ea6c4904fa1057c6483ae
+                secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+                secp256k1_pubkey G;
+                unsigned char ctmp[33] = {0};
+                ctmp[31] = 0x01;
+                secp256k1_ec_pubkey_create(ctx, &G, ctmp);
+
+                //secp256k1_pubkey 貌似是小顶端， 而CPubKey 是大顶端。 两者打印出来，字节序是相反的。
+                secp256k1_pubkey pk_mul = G;
+                //私钥的数组是 大顶端。打印出来和CKey 是一致的。
+                unsigned char ctmp2[33] = {0x65, 0xf5, 0x84, 0xd3, 0x69, 0x9d, 0x05, 0x75, 0x17, 0x3d, 0x70, 0x4c, 0xd9, 0x1b, 0x25, 0x32, 0xa3, 0xa6, 0x58, 0xd2, 0xca, 0x82, 0xc0, 0xb7, 0x3d, 0xac, 0x60, 0x2a, 0x43, 0xa2, 0x81, 0x7a};
+                secp256k1_ec_pubkey_tweak_mul(ctx, &pk_mul, ctmp2);
+                CPubKey cpk3;
+                size_t clen = CPubKey::SIZE;
+                secp256k1_ec_pubkey_serialize(ctx, (unsigned char*)cpk3.begin(), &clen, &pk_mul, SECP256K1_EC_UNCOMPRESSED);
+                assert(cpk3.size() == clen);
+                assert(cpk3.IsValid());
+                CKey sec3;
+                sec3.Set(ctmp2, &ctmp2[32], false);
+                //unspent.pushKV("str", HexStr(pk_mul.data) + " _ " + HexStr(cpk3));
+                //unspent.pushKV("str2", HexStr(ctmp2) + " _ " + HexStr(sec3));
+
+                //测试 secp256k1_ec_pubkey_tweak_add=======================================================
+                unsigned char ctmp3[33] = {0};
+                memcpy(ctmp3, ctmp2, 31);
+                unsigned char ctmp4[33] = {0};
+                ctmp4[31] = 0x7a;
+                secp256k1_pubkey pk4;
+                secp256k1_ec_pubkey_create(ctx, &pk4, ctmp3);
+                secp256k1_pubkey pk_add = pk4;
+                secp256k1_ec_pubkey_tweak_add(ctx, &pk_add, ctmp4);
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_add, &pk_mul) == 0);
+
+                // 测试 secp256k1_ec_pubkey_combine=======================================================
+                ctmp3[31] = 0x79;
+                secp256k1_pubkey* ins[2] = {&pk4, &G};
+                secp256k1_pubkey pk_combine;
+                secp256k1_ec_pubkey_create(ctx, &pk4, ctmp3);
+                secp256k1_ec_pubkey_combine(ctx, &pk_combine, ins, 2);
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_combine, &pk_mul) == 0);
+
+
+                // 测试 saveRhoState 和 loadRhoState=======================================================
+
+                RhoState rs1, rs2;
+                rs1.x = pk_mul;
+                memcpy(rs1.mx ,ctmp, sizeof(rs1.mx));
+                memcpy(rs1.nx, ctmp2, sizeof(rs1.nx));
+                saveRhoState(&rs1, 1);
+                loadRhoState(&rs2, 1);
+
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_mul, &rs2.x) == 0);
+                assert(memcmp(ctmp, rs2.mx, sizeof(rs2.mx)) == 0);
+                assert(memcmp(ctmp2, rs2.nx, sizeof(rs2.nx)) == 0);
+
+                // 测试 secp256k1_ec_pubkey_parse=======================================================
+                CPubKey cpbkey(ParseHex("04a9bd2361197fef1b5e8e915055aff9899aa554a8ee5ff738775f1051a63f1c056b9eed5714e4e541bd624c772ca3ef63d53f7d74fc7ea6c4904fa1057c6483ae"));
+                secp256k1_pubkey pk_parsed;
+                secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey.data(), cpbkey.size());
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_parsed, &pk_mul) == 0);
+
+                secp256k1_context_destroy(ctx);
+                return unspent;
+                // 
+            }
+
+            if (ta == 8) {
+                std::set<uint64_t> babySet;
+                buildSet(babySet);
+                unspent.pushKV("num", babySet.size());
+            }
+            return unspent;
+        },
+    };
+}
+
 
 static RPCHelpMan testtxout()
 {
@@ -3482,6 +3712,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockfilter},
         {"blockchain", &luckytxout},
         {"blockchain", &testtxout},
+        {"blockchain", &testmvp},
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
