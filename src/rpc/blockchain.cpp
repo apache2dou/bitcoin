@@ -2762,6 +2762,7 @@ std::string read_key() {
 }
 
 static RecursiveMutex pkh_map_mutex;
+static RecursiveMutex baby_map_mutex;
 
 void save_map(std::map<int64_t, int64_t>& _map)
 {
@@ -2779,6 +2780,29 @@ void read_map(std::map<int64_t, int64_t>& _map) {
     int64_t value;
     // 反序列化从文件
     std::ifstream ifs("D:\\pkh_map.txt");
+    while (ifs >> key >> value) {
+        _map[key] = value;
+    }
+}
+
+
+void save_babymap(std::map<uint64_t, int>& _map)
+{
+    LOCK(baby_map_mutex);
+    // 将map对象序列化到文件中
+    std::ofstream ofs("D:\\baby_map.txt");
+    for (const auto& kv : _map) {
+        ofs << kv.first << " " << kv.second << "\n";
+    }
+    ofs << std::flush; // 确保所有数据都被写入
+}
+
+void read_babymap(std::map<uint64_t, int>& _map)
+{
+    uint64_t key;
+    int value;
+    // 反序列化从文件
+    std::ifstream ifs("D:\\baby_map.txt");
     while (ifs >> key >> value) {
         _map[key] = value;
     }
@@ -2986,35 +3010,91 @@ bool saveRhoState(RhoState* s, int num) {
     return true;
 }
 
-void buildSet(std::set<uint64_t>& _set)
+static int64_t BabyNUM = 0x20000000;
+static CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
+
+void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num = 0)
 {
-    int64_t limit = 0x40000000;
-
+    if (num) BabyNUM = num;
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-
-    CPubKey cpbkey(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
     secp256k1_pubkey pk_mvp;
-    secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkey.data(), cpbkey.size());
+    secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
     unsigned char cone[33] = {0};
     cone[31] = 0x01;
     secp256k1_pubkey pk_tmp = pk_mvp;
-    _set.clear();
-    auto pushKey = [](std::set<uint64_t>& s, secp256k1_pubkey& pk) {
+    _map.clear();
+    auto pushKey = [](std::map<uint64_t, int>& m, secp256k1_pubkey& pk, int n) {
         uint64_t t = *(uint64_t*)pk.data;
-        s.insert(t);
+        m[t] = n;
     };
-    for (int i = 0; i <= limit; i++) {
+    for (int i = 0; i <= BabyNUM; i++) {
         secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, cone);
-        pushKey(_set, pk_tmp);
+        pushKey(_map, pk_tmp, i+1);
     }
-    for (int i = 1; i < limit; i++) {
+    /*
+    for (int i = 2; i <= BabyNUM; i++) {
         secp256k1_pubkey pk_tmp2 = pk_tmp;
         secp256k1_pubkey* ins[2] = {&pk_tmp2, &pk_mvp};
         secp256k1_ec_pubkey_combine(ctx, &pk_tmp, ins, 2);
-        pushKey(_set, pk_tmp);
-    }
+        pushKey(_map, pk_tmp, -i);
+    }*/
         
     secp256k1_context_destroy(ctx);
+}
+
+bool check(secp256k1_pubkey* pk, unsigned char* m, unsigned char* n)
+{
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    secp256k1_pubkey pk_mvp;
+    secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
+    secp256k1_pubkey mG;    
+    secp256k1_pubkey* ins[2] = {&pk_mvp, &mG};
+    secp256k1_ec_pubkey_create(ctx, &mG, m);
+    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_mvp, n);
+    secp256k1_pubkey pk_combine;
+    secp256k1_ec_pubkey_combine(ctx, &pk_combine, ins, 2);
+    bool ret = secp256k1_ec_pubkey_cmp(ctx, &pk_combine, pk);
+    secp256k1_context_destroy(ctx);
+    return ret == 0;
+}
+
+bool find_baby(std::map<uint64_t, int>& _map, secp256k1_pubkey& pk)
+{
+    uint64_t t = *(uint64_t*)pk.data;
+    auto i = _map.find(t);
+    if (i == _map.end())
+        return false;
+    int n = i->second;
+
+    unsigned char c1[33] = {0};
+    c1[31] = 0x01;
+    unsigned char cn[33] = {0};
+    auto f = [](unsigned char* cn, unsigned char* p) {
+        cn[31] = p[0];
+        cn[30] = p[2];
+        cn[29] = p[3];
+        cn[28] = p[4];
+    };
+
+    if (n > 0) {
+        unsigned char* p = (unsigned char*)&n;
+        f(cn, p);
+        return check(&pk, cn, c1);
+    }
+    if (n < 0) {
+        int n_ = -n;
+        unsigned char* p = (unsigned char*)&n_;
+        f(cn, p);
+        n_ = BabyNUM + 1;
+        f(c1, p);
+        return check(&pk, c1, cn);
+    }
+    return false;
+}
+
+bool rho_F(RhoState& s)
+{
+    return true;
 }
 
 static RPCHelpMan testmvp()
@@ -3040,7 +3120,7 @@ static RPCHelpMan testmvp()
             unspent.pushKV("str2", "");
             unspent.pushKV("num", 1);
 
-            if (ta == 1) {
+            if (ta == 11) {
                 Chainstate* chainstate;
                 std::unique_ptr<CCoinsViewCursor> cursor;
                 {
@@ -3067,7 +3147,7 @@ static RPCHelpMan testmvp()
                     cursor->Next();
                 }
             }
-            if (ta == 2) {
+            if (ta == 12) {
                 //计算公钥对应的地址===============================================
                 //地址为 1E2hARCudWzdmMoteP12w8ceYruPaqyrrZ
                 //CPubKey pbkey(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
@@ -3150,10 +3230,16 @@ static RPCHelpMan testmvp()
                 // 
             }
 
-            if (ta == 8) {
-                std::set<uint64_t> babySet;
-                buildSet(babySet);
-                unspent.pushKV("num", babySet.size());
+            if (ta == 118) {
+                std::map<uint64_t, int> babyMap;
+                buildBabyMap(babyMap);
+                unspent.pushKV("num", babyMap.size());
+                save_babymap(babyMap);
+            }
+            if (ta == 119) {
+                std::map<uint64_t, int> babyMap;
+                read_babymap(babyMap);
+                unspent.pushKV("num", babyMap.size());
             }
             return unspent;
         },
