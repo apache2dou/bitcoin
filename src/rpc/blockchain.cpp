@@ -3010,7 +3010,7 @@ bool saveRhoState(RhoState* s, int num) {
     return true;
 }
 
-static int64_t BabyNUM = 0x20000000;
+static int64_t BabyNUM = 0x10000001;
 static CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 
 void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num = 0)
@@ -3027,12 +3027,12 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num = 0)
         uint64_t t = *(uint64_t*)pk.data;
         m[t] = n;
     };
-    for (int i = 0; i <= BabyNUM; i++) {
+    for (int i = 1; i <= BabyNUM; i++) {
         secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, cone);
-        pushKey(_map, pk_tmp, i+1);
+        pushKey(_map, pk_tmp, i);
     }
     /*
-    for (int i = 2; i <= BabyNUM; i++) {
+    for (int i = 2; i < BabyNUM; i++) {
         secp256k1_pubkey pk_tmp2 = pk_tmp;
         secp256k1_pubkey* ins[2] = {&pk_tmp2, &pk_mvp};
         secp256k1_ec_pubkey_combine(ctx, &pk_tmp, ins, 2);
@@ -3085,7 +3085,7 @@ bool find_baby(std::map<uint64_t, int>& _map, secp256k1_pubkey& pk)
         int n_ = -n;
         unsigned char* p = (unsigned char*)&n_;
         f(cn, p);
-        n_ = BabyNUM + 1;
+        n_ = BabyNUM;
         f(c1, p);
         return check(&pk, c1, cn);
     }
@@ -3104,6 +3104,7 @@ static RPCHelpMan testmvp()
         "test around mvp",
         {
             {"ta", RPCArg::Type::NUM, RPCArg::Optional::NO, "test args"},
+            {"num", RPCArg::Type::NUM, RPCArg::Optional::NO, "test args"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "", {
@@ -3114,7 +3115,8 @@ static RPCHelpMan testmvp()
         RPCExamples{HelpExampleCli("-rpcclienttimeout=0 testmvp", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
             NodeContext& node = EnsureAnyNodeContext(request.context);
-            int64_t ta = self.Arg<std::int32_t>("ta");
+            int32_t ta = self.Arg<std::int32_t>("ta");
+            int32_t babynum = self.Arg<std::int32_t>("num");
             UniValue unspent(UniValue::VOBJ);
             unspent.pushKV("str", "");
             unspent.pushKV("str2", "");
@@ -3232,13 +3234,14 @@ static RPCHelpMan testmvp()
 
             if (ta == 118) {
                 std::map<uint64_t, int> babyMap;
-                buildBabyMap(babyMap);
+                buildBabyMap(babyMap, babynum);
                 unspent.pushKV("num", babyMap.size());
                 save_babymap(babyMap);
             }
             if (ta == 119) {
                 std::map<uint64_t, int> babyMap;
                 read_babymap(babyMap);
+                BabyNUM = babyMap.size();
                 unspent.pushKV("num", babyMap.size());
             }
             return unspent;
