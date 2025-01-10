@@ -2810,6 +2810,7 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
     } tp;
     std::map<uint64_t, tp> tmp_map;
     int index = 0;
+    int load_size = 0x7fffffff;
     try {
         for (const auto& entry : fs::directory_iterator(directory)) {
             if (entry.is_regular_file()) {
@@ -2817,8 +2818,12 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
                 if (fileName.starts_with(baseFileName)) { // C++20 特性
                     int base;
                     sscanf(fileName.c_str(), "baby_map%d.txt", &base);
-                    if (base > num)
+                    if (base > num) {
+                        if (base < load_size)
+                            load_size = base;
                         continue;
+                    }
+                        
                     std::ifstream file(entry.path());
                     if (!file.is_open()) {
                         throw std::runtime_error("Failed to open file: " + fileName);
@@ -2835,6 +2840,8 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
                 }
             }
         }
+        x.reserve(load_size - 1);
+        m.reserve(load_size - 1);
         auto it = tmp_map.begin();
         while (it != tmp_map.end()) {
             x.push_back(it->first);
@@ -3126,23 +3133,28 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
     secp256k1_context_destroy(ctx);
 }
 
-bool check(secp256k1_pubkey* pk, unsigned char* m, unsigned char* n)
-{
-    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-    secp256k1_pubkey pk_mvp;
-    secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
-    secp256k1_pubkey mG;    
-    secp256k1_pubkey* ins[2] = {&pk_mvp, &mG};
+void create(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsigned char* n) {
+    static secp256k1_pubkey pk_mvp = {0};
+    if (pk_mvp.data[0] == 0) {
+        secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
+    }
+    secp256k1_pubkey mG;
+    secp256k1_pubkey pk_tmp = pk_mvp;
+    secp256k1_pubkey* ins[2] = {&pk_tmp, &mG};
     secp256k1_ec_pubkey_create(ctx, &mG, m);
-    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_mvp, n);
+    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_tmp, n);
+    secp256k1_ec_pubkey_combine(ctx, pk, ins, 2);
+}
+
+bool check(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsigned char* n)
+{
     secp256k1_pubkey pk_combine;
-    secp256k1_ec_pubkey_combine(ctx, &pk_combine, ins, 2);
-    bool ret = secp256k1_ec_pubkey_cmp(ctx, &pk_combine, pk);
-    secp256k1_context_destroy(ctx);
+    create(ctx, &pk_combine, m, n);
+    int ret = secp256k1_ec_pubkey_cmp(ctx, &pk_combine, pk);
     return ret == 0;
 }
 
-bool find_baby(std::vector<uint64_t>& _x, std::vector<int>& _m, secp256k1_pubkey& pk)
+bool find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int>& _m, secp256k1_pubkey& pk)
 {
     uint64_t t = *(uint64_t*)pk.data;
     auto i = std::lower_bound(_x.begin(), _x.end(), t);
@@ -3157,19 +3169,56 @@ bool find_baby(std::vector<uint64_t>& _x, std::vector<int>& _m, secp256k1_pubkey
 
     if (n > 0) {        
         set_int(cn, n);
-        return check(&pk, cn, c1);
+        return check(ctx,&pk, cn, c1);
     }
     /*
     if (n < 0) {
         set_int(cn, -n);
         set_int(c1, BabyNUM);
-        return check(&pk, c1, cn);
+        return check(ctx, &pk, c1, cn);
     }*/
     return false;
 }
 
-bool rho_F(RhoState& s)
+bool rho_F(secp256k1_context* ctx, RhoState& s)
 {
+    static secp256k1_pubkey pk_mvp = {0};
+    if (pk_mvp.data[0] == 0) {
+        secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
+    }
+    char c = s.x.data[0];
+    if ((c & 0x3) == 0) {
+        static unsigned char cb[33] = {0};
+        static secp256k1_pubkey pk_b = {0};
+        if (pk_b.data[0] == 0 && pk_b.data[4] == 0) {
+            set_int(cb, BabyNUM);
+            secp256k1_ec_pubkey_create(ctx, &pk_b, cb);
+        }
+        secp256k1_pubkey pk_ = s.x;
+        secp256k1_pubkey* ins[2] = {&pk_, &pk_b};
+        int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
+        assert(r == 1);
+        r = secp256k1_ec_seckey_tweak_add(ctx, s.mx, cb);
+        assert(r == 1);
+    } else if ((c & 0x3) == 3) {
+        unsigned char c1[33] = {0};
+        c1[31] = 0x01;
+        secp256k1_pubkey pk_ = s.x;
+        secp256k1_pubkey* ins[2] = {&pk_, &pk_mvp};
+        int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
+        assert(r == 1);
+        r = secp256k1_ec_seckey_tweak_add(ctx, s.nx, c1);
+        assert(r == 1);
+    } else {
+        unsigned char c2[33] = {0};
+        c2[31] = 0x02;
+        int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, c2);
+        assert(r == 1);
+        r = secp256k1_ec_seckey_tweak_mul(ctx, s.mx, c2);
+        assert(r == 1);
+        r = secp256k1_ec_seckey_tweak_mul(ctx, s.nx, c2);
+        assert(r == 1);
+    }
     return true;
 }
 
@@ -3198,6 +3247,7 @@ static RPCHelpMan testmvp()
             unspent.pushKV("str2", "");
             unspent.pushKV("num", 1);
 
+            //挑选一个mvp 并打印出来
             if (ta == 11) {
                 Chainstate* chainstate;
                 std::unique_ptr<CCoinsViewCursor> cursor;
@@ -3225,6 +3275,9 @@ static RPCHelpMan testmvp()
                     cursor->Next();
                 }
             }
+
+            secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+
             if (ta == 12) {
                 //计算公钥对应的地址===============================================
                 //地址为 1E2hARCudWzdmMoteP12w8ceYruPaqyrrZ
@@ -3243,7 +3296,6 @@ static RPCHelpMan testmvp()
                 //测试 secp256k1_ec_pubkey_tweak_mul========================================
                 //65f584d3699d0575173d704cd91b2532a3a658d2ca82c0b73dac602a43a2817a
                 //04a9bd2361197fef1b5e8e915055aff9899aa554a8ee5ff738775f1051a63f1c056b9eed5714e4e541bd624c772ca3ef63d53f7d74fc7ea6c4904fa1057c6483ae
-                secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
                 secp256k1_pubkey G;
                 unsigned char ctmp[33] = {0};
                 ctmp[31] = 0x01;
@@ -3261,6 +3313,8 @@ static RPCHelpMan testmvp()
                 assert(cpk3.IsValid());
                 CKey sec3;
                 sec3.Set(ctmp2, &ctmp2[32], false);
+                CPubKey cpk4 = sec3.GetPubKey();
+                assert(cpk4 == cpk3);
                 //unspent.pushKV("str", HexStr(pk_mul.data) + " _ " + HexStr(cpk3));
                 //unspent.pushKV("str2", HexStr(ctmp2) + " _ " + HexStr(sec3));
 
@@ -3283,31 +3337,14 @@ static RPCHelpMan testmvp()
                 secp256k1_ec_pubkey_combine(ctx, &pk_combine, ins, 2);
                 assert(secp256k1_ec_pubkey_cmp(ctx, &pk_combine, &pk_mul) == 0);
 
-
-                // 测试 saveRhoState 和 loadRhoState=======================================================
-
-                RhoState rs1, rs2;
-                rs1.x = pk_mul;
-                memcpy(rs1.mx ,ctmp, sizeof(rs1.mx));
-                memcpy(rs1.nx, ctmp2, sizeof(rs1.nx));
-                saveRhoState(&rs1, 1);
-                loadRhoState(&rs2, 1);
-
-                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_mul, &rs2.x) == 0);
-                assert(memcmp(ctmp, rs2.mx, sizeof(rs2.mx)) == 0);
-                assert(memcmp(ctmp2, rs2.nx, sizeof(rs2.nx)) == 0);
-
                 // 测试 secp256k1_ec_pubkey_parse=======================================================
                 CPubKey cpbkey(ParseHex("04a9bd2361197fef1b5e8e915055aff9899aa554a8ee5ff738775f1051a63f1c056b9eed5714e4e541bd624c772ca3ef63d53f7d74fc7ea6c4904fa1057c6483ae"));
                 secp256k1_pubkey pk_parsed;
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey.data(), cpbkey.size());
                 assert(secp256k1_ec_pubkey_cmp(ctx, &pk_parsed, &pk_mul) == 0);
-
-                secp256k1_context_destroy(ctx);
-                return unspent;
-                // 
             }
 
+            //生成babystep
             if (ta == 118) {
                 if (babynum) {
                     BabyNUM = babynum;
@@ -3331,29 +3368,60 @@ static RPCHelpMan testmvp()
                 }
                 unspent.pushKV("num", total);
             }
+            //加载babystep 并简单测试
             if (ta == 119) {
                 std::vector<uint64_t> _Xvec;
                 std::vector<int> _Mvec;
                 read_babymap(_Xvec, _Mvec, babynum);
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
-                secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
                 //4GG+mvp
                 CPubKey cpbkey1(ParseHex("04f2046923f3d5060fec6d47770bef9ba2823ac38e317ef33544c2947dbc77f938739f18b1175ca0034752c519d420e2378c9caa6d1806581c7f4e30b8a962847e"));
                 secp256k1_pubkey pk_parsed;
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey1.data(), cpbkey1.size());
-                assert(!find_baby(_Xvec, _Mvec, pk_parsed));
+                assert(!find_baby(ctx, _Xvec, _Mvec, pk_parsed));
                 //1G+mvp
                 CPubKey cpbkey2(ParseHex("0437428773f4bec8f6909ddc53627d892b9e96745c4898f51ffd37fa8c2dafaedc3ab158f7ece4572be1dd7cdf43ffa7171bead852f1650b9ee4dd4dc8d6e8fcde"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2.data(), cpbkey2.size());
-                assert(find_baby(_Xvec, _Mvec, pk_parsed));
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed));
                 // fffffffG+mvp
                 CPubKey cpbkey3(ParseHex("04abe5f23b66d0b2efdc7537f047297fa72641df9d49a8bbcc143142c5cfd2f873c74643e4a1160acbb234d537b0537efbeed96af5d21d15bada929a5648810c8d"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey3.data(), cpbkey3.size());
-                assert(find_baby(_Xvec, _Mvec, pk_parsed));
-                secp256k1_context_destroy(ctx);
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed));
                 unspent.pushKV("num", _Xvec.size());
             }
+            //生成RhoState
+            if (ta == 120 && babynum == 888) {
+                RhoState rs[32] = {0};
+                for (RhoState& r : rs) {
+                    CKey secret1, secret2;
+                    secret1.MakeNewKey(false);
+                    secret2.MakeNewKey(false);
+                    memcpy(r.mx, secret1.data(), sizeof(r.mx));
+                    memcpy(r.nx, secret2.data(), sizeof(r.nx));
+                    create(ctx, &r.x, r.mx, r.nx);
+                }
+                saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
+
+                RhoState rs2[32] = {0};
+                loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState));
+                for (RhoState& r : rs2) {
+                    assert(check(ctx, &r.x, r.mx, r.nx));
+                }
+            }
+            //测试 rho_F
+            if (ta == 121) {
+                int i = 1000;
+                RhoState rs[32] = {0};
+                loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
+                while (--i > 0)
+                {
+                    rho_F(ctx, rs[0]);
+                    assert(check(ctx, &rs[0].x, rs[0].mx, rs[0].nx));
+                }
+            }
+
+            secp256k1_context_destroy(ctx);
             return unspent;
         },
     };
