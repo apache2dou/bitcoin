@@ -643,6 +643,17 @@ int secp256k1_ec_seckey_negate(const secp256k1_context* ctx, unsigned char *seck
     return ret;
 }
 
+int secp256k1_ec_seckey_inverse(
+    const secp256k1_context* ctx,
+    unsigned char* seckey_return,
+    unsigned char* seckey) {
+    int ret = 0;
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(seckey != NULL);
+
+    return ret;
+}
+
 int secp256k1_ec_privkey_negate(const secp256k1_context* ctx, unsigned char *seckey) {
     return secp256k1_ec_seckey_negate(ctx, seckey);
 }

@@ -2818,7 +2818,10 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
                 if (fileName.starts_with(baseFileName)) { // C++20 特性
                     int base;
                     sscanf(fileName.c_str(), "baby_map%d.txt", &base);
-                    if (base > num) {
+                    if (num == 0) {
+                        if (load_size == 0x7fffffff || load_size < base)
+                            load_size = base;
+                    }else if (base > num) {
                         if (base < load_size)
                             load_size = base;
                         continue;
@@ -2840,8 +2843,10 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
                 }
             }
         }
-        x.reserve(load_size - 1);
-        m.reserve(load_size - 1);
+        if (load_size != 0x7fffffff) {
+            x.reserve(load_size - 1);
+            m.reserve(load_size - 1);
+        }
         auto it = tmp_map.begin();
         while (it != tmp_map.end()) {
             x.push_back(it->first);
@@ -3154,12 +3159,12 @@ bool check(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsig
     return ret == 0;
 }
 
-bool find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int>& _m, secp256k1_pubkey& pk)
+int find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int>& _m, secp256k1_pubkey& pk)
 {
     uint64_t t = *(uint64_t*)pk.data;
     auto i = std::lower_bound(_x.begin(), _x.end(), t);
     if (i == _x.end()|| t !=*i)
-        return false;
+        return 0;
     std::ptrdiff_t index = std::distance(_x.begin(), i);
     int n = _m[index];
 
@@ -3169,7 +3174,8 @@ bool find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int
 
     if (n > 0) {        
         set_int(cn, n);
-        return check(ctx,&pk, cn, c1);
+        if( check(ctx,&pk, cn, c1))
+            return n;
     }
     /*
     if (n < 0) {
@@ -3177,7 +3183,7 @@ bool find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int
         set_int(c1, BabyNUM);
         return check(ctx, &pk, c1, cn);
     }*/
-    return false;
+    return 0;
 }
 
 bool rho_F(secp256k1_context* ctx, RhoState& s)
@@ -3220,6 +3226,28 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         assert(r == 1);
     }
     return true;
+}
+
+bool bingo(secp256k1_context* ctx, CKey& r, RhoState& rs, int m)
+{
+    // assert(check(ctx, &r.x, r.mx, r.nx));
+    unsigned char c1[33] = {0};
+    c1[31] = 0x01;
+    unsigned char cm[33] = {0};
+    set_int(cm, m);
+    secp256k1_ec_seckey_negate(ctx, cm);
+    unsigned char cm2[33] = {0};
+    memcpy(cm2, rs.mx, sizeof(rs.mx));
+    unsigned char cn2[33] = {0};
+    memcpy(cn2, rs.nx, sizeof(rs.nx));
+    secp256k1_ec_seckey_negate(ctx, cn2);
+    secp256k1_ec_seckey_tweak_add(ctx, cn2, c1);
+    secp256k1_ec_seckey_tweak_add(ctx, cm2, cm);
+    unsigned char cn2i[33] = {0};
+    secp256k1_ec_seckey_inverse(ctx, cn2i, cn2);
+    secp256k1_ec_seckey_tweak_mul(ctx, cm2, cn2i);
+    r.Set(cm2, &cm2[32], false);
+    return false;
 }
 
 static RPCHelpMan testmvp()
@@ -3352,7 +3380,7 @@ static RPCHelpMan testmvp()
                     babynum = BabyNUM;
                 }
 
-                int batch = 0x10000000;
+                int batch = (babynum + 5) / 6; // 0x10000000;
                 int times = babynum / batch + 1;
                 int64_t total = 0;
                 for (int i = 0; i < times; i++) {
@@ -3379,15 +3407,15 @@ static RPCHelpMan testmvp()
                 CPubKey cpbkey1(ParseHex("04f2046923f3d5060fec6d47770bef9ba2823ac38e317ef33544c2947dbc77f938739f18b1175ca0034752c519d420e2378c9caa6d1806581c7f4e30b8a962847e"));
                 secp256k1_pubkey pk_parsed;
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey1.data(), cpbkey1.size());
-                assert(!find_baby(ctx, _Xvec, _Mvec, pk_parsed));
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0);
                 //1G+mvp
                 CPubKey cpbkey2(ParseHex("0437428773f4bec8f6909ddc53627d892b9e96745c4898f51ffd37fa8c2dafaedc3ab158f7ece4572be1dd7cdf43ffa7171bead852f1650b9ee4dd4dc8d6e8fcde"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2.data(), cpbkey2.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed));
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) != 0);
                 // fffffffG+mvp
                 CPubKey cpbkey3(ParseHex("04abe5f23b66d0b2efdc7537f047297fa72641df9d49a8bbcc143142c5cfd2f873c74643e4a1160acbb234d537b0537efbeed96af5d21d15bada929a5648810c8d"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey3.data(), cpbkey3.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed));
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) != 0);
                 unspent.pushKV("num", _Xvec.size());
             }
             //生成RhoState
@@ -3417,8 +3445,31 @@ static RPCHelpMan testmvp()
                 while (--i > 0)
                 {
                     rho_F(ctx, rs[0]);
-                    assert(check(ctx, &rs[0].x, rs[0].mx, rs[0].nx));
+                    assert(check(ctx, &rs[0].x, rs[0].mx, rs[1].nx));
                 }
+            }
+
+            if (ta == 8) {
+                RhoState rs[32] = {0};
+                loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
+                for (RhoState& r : rs) {
+                    assert(check(ctx, &r.x, r.mx, r.nx));
+                }
+                std::vector<uint64_t> _Xvec;
+                std::vector<int> _Mvec;
+                read_babymap(_Xvec, _Mvec, babynum);
+                BabyNUM = _Xvec.size();
+                assert(_Xvec.size() == _Mvec.size());
+                auto T = [&](int i) {
+                    rho_F(ctx, rs[i]);
+                    int b = find_baby(ctx, _Xvec, _Mvec, rs[i].x);
+                    if (b != 0) {
+                        CKey k;
+                        if (bingo(ctx, k, rs[i], b))
+                            save_key(k);
+                    }
+
+                };
             }
 
             secp256k1_context_destroy(ctx);
