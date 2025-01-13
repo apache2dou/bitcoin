@@ -647,10 +647,16 @@ int secp256k1_ec_seckey_inverse(
     const secp256k1_context* ctx,
     unsigned char* seckey_return,
     unsigned char* seckey) {
+    secp256k1_scalar sec;
+    secp256k1_scalar sec2;
     int ret = 0;
     VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(seckey_return != NULL);
     ARG_CHECK(seckey != NULL);
-
+    ret = secp256k1_scalar_set_b32_seckey(&sec, seckey);
+    secp256k1_scalar_cmov(&sec, &secp256k1_scalar_zero, !ret);
+    secp256k1_scalar_inverse(&sec2, &sec);
+    secp256k1_scalar_get_b32(seckey_return, &sec2);
     return ret;
 }
 

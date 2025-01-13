@@ -3028,6 +3028,7 @@ public:
     secp256k1_pubkey x;
     unsigned char mx[32];
     unsigned char nx[32];
+    uint64_t times;
 };
 
 void loadrs(std::ifstream& file,RhoState& s)
@@ -3040,6 +3041,8 @@ void loadrs(std::ifstream& file,RhoState& s)
         memcpy(s.mx, ParseHex(line).data(), sizeof(s.mx));
         std::getline(file, line); // 读取一行到字符串line
         memcpy(s.nx, ParseHex(line).data(), sizeof(s.nx));
+        std::getline(file, line); // 读取一行到字符串line
+        sscanf(line.c_str(), "%llu", &s.times);
 
     } else {
         std::cerr << "Unable to open file" << std::endl;
@@ -3063,6 +3066,7 @@ void savers(std::ofstream& file, RhoState& s)
     file << HexStr(s.x.data) << std::endl;
     file << HexStr(s.mx) << std::endl;
     file << HexStr(s.nx) << std::endl;
+    file << s.times << std::endl;
 }
 
 bool saveRhoState(RhoState* s, int num) {
@@ -3225,6 +3229,7 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         r = secp256k1_ec_seckey_tweak_mul(ctx, s.nx, c2);
         assert(r == 1);
     }
+    s.times++;
     return true;
 }
 
@@ -3247,7 +3252,7 @@ bool bingo(secp256k1_context* ctx, CKey& r, RhoState& rs, int m)
     secp256k1_ec_seckey_inverse(ctx, cn2i, cn2);
     secp256k1_ec_seckey_tweak_mul(ctx, cm2, cn2i);
     r.Set(cm2, &cm2[32], false);
-    return false;
+    return true;
 }
 
 static RPCHelpMan testmvp()
@@ -3325,9 +3330,9 @@ static RPCHelpMan testmvp()
                 //65f584d3699d0575173d704cd91b2532a3a658d2ca82c0b73dac602a43a2817a
                 //04a9bd2361197fef1b5e8e915055aff9899aa554a8ee5ff738775f1051a63f1c056b9eed5714e4e541bd624c772ca3ef63d53f7d74fc7ea6c4904fa1057c6483ae
                 secp256k1_pubkey G;
-                unsigned char ctmp[33] = {0};
-                ctmp[31] = 0x01;
-                secp256k1_ec_pubkey_create(ctx, &G, ctmp);
+                unsigned char ctmp_one[33] = {0};
+                ctmp_one[31] = 0x01;
+                secp256k1_ec_pubkey_create(ctx, &G, ctmp_one);
 
                 //secp256k1_pubkey 貌似是小顶端， 而CPubKey 是大顶端。 两者打印出来，字节序是相反的。
                 secp256k1_pubkey pk_mul = G;
@@ -3370,6 +3375,52 @@ static RPCHelpMan testmvp()
                 secp256k1_pubkey pk_parsed;
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey.data(), cpbkey.size());
                 assert(secp256k1_ec_pubkey_cmp(ctx, &pk_parsed, &pk_mul) == 0);
+
+                //测试 secp256k1_ec_seckey_tweak_mul 和 secp256k1_ec_seckey_inverse=======================================================
+                auto sec4 = ParseHex("bbbace0c56e3ebd03072b0cb2370f1a060b6f29e988ec77e92a190c92448c6e6");
+                auto sec4_tmp = sec4;
+                auto sec4_inv = ParseHex("82b6f65ef08f2312c9655cc497ee200f3e71a6e4a3b53c29793e572fdfa8e8f1");
+                secp256k1_ec_seckey_tweak_mul(ctx, sec4_tmp.data(), sec4_inv.data());
+                assert(memcmp(sec4_tmp.data(), ctmp_one, sec4_tmp.size()) == 0);
+                unsigned char cinverse[33] = {0};
+                secp256k1_ec_seckey_inverse(ctx, cinverse, sec4_inv.data());
+                assert(memcmp(sec4.data(), cinverse, sec4.size()) == 0);
+
+                CKey sec_rand;
+                sec_rand.MakeNewKey(false);
+                CPubKey pbkey_rand = sec_rand.GetPubKey();
+                secp256k1_pubkey pbkey_rand_parse_mul;
+                secp256k1_ec_pubkey_parse(ctx, &pbkey_rand_parse_mul, pbkey_rand.data(), pbkey_rand.size());
+                unsigned char sec_rand_inv[33] = {0};
+                secp256k1_ec_seckey_inverse(ctx, sec_rand_inv, (unsigned char*)sec_rand.data());
+                secp256k1_ec_pubkey_tweak_mul(ctx, &pbkey_rand_parse_mul, sec_rand_inv);
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pbkey_rand_parse_mul, &G) == 0);
+
+                //测试bingo=======================================================
+                //5294873c75604180f16f2dec603b8e786da8feefc71baa101e6138205f8d5ba1  sec
+                //2a9d0567a5531408a7927116cdebd3d2e246df1ed423bfb95ef661f7be5e0b3d  05838517687b13e266e3464a7acd81e85d049a9128bbbf1e6375bfa473714eb8
+                //m=1ffffff
+                //n2=4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0d
+                //m2=cad9954ad40d7e586df711835bdde9f5327f99ed4d59ac4ea19f811b17340a1c
+                CPubKey cpbkey_x(ParseHex("0426ca9cdb76480823bdb3704aff808419e4a42d9a7d809165309dc1e8e553fbb594072adeda50865c4a871bb178d0093d7df365d30f16b745b42d80daa2772ea3"));
+                RhoState rs = {0};
+                secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
+                auto n2 = ParseHex("4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0d");
+                auto m2 = ParseHex("cad9954ad40d7e586df711835bdde9f5327f99ed4d59ac4ea19f811b17340a1c");
+                memcpy(rs.nx, n2.data(), n2.size());
+                memcpy(rs.mx, m2.data(), m2.size());
+                CKey mvp_mock;
+                int m = 0x1ffffff;
+                bingo(ctx, mvp_mock, rs, m);
+                CPubKey pk_got = mvp_mock.GetPubKey();
+                CPubKey pk_mock(ParseHex("042a9d0567a5531408a7927116cdebd3d2e246df1ed423bfb95ef661f7be5e0b3d05838517687b13e266e3464a7acd81e85d049a9128bbbf1e6375bfa473714eb8"));
+                assert(pk_got == pk_mock);
+                secp256k1_pubkey pk_mock_parse_mul;
+                secp256k1_ec_pubkey_parse(ctx, &pk_mock_parse_mul, pk_mock.data(), pk_mock.size());
+                unsigned char cm[33] = {0};
+                set_int(cm, m);
+                secp256k1_ec_pubkey_tweak_add(ctx, &pk_mock_parse_mul, cm);
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_mock_parse_mul, &rs.x) == 0);
             }
 
             //生成babystep
@@ -3428,6 +3479,7 @@ static RPCHelpMan testmvp()
                     memcpy(r.mx, secret1.data(), sizeof(r.mx));
                     memcpy(r.nx, secret2.data(), sizeof(r.nx));
                     create(ctx, &r.x, r.mx, r.nx);
+                    r.times = 0;
                 }
                 saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
 
@@ -3445,7 +3497,7 @@ static RPCHelpMan testmvp()
                 while (--i > 0)
                 {
                     rho_F(ctx, rs[0]);
-                    assert(check(ctx, &rs[0].x, rs[0].mx, rs[1].nx));
+                    assert(check(ctx, &rs[0].x, rs[0].mx, rs[0].nx));
                 }
             }
 
@@ -3460,16 +3512,40 @@ static RPCHelpMan testmvp()
                 read_babymap(_Xvec, _Mvec, babynum);
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
+                bool stop = false;
                 auto T = [&](int i) {
-                    rho_F(ctx, rs[i]);
-                    int b = find_baby(ctx, _Xvec, _Mvec, rs[i].x);
-                    if (b != 0) {
-                        CKey k;
-                        if (bingo(ctx, k, rs[i], b))
-                            save_key(k);
+                    unsigned int count_try{0};
+                    while (!stop) {
+                        try {
+                            ++count_try;
+                            if (count_try % 10000 == 0)
+                                node.rpc_interruption_point();
+                            rho_F(ctx, rs[i]);
+                            int b = find_baby(ctx, _Xvec, _Mvec, rs[i].x);
+                            if (b != 0) {
+                                CKey k;
+                                if (bingo(ctx, k, rs[i], b)) {
+                                    save_key(k);
+                                    stop = true;
+                                }
+                            }
+                        } catch (...) {
+                            stop = true;
+                        }
                     }
-
                 };
+
+                std::vector<std::thread> threads;
+                int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
+                assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
+                threads.reserve(n_tasks);
+                for (int i = 0; i < n_tasks; ++i) {
+                    threads.emplace_back(T, i);
+                }
+                for (auto& t : threads) {
+                    t.join();
+                }
+                saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
             }
 
             secp256k1_context_destroy(ctx);
