@@ -3130,15 +3130,7 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
     for (auto& t : threads) {
         t.join();
     }
-
-    /*
-    for (int i = 2; i < num; i++) {
-        secp256k1_pubkey pk_tmp2 = pk_tmp;
-        secp256k1_pubkey* ins[2] = {&pk_tmp2, &pk_mvp};
-        secp256k1_ec_pubkey_combine(ctx, &pk_tmp, ins, 2);
-        pushKey(_map, pk_tmp, -i);
-    }*/
-        
+    
     secp256k1_context_destroy(ctx);
 }
 
@@ -3155,12 +3147,15 @@ void create(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsi
     secp256k1_ec_pubkey_combine(ctx, pk, ins, 2);
 }
 
-bool check(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsigned char* n)
+int check(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsigned char* n)
 {
     secp256k1_pubkey pk_combine;
     create(ctx, &pk_combine, m, n);
-    int ret = secp256k1_ec_pubkey_cmp(ctx, &pk_combine, pk);
-    return ret == 0;
+    if (memcmp(pk->data, pk_combine.data, sizeof(pk->data) / 2) == 0) {
+        int ret = secp256k1_ec_pubkey_cmp(ctx, &pk_combine, pk);
+        return ret == 0 ? 1 : -1;
+    }
+    return 0; 
 }
 
 int find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int>& _m, secp256k1_pubkey& pk)
@@ -3178,15 +3173,9 @@ int find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int>
 
     if (n > 0) {        
         set_int(cn, n);
-        if( check(ctx,&pk, cn, c1))
-            return n;
+        int c = check(ctx, &pk, cn, c1);
+        return n * c;
     }
-    /*
-    if (n < 0) {
-        set_int(cn, -n);
-        set_int(c1, BabyNUM);
-        return check(ctx, &pk, c1, cn);
-    }*/
     return 0;
 }
 
@@ -3239,8 +3228,12 @@ bool bingo(secp256k1_context* ctx, CKey& r, RhoState& rs, int m)
     unsigned char c1[33] = {0};
     c1[31] = 0x01;
     unsigned char cm[33] = {0};
-    set_int(cm, m);
-    secp256k1_ec_seckey_negate(ctx, cm);
+    set_int(cm, m > 0 ? m : -m);
+    if (m > 0) {
+        secp256k1_ec_seckey_negate(ctx, cm);
+    } else {
+        secp256k1_ec_seckey_negate(ctx, c1);
+    }
     unsigned char cm2[33] = {0};
     memcpy(cm2, rs.mx, sizeof(rs.mx));
     unsigned char cn2[33] = {0};
@@ -3421,6 +3414,17 @@ static RPCHelpMan testmvp()
                 set_int(cm, m);
                 secp256k1_ec_pubkey_tweak_add(ctx, &pk_mock_parse_mul, cm);
                 assert(secp256k1_ec_pubkey_cmp(ctx, &pk_mock_parse_mul, &rs.x) == 0);
+
+                //测试 bingo 负值的情况
+                CPubKey cpbkey_x_neg(ParseHex("0426ca9cdb76480823bdb3704aff808419e4a42d9a7d809165309dc1e8e553fbb56bf8d52125af79a3b578e44e872ff6c2820c9a2cf0e948ba4bd27f245d88cd8c"));
+                secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
+                auto n2_neg = ParseHex("b76a58f34def9cb37355d0a681a542fd7fbf151ab1d403ad8ef68aab6cc57334");
+                auto m2_neg = ParseHex("35266ab52bf281a79208ee7ca4221609882f42f961eef3ed1e32dd71b9023725");
+                memcpy(rs.nx, n2_neg.data(), n2_neg.size());
+                memcpy(rs.mx, m2_neg.data(), m2_neg.size());
+                CKey mvp_mock2;
+                bingo(ctx, mvp_mock2, rs, -m);
+                assert(memcmp(mvp_mock.data(), mvp_mock2.data(), mvp_mock.size()) == 0);
             }
 
             //生成babystep
@@ -3462,11 +3466,15 @@ static RPCHelpMan testmvp()
                 //1G+mvp
                 CPubKey cpbkey2(ParseHex("0437428773f4bec8f6909ddc53627d892b9e96745c4898f51ffd37fa8c2dafaedc3ab158f7ece4572be1dd7cdf43ffa7171bead852f1650b9ee4dd4dc8d6e8fcde"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2.data(), cpbkey2.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) != 0);
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 1);
+                //-(0x123G+mvp)
+                CPubKey cpbkey2neg(ParseHex("042fd9083bb6db687452d321c9c30018dc18a79e5e02f28fcd5d79260a14f0f4c9b653336b2143edbef0d880e6bcc7fc62c40818ed2f8c66010bf679fd45d60e2a"));
+                secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2neg.data(), cpbkey2neg.size());
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == -0x123);
                 // fffffffG+mvp
                 CPubKey cpbkey3(ParseHex("04abe5f23b66d0b2efdc7537f047297fa72641df9d49a8bbcc143142c5cfd2f873c74643e4a1160acbb234d537b0537efbeed96af5d21d15bada929a5648810c8d"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey3.data(), cpbkey3.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) != 0);
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0xfffffff);
                 unspent.pushKV("num", _Xvec.size());
             }
             //生成RhoState
@@ -3496,8 +3504,8 @@ static RPCHelpMan testmvp()
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
                 while (--i > 0)
                 {
-                    rho_F(ctx, rs[0]);
                     assert(check(ctx, &rs[0].x, rs[0].mx, rs[0].nx));
+                    rho_F(ctx, rs[0]);
                 }
             }
 
