@@ -2785,6 +2785,19 @@ void read_map(std::map<int64_t, int64_t>& _map) {
     }
 }
 
+class iLog
+{
+public:
+    std::ofstream ofs;
+    iLog()
+    {
+        ofs.open("D:\\iLog.txt", std::ios::app);
+    }
+    ~iLog()
+    {
+        ofs.close();
+    }
+};
 
 void save_babymap(std::map<uint64_t, int>& _map, int base)
 {
@@ -3303,7 +3316,7 @@ static RPCHelpMan testmvp()
             }
 
             secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-
+            iLog _log;
             if (ta == 12) {
                 //计算公钥对应的地址===============================================
                 //地址为 1E2hARCudWzdmMoteP12w8ceYruPaqyrrZ
@@ -3476,6 +3489,10 @@ static RPCHelpMan testmvp()
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey3.data(), cpbkey3.size());
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0xfffffff);
                 unspent.pushKV("num", _Xvec.size());
+
+                if (babynum == 0) {
+                    _log.ofs << "BabyNUM: " << BabyNUM << std::endl;
+                }
             }
             //生成RhoState
             if (ta == 120 && babynum == 888) {
@@ -3511,6 +3528,7 @@ static RPCHelpMan testmvp()
 
             if (ta == 8) {
                 RhoState rs[32] = {0};
+                std::string _logvec[32];
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
                 for (RhoState& r : rs) {
                     assert(check(ctx, &r.x, r.mx, r.nx));
@@ -3523,12 +3541,17 @@ static RPCHelpMan testmvp()
                 bool stop = false;
                 auto T = [&](int i) {
                     unsigned int count_try{0};
+                    unsigned int count_zero{0};
                     while (!stop) {
                         try {
                             ++count_try;
                             if (count_try % 10000 == 0)
                                 node.rpc_interruption_point();
                             rho_F(ctx, rs[i]);
+                            uint64_t t = *(uint64_t*)rs[i].x.data;
+                            if ((t & 0xFFFFFFF) == 0) {
+                                ++count_zero;
+                            }
                             int b = find_baby(ctx, _Xvec, _Mvec, rs[i].x);
                             if (b != 0) {
                                 CKey k;
@@ -3541,6 +3564,10 @@ static RPCHelpMan testmvp()
                             stop = true;
                         }
                     }
+                    std::stringstream ss;
+                    ss << count_try << " points, " << count_zero
+                       << " begain with 28 zero." << std::endl;
+                    _logvec[i] = ss.str();
                 };
 
                 std::vector<std::thread> threads;
@@ -3554,6 +3581,8 @@ static RPCHelpMan testmvp()
                     t.join();
                 }
                 saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
+                for (int i = 0; i < n_tasks; i++)
+                    _log.ofs << _logvec[i];
             }
 
             secp256k1_context_destroy(ctx);
