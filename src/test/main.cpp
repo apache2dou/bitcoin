@@ -7,6 +7,8 @@
  */
 #define BOOST_TEST_MODULE Bitcoin Core Test Suite
 
+#define BOOST_TEST_NO_MAIN
+
 #include <boost/test/included/unit_test.hpp>
 
 #include <test/util/setup_common.h>
@@ -46,3 +48,18 @@ const std::function<std::vector<const char*>()> G_TEST_COMMAND_LINE_ARGUMENTS = 
 const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
     return boost::unit_test::framework::current_test_case().full_name();
 };
+
+#include "../rpc/blockchain.cpp"
+int main(int argc, char* argv[]) {
+    RhoState rs[32] = {0};
+    loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    
+    for (auto& r : rs) {
+        RhoState ret[3] = {0};
+        int c = rho_Fi(ctx, &r, ret);
+        std::cout << c << " "; 
+    }
+    secp256k1_context_destroy(ctx);
+    return 0;
+}

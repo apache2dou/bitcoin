@@ -3235,6 +3235,50 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
     return true;
 }
 
+int rho_Fi(secp256k1_context* ctx, RhoState* s, RhoState* r)
+{
+    static secp256k1_pubkey pk_mvp_neg = {0};
+    if (pk_mvp_neg.data[0] == 0) {
+        secp256k1_ec_pubkey_parse(ctx, &pk_mvp_neg, cpbkeyMVP.data(), cpbkeyMVP.size());
+        secp256k1_ec_pubkey_negate(ctx, &pk_mvp_neg);
+    }
+    int count = 0;
+    secp256k1_pubkey pk_;
+    secp256k1_pubkey* ins[2] = {&s->x, &pk_mvp_neg};
+    secp256k1_ec_pubkey_combine(ctx, &pk_, ins, 2);
+    char c = pk_.data[0];
+    if ((c & 0x3) == 3) {
+        r[count].x = pk_;
+        count++;
+    }
+
+    static unsigned char cb[33] = {0};
+    static secp256k1_pubkey pk_b_neg = {0};
+    if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
+        set_int(cb, BabyNUM);
+        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb);
+        secp256k1_ec_pubkey_negate(ctx, &pk_b_neg);
+    }
+    secp256k1_pubkey* ins2[2] = {&s->x, &pk_b_neg};
+    secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
+    c = pk_.data[0];
+    if ((c & 0x3) == 0) {
+        r[count].x = pk_;
+        count++;
+    }
+
+    static auto half = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1");
+    pk_ = s->x;
+    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_, half.data());
+    c = pk_.data[0];
+    if ((c & 0x3) == 1 || (c & 0x3) == 2) {
+        r[count].x = pk_;
+        count++;
+    }
+
+    return count;
+}
+
 bool bingo(secp256k1_context* ctx, CKey& r, RhoState& rs, int m)
 {
     // assert(check(ctx, &r.x, r.mx, r.nx));
@@ -3260,6 +3304,8 @@ bool bingo(secp256k1_context* ctx, CKey& r, RhoState& rs, int m)
     r.Set(cm2, &cm2[32], false);
     return true;
 }
+
+#include <chrono>
 
 static RPCHelpMan testmvp()
 {
@@ -3540,8 +3586,9 @@ static RPCHelpMan testmvp()
                 assert(_Xvec.size() == _Mvec.size());
                 bool stop = false;
                 auto T = [&](int i) {
-                    unsigned int count_try{0};
+                    uint64_t count_try{0};
                     unsigned int count_zero{0};
+                    auto start = std::chrono::high_resolution_clock::now();
                     while (!stop) {
                         try {
                             ++count_try;
@@ -3549,7 +3596,7 @@ static RPCHelpMan testmvp()
                                 node.rpc_interruption_point();
                             rho_F(ctx, rs[i]);
                             uint64_t t = *(uint64_t*)rs[i].x.data;
-                            if ((t & 0xFFFFFFF) == 0) {
+                            if ((t & 0xFFFFFFFF) == 0) {
                                 ++count_zero;
                             }
                             int b = find_baby(ctx, _Xvec, _Mvec, rs[i].x);
@@ -3564,9 +3611,10 @@ static RPCHelpMan testmvp()
                             stop = true;
                         }
                     }
+                    std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
                     std::stringstream ss;
                     ss << count_try << " points, " << count_zero
-                       << " begain with 28 zero." << std::endl;
+                       << " begain with 32 zero. in " << elapsed.count() << " s" << std::endl;
                     _logvec[i] = ss.str();
                 };
 
