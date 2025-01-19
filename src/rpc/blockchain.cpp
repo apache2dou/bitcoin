@@ -3074,7 +3074,7 @@ bool loadRhoState(RhoState* s, int num)
     return true;
 }
 
-void savers(std::ofstream& file, RhoState& s)
+void savers(std::ofstream& file, const RhoState& s)
 {
     file << HexStr(s.x.data) << std::endl;
     file << HexStr(s.mx) << std::endl;
@@ -3082,7 +3082,8 @@ void savers(std::ofstream& file, RhoState& s)
     file << s.times << std::endl;
 }
 
-bool saveRhoState(RhoState* s, int num) {
+bool saveRhoState(const RhoState* s, int num)
+{
     std::ofstream file("D:\\RhoState.txt"); // 打开文件
     for (int i = 0; i < num; i++) {
         savers(file, s[i]);
@@ -3147,7 +3148,8 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
     secp256k1_context_destroy(ctx);
 }
 
-void create(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsigned char* n) {
+void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n)
+{
     static secp256k1_pubkey pk_mvp = {0};
     if (pk_mvp.data[0] == 0) {
         secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
@@ -3160,7 +3162,7 @@ void create(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsi
     secp256k1_ec_pubkey_combine(ctx, pk, ins, 2);
 }
 
-int check(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsigned char* n)
+int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n)
 {
     secp256k1_pubkey pk_combine;
     create(ctx, &pk_combine, m, n);
@@ -3171,7 +3173,7 @@ int check(secp256k1_context* ctx, secp256k1_pubkey* pk, unsigned char* m, unsign
     return 0; 
 }
 
-int find_baby(secp256k1_context* ctx,std::vector<uint64_t>& _x, std::vector<int>& _m, secp256k1_pubkey& pk)
+int find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const std::vector<int>& _m, const secp256k1_pubkey& pk)
 {
     uint64_t t = *(uint64_t*)pk.data;
     auto i = std::lower_bound(_x.begin(), _x.end(), t);
@@ -3235,35 +3237,43 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
     return true;
 }
 
-int rho_Fi(secp256k1_context* ctx, RhoState* s, RhoState* r)
+int rho_Fi(const secp256k1_context* ctx, const RhoState* const s, RhoState* r)
 {
     static secp256k1_pubkey pk_mvp_neg = {0};
+    static unsigned char c1_neg[33] = {0};    
     if (pk_mvp_neg.data[0] == 0) {
         secp256k1_ec_pubkey_parse(ctx, &pk_mvp_neg, cpbkeyMVP.data(), cpbkeyMVP.size());
         secp256k1_ec_pubkey_negate(ctx, &pk_mvp_neg);
+        c1_neg[31] = 0x01;
+        secp256k1_ec_seckey_negate(ctx, c1_neg);
     }
     int count = 0;
     secp256k1_pubkey pk_;
-    secp256k1_pubkey* ins[2] = {&s->x, &pk_mvp_neg};
+    const secp256k1_pubkey* ins[2] = {&s->x, &pk_mvp_neg};
     secp256k1_ec_pubkey_combine(ctx, &pk_, ins, 2);
     char c = pk_.data[0];
     if ((c & 0x3) == 3) {
         r[count].x = pk_;
+        memcpy(r[count].mx, s->mx, sizeof(s->mx));
+        memcpy(r[count].nx,s->nx,sizeof(s->nx));
+        secp256k1_ec_seckey_tweak_add(ctx, r[count].nx, c1_neg);
         count++;
     }
-
-    static unsigned char cb[33] = {0};
+    static unsigned char cb_neg[33] = {0};
     static secp256k1_pubkey pk_b_neg = {0};
     if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
-        set_int(cb, BabyNUM);
-        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb);
-        secp256k1_ec_pubkey_negate(ctx, &pk_b_neg);
+        set_int(cb_neg, BabyNUM);
+        secp256k1_ec_seckey_negate(ctx, cb_neg);
+        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
     }
-    secp256k1_pubkey* ins2[2] = {&s->x, &pk_b_neg};
+    const secp256k1_pubkey* ins2[2] = {&s->x, &pk_b_neg};
     secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
     c = pk_.data[0];
     if ((c & 0x3) == 0) {
         r[count].x = pk_;
+        memcpy(r[count].mx, s->mx, sizeof(s->mx));
+        memcpy(r[count].nx, s->nx, sizeof(s->nx));
+        secp256k1_ec_seckey_tweak_add(ctx, r[count].mx, cb_neg);
         count++;
     }
 
@@ -3273,13 +3283,17 @@ int rho_Fi(secp256k1_context* ctx, RhoState* s, RhoState* r)
     c = pk_.data[0];
     if ((c & 0x3) == 1 || (c & 0x3) == 2) {
         r[count].x = pk_;
+        memcpy(r[count].mx, s->mx, sizeof(s->mx));
+        memcpy(r[count].nx, s->nx, sizeof(s->nx));
+        secp256k1_ec_seckey_tweak_mul(ctx, r[count].mx, half.data());
+        secp256k1_ec_seckey_tweak_mul(ctx, r[count].nx, half.data());
         count++;
     }
 
     return count;
 }
 
-bool bingo(secp256k1_context* ctx, CKey& r, RhoState& rs, int m)
+bool bingo(const secp256k1_context* ctx, CKey& r, const RhoState& rs, int m)
 {
     // assert(check(ctx, &r.x, r.mx, r.nx));
     unsigned char c1[33] = {0};
@@ -3560,15 +3574,24 @@ static RPCHelpMan testmvp()
                     assert(check(ctx, &r.x, r.mx, r.nx));
                 }
             }
-            //测试 rho_F
+            //测试 rho_F 与 rho_Fi
             if (ta == 121) {
-                int i = 1000;
                 RhoState rs[32] = {0};
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
-                while (--i > 0)
-                {
-                    assert(check(ctx, &rs[0].x, rs[0].mx, rs[0].nx));
-                    rho_F(ctx, rs[0]);
+                for (int ii = 0; ii < 32; ii++) {
+                    int i = 10000;
+                    while (--i > 0) {
+                        assert(check(ctx, &rs[ii].x, rs[ii].mx, rs[ii].nx));
+                        RhoState tmp = rs[ii];
+                        rho_F(ctx, rs[ii]);
+                        RhoState ret[32] = {0};
+                        int c = rho_Fi(ctx, &rs[ii], ret);
+                        bool b = false;
+                        for (int j = 0; j < c; j++) {
+                            b = b || (secp256k1_ec_pubkey_cmp(ctx, &ret[j].x, &tmp.x) == 0);
+                        }
+                        assert(b);
+                    }
                 }
             }
 

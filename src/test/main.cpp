@@ -50,16 +50,48 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
 };
 
 #include "../rpc/blockchain.cpp"
+#include <stack>
 int main(int argc, char* argv[]) {
-    RhoState rs[32] = {0};
-    loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-    
-    for (auto& r : rs) {
-        RhoState ret[3] = {0};
-        int c = rho_Fi(ctx, &r, ret);
-        std::cout << c << " "; 
+    int limit = 10000;
+    BabyNUM = 715128831;
+    std::queue<RhoState> rs_q;
+    std::stack<RhoState> rs_s;
+    RhoState tmp1[32];
+    loadRhoState(tmp1, 32);
+    /* for (int i = 0; i < limit; i++) {
+        rs_s.push(tmp1[1]);
+        rho_F(ctx, tmp1[1]);
+    }*/
+    rs_q.push(tmp1[1]);
+    int count = 0;
+
+    int counts[32] = {0};
+    //打印一个key 方便测试。
+    auto print_pkey = [&](secp256k1_pubkey* pk) {
+        CPubKey cpk3;
+        size_t clen = CPubKey::SIZE;
+        secp256k1_ec_pubkey_serialize(ctx, (unsigned char*)cpk3.begin(), &clen, pk, SECP256K1_EC_UNCOMPRESSED);
+        std::cout << HexStr(cpk3) << std::endl;
+    };
+
+    while (count < limit)  {
+        auto& iter = rs_q.front();
+        RhoState ret[32] = {0};
+        int c = rho_Fi(ctx, &iter, ret);
+        count++;
+        counts[c]++;
+        for (int i = 0; i < c; i++) {
+            rs_q.push(ret[i]);
+            RhoState tmp = ret[i];
+            assert(check(ctx, &tmp.x, tmp.mx, tmp.nx));
+            rho_F(ctx, tmp);
+            assert(secp256k1_ec_pubkey_cmp(ctx, &tmp.x, &iter.x) == 0);
+        }
+        rs_q.pop();
+        std::cout << c << " ";
     }
+    std::cout << counts[0] << " " << counts[1] << " " << counts[2] << " " << counts[3] << "\r\n";
     secp256k1_context_destroy(ctx);
     return 0;
 }
