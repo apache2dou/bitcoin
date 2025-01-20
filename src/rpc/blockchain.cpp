@@ -3196,16 +3196,23 @@ int find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const std
 
 bool rho_F(secp256k1_context* ctx, RhoState& s)
 {
-    static secp256k1_pubkey pk_mvp = {0};
-    if (pk_mvp.data[0] == 0) {
-        secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
-    }
-    char c = s.x.data[0];
-    if ((c & 0x3) == 0) {
+    char c = (s.x.data[0] & 0xF);
+    auto fun = [&](unsigned char t) {
+        unsigned char _mul_n[33] = {0};
+        _mul_n[31] = t;
+        int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, _mul_n);
+        assert(r == 1);
+        r = secp256k1_ec_seckey_tweak_mul(ctx, s.mx, _mul_n);
+        assert(r == 1);
+        r = secp256k1_ec_seckey_tweak_mul(ctx, s.nx, _mul_n);
+        assert(r == 1);
+    };
+    switch (c) {
+    case 0: {
         static unsigned char cb[33] = {0};
         static secp256k1_pubkey pk_b = {0};
         if (pk_b.data[0] == 0 && pk_b.data[4] == 0) {
-            set_int(cb, BabyNUM);
+            set_int(cb, 1023);
             secp256k1_ec_pubkey_create(ctx, &pk_b, cb);
         }
         secp256k1_pubkey pk_ = s.x;
@@ -3214,7 +3221,13 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         assert(r == 1);
         r = secp256k1_ec_seckey_tweak_add(ctx, s.mx, cb);
         assert(r == 1);
-    } else if ((c & 0x3) == 3) {
+        break;
+    }
+    case 1: {
+        static secp256k1_pubkey pk_mvp = {0};
+        if (pk_mvp.data[0] == 0) {
+            secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
+        }
         unsigned char c1[33] = {0};
         c1[31] = 0x01;
         secp256k1_pubkey pk_ = s.x;
@@ -3223,21 +3236,18 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         assert(r == 1);
         r = secp256k1_ec_seckey_tweak_add(ctx, s.nx, c1);
         assert(r == 1);
-    } else {
-        unsigned char c2[33] = {0};
-        c2[31] = 0x02;
-        int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, c2);
-        assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_mul(ctx, s.mx, c2);
-        assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_mul(ctx, s.nx, c2);
-        assert(r == 1);
+        break;
+    }
+    default: {
+        char mul[0x10] = {1, 1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43};
+        fun(mul[c]);
+    }
     }
     s.times++;
     return true;
 }
 
-int rho_Fi(const secp256k1_context* ctx, const RhoState* const s, RhoState* r)
+int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs)
 {
     static secp256k1_pubkey pk_mvp_neg = {0};
     static unsigned char c1_neg[33] = {0};    
@@ -3249,47 +3259,63 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const s, RhoState* r)
     }
     int count = 0;
     secp256k1_pubkey pk_;
-    const secp256k1_pubkey* ins[2] = {&s->x, &pk_mvp_neg};
+    const secp256k1_pubkey* ins[2] = {&src_rs->x, &pk_mvp_neg};
     secp256k1_ec_pubkey_combine(ctx, &pk_, ins, 2);
     char c = pk_.data[0];
-    if ((c & 0x3) == 3) {
-        r[count].x = pk_;
-        memcpy(r[count].mx, s->mx, sizeof(s->mx));
-        memcpy(r[count].nx,s->nx,sizeof(s->nx));
-        secp256k1_ec_seckey_tweak_add(ctx, r[count].nx, c1_neg);
+    if ((c & 0xF) == 1) {
+        ret_rs[count].x = pk_;
+        memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
+        memcpy(ret_rs[count].nx,src_rs->nx,sizeof(src_rs->nx));
+        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].nx, c1_neg);
         count++;
     }
     static unsigned char cb_neg[33] = {0};
     static secp256k1_pubkey pk_b_neg = {0};
     if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
-        set_int(cb_neg, BabyNUM);
+        set_int(cb_neg, 1023);
         secp256k1_ec_seckey_negate(ctx, cb_neg);
         secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
     }
-    const secp256k1_pubkey* ins2[2] = {&s->x, &pk_b_neg};
+    const secp256k1_pubkey* ins2[2] = {&src_rs->x, &pk_b_neg};
     secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
     c = pk_.data[0];
-    if ((c & 0x3) == 0) {
-        r[count].x = pk_;
-        memcpy(r[count].mx, s->mx, sizeof(s->mx));
-        memcpy(r[count].nx, s->nx, sizeof(s->nx));
-        secp256k1_ec_seckey_tweak_add(ctx, r[count].mx, cb_neg);
+    if ((c & 0xF) == 0) {
+        ret_rs[count].x = pk_;
+        memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
+        memcpy(ret_rs[count].nx, src_rs->nx, sizeof(src_rs->nx));
+        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].mx, cb_neg);
         count++;
     }
 
     static auto half = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1");
-    pk_ = s->x;
-    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_, half.data());
-    c = pk_.data[0];
-    if ((c & 0x3) == 1 || (c & 0x3) == 2) {
-        r[count].x = pk_;
-        memcpy(r[count].mx, s->mx, sizeof(s->mx));
-        memcpy(r[count].nx, s->nx, sizeof(s->nx));
-        secp256k1_ec_seckey_tweak_mul(ctx, r[count].mx, half.data());
-        secp256k1_ec_seckey_tweak_mul(ctx, r[count].nx, half.data());
-        count++;
-    }
+    static auto s3 = ParseHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9d1c9e899ca306ad27fe1945de0242b81");
+    static auto s5 = ParseHex("66666666666666666666666666666665e445f1f5dfb6a67e4cba8c385348e6e7");
+    static auto s7 = ParseHex("49249249249249249249249249249248c79facd43214c011123c1b03a93412a5");
+    static auto s11 = ParseHex("a2e8ba2e8ba2e8ba2e8ba2e8ba2e8ba219b51835b55cc30ebfe2f6599bc56f58");
+    static auto s13 = ParseHex("13b13b13b13b13b13b13b13b13b13b139834d5ea5c40a9dd3623dfe3727a53ca");
+    static auto s17 = ParseHex("b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b3cf1205578ac9da84876751cccf355b3d");
+    static auto s19 = ParseHex("5e50d79435e50d79435e50d79435e50d0168d81f18283b088a0a22d59013fd18");
+    static auto s23 = ParseHex("de9bd37a6f4de9bd37a6f4de9bd37a6e33075be9fc98324a377f471645bfdfb3");
+    static auto s29 = ParseHex("34f72c234f72c234f72c234f72c234f6e8d4baf1ef4cd1b4160836df57375cf3");
+    static auto s31 = ParseHex("c6318c6318c6318c6318c6318c6318c535b0ab052cdd6347081ebcd01d113ac7");
+    static auto s37 = ParseHex("59f22983759f22983759f22983759f2225ea694a21e915b420cd5f7d95437eb6");
+    static auto s41 = ParseHex("3831f3831f3831f3831f3831f3831f37ea8a4977522f296ac6346c2b65e6723a");
+    static auto s43 = ParseHex("ee23b88ee23b88ee23b88ee23b88ee2289f00efa4fb4acde4746ab4d686218fb");
 
+    const unsigned char* scalars[0x10] = {nullptr, nullptr, half.data(), s3.data(), s5.data(), s7.data(), s11.data(), s13.data(), s17.data(), s19.data(), s23.data(), s29.data(), s31.data(), s37.data(), s41.data(), s43.data()};
+    for (int i = 2; i < 0x10; i++) {
+        pk_ = src_rs->x;
+        secp256k1_ec_pubkey_tweak_mul(ctx, &pk_, scalars[i]);
+        c = pk_.data[0];
+        if ((c & 0xF) == i) {
+            ret_rs[count].x = pk_;
+            memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
+            memcpy(ret_rs[count].nx, src_rs->nx, sizeof(src_rs->nx));
+            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].mx, scalars[i]);
+            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].nx, scalars[i]);
+            count++;
+        }
+    }
     return count;
 }
 

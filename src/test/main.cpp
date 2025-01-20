@@ -54,15 +54,14 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
 int main(int argc, char* argv[]) {
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
     int limit = 10000;
-    BabyNUM = 715128831;
     std::queue<RhoState> rs_q;
     std::stack<RhoState> rs_s;
     RhoState tmp1[32];
     loadRhoState(tmp1, 32);
-    /* for (int i = 0; i < limit; i++) {
+    for (int i = 0; i < limit; i++) {
         rs_s.push(tmp1[1]);
         rho_F(ctx, tmp1[1]);
-    }*/
+    }
     rs_q.push(tmp1[1]);
     int count = 0;
 
@@ -91,7 +90,10 @@ int main(int argc, char* argv[]) {
         rs_q.pop();
         std::cout << c << " ";
     }
-    std::cout << counts[0] << " " << counts[1] << " " << counts[2] << " " << counts[3] << "\r\n";
+    std::cout << "\r\n";
+    for (int i = 0; i < 32; i++) {
+        std::cout << counts[i] << " ";
+    }
     secp256k1_context_destroy(ctx);
     return 0;
 }
