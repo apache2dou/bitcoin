@@ -3207,12 +3207,12 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         r = secp256k1_ec_seckey_tweak_mul(ctx, s.nx, _mul_n);
         assert(r == 1);
     };
-    switch (c) {
+    switch (/*c*/ 0) {
     case 0: {
         static unsigned char cb[33] = {0};
         static secp256k1_pubkey pk_b = {0};
         if (pk_b.data[0] == 0 && pk_b.data[4] == 0) {
-            set_int(cb, 1023);
+            set_int(cb, BabyNUM/*1023*/);
             secp256k1_ec_pubkey_create(ctx, &pk_b, cb);
         }
         secp256k1_pubkey pk_ = s.x;
