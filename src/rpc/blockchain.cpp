@@ -3249,6 +3249,26 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
 
 int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs)
 {
+    int count = 0;
+    secp256k1_pubkey pk_;
+    char c;
+    static unsigned char cb_neg[33] = {0};
+    static secp256k1_pubkey pk_b_neg = {0};
+    if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
+        set_int(cb_neg, BabyNUM/*1023*/);
+        secp256k1_ec_seckey_negate(ctx, cb_neg);
+        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
+    }
+    const secp256k1_pubkey* ins2[2] = {&src_rs->x, &pk_b_neg};
+    secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
+    c = pk_.data[0];
+    if (true /* (c & 0xF) == 0*/) {
+        ret_rs[count].x = pk_;
+        memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
+        memcpy(ret_rs[count].nx, src_rs->nx, sizeof(src_rs->nx));
+        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].mx, cb_neg);
+        count++;
+    } /*
     static secp256k1_pubkey pk_mvp_neg = {0};
     static unsigned char c1_neg[33] = {0};    
     if (pk_mvp_neg.data[0] == 0) {
@@ -3257,33 +3277,14 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
         c1_neg[31] = 0x01;
         secp256k1_ec_seckey_negate(ctx, c1_neg);
     }
-    int count = 0;
-    secp256k1_pubkey pk_;
     const secp256k1_pubkey* ins[2] = {&src_rs->x, &pk_mvp_neg};
     secp256k1_ec_pubkey_combine(ctx, &pk_, ins, 2);
-    char c = pk_.data[0];
+    c = pk_.data[0];
     if ((c & 0xF) == 1) {
         ret_rs[count].x = pk_;
         memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
         memcpy(ret_rs[count].nx,src_rs->nx,sizeof(src_rs->nx));
         secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].nx, c1_neg);
-        count++;
-    }
-    static unsigned char cb_neg[33] = {0};
-    static secp256k1_pubkey pk_b_neg = {0};
-    if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
-        set_int(cb_neg, 1023);
-        secp256k1_ec_seckey_negate(ctx, cb_neg);
-        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
-    }
-    const secp256k1_pubkey* ins2[2] = {&src_rs->x, &pk_b_neg};
-    secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
-    c = pk_.data[0];
-    if ((c & 0xF) == 0) {
-        ret_rs[count].x = pk_;
-        memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
-        memcpy(ret_rs[count].nx, src_rs->nx, sizeof(src_rs->nx));
-        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].mx, cb_neg);
         count++;
     }
 
@@ -3315,7 +3316,7 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
             secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].nx, scalars[i]);
             count++;
         }
-    }
+    }*/
     return count;
 }
 
@@ -3346,7 +3347,42 @@ bool bingo(const secp256k1_context* ctx, CKey& r, const RhoState& rs, int m)
 }
 
 #include <chrono>
+// 将vector保存到文件
+template <typename T>
+void saveVectorToFile(const std::vector<T>& vec, const std::string& filename)
+{
+    std::ofstream outFile(filename, std::ios::binary);
+    if (outFile.is_open()) {
+        // 写入vector的大小
+        size_t size = vec.size();
+        outFile.write(reinterpret_cast<const char*>(&size), sizeof(size));
+        // 写入vector的元素
+        outFile.write(reinterpret_cast<const char*>(vec.data()), size * sizeof(T));
+        outFile.close();
+    } else {
+        std::cerr << "无法打开文件: " << filename << std::endl;
+    }
+}
 
+// 从文件加载vector
+template <typename T>
+std::vector<T> loadVectorFromFile(const std::string& filename)
+{
+    std::vector<T> vec;
+    std::ifstream inFile(filename, std::ios::binary);
+    if (inFile.is_open()) {
+        // 读取vector的大小
+        size_t size;
+        inFile.read(reinterpret_cast<char*>(&size), sizeof(size));
+        vec.resize(size);
+        // 读取vector的元素
+        inFile.read(reinterpret_cast<char*>(vec.data()), size * sizeof(T));
+        inFile.close();
+    } else {
+        std::cerr << "无法打开文件: " << filename << std::endl;
+    }
+    return vec;
+}
 static RPCHelpMan testmvp()
 {
     return RPCHelpMan{
@@ -3550,11 +3586,20 @@ static RPCHelpMan testmvp()
                 }
                 unspent.pushKV("num", total);
             }
+            const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
+            const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
             //加载babystep 并简单测试
             if (ta == 119) {
                 std::vector<uint64_t> _Xvec;
                 std::vector<int> _Mvec;
-                read_babymap(_Xvec, _Mvec, babynum);
+                if (babynum == 888) {
+                    read_babymap(_Xvec, _Mvec, 0);
+                    saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
+                    saveVectorToFile<int>(_Mvec, _Mvec_name);
+                } else {
+                    _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
+                    _Mvec = loadVectorFromFile<int>(_Mvec_name);
+                }
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
                 //4GG+mvp
@@ -3575,6 +3620,14 @@ static RPCHelpMan testmvp()
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey3.data(), cpbkey3.size());
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0xfffffff);
                 unspent.pushKV("num", _Xvec.size());
+                //BabyNUM G+mvp
+                secp256k1_pubkey pk_combine;
+                unsigned char cm[33] = {0};
+                unsigned char cn[33] = {0};
+                set_int(cm, BabyNUM);
+                set_int(cn, 1);
+                create(ctx, &pk_combine, cm, cn);
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_combine) == BabyNUM);
 
                 if (babynum == 0) {
                     _log.ofs << "BabyNUM: " << BabyNUM << std::endl;
@@ -3630,7 +3683,8 @@ static RPCHelpMan testmvp()
                 }
                 std::vector<uint64_t> _Xvec;
                 std::vector<int> _Mvec;
-                read_babymap(_Xvec, _Mvec, babynum);
+                _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
+                _Mvec = loadVectorFromFile<int>(_Mvec_name);
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
                 bool stop = false;
