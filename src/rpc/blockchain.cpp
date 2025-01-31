@@ -3633,8 +3633,8 @@ static RPCHelpMan testmvp()
                     _log.ofs << "BabyNUM: " << BabyNUM << std::endl;
                 }
             }
-            //生成RhoState
-            if (ta == 120 && babynum == 888) {
+
+            auto initRhoState = [&]() {
                 RhoState rs[32] = {0};
                 for (RhoState& r : rs) {
                     CKey secret1, secret2;
@@ -3646,6 +3646,18 @@ static RPCHelpMan testmvp()
                     r.times = 0;
                 }
                 saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
+
+                // 获取当前时间点
+                auto now = std::chrono::system_clock::now();
+                // 将时间点转换为时间戳
+                std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
+                std::tm* localTime = std::localtime(&currentTime);
+
+                _log.ofs << "====RhoState refreshed at " << std::put_time(localTime, "%Y-%m-%d %H:%M:%S") << std::endl;
+            };
+            //生成RhoState
+            if (ta == 120 && babynum == 888) {
+                initRhoState();
 
                 RhoState rs2[32] = {0};
                 loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState));
@@ -3675,6 +3687,9 @@ static RPCHelpMan testmvp()
             }
 
             if (ta == 8) {
+                if (babynum == 1) {
+                    initRhoState();
+                }
                 RhoState rs[32] = {0};
                 std::string _logvec[32];
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
