@@ -83,7 +83,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < c; i++) {
             rs_q.push(ret[i]);
             RhoState tmp = ret[i];
-            assert(check(ctx, &tmp.x, tmp.mx, tmp.nx));
+            assert(check(ctx, &tmp.x, tmp.m, tmp.n));
             rho_F(ctx, tmp);
             assert(secp256k1_ec_pubkey_cmp(ctx, &tmp.x, &iter.x) == 0);
         }

@@ -3035,12 +3035,17 @@ static RPCHelpMan luckytxout()
 
 #include "../../secp256k1/include/secp256k1.h"
 
-class RhoState
+class SecPair
+{
+public:
+    unsigned char m[32];
+    unsigned char n[32];
+};
+
+class RhoState:public SecPair
 {
 public:
     secp256k1_pubkey x;
-    unsigned char mx[32];
-    unsigned char nx[32];
     uint64_t times;
 };
 
@@ -3051,9 +3056,9 @@ void loadrs(std::ifstream& file,RhoState& s)
         std::getline(file, line); // 读取一行到字符串line
         memcpy(s.x.data, ParseHex(line).data(), sizeof(s.x.data));
         std::getline(file, line); // 读取一行到字符串line
-        memcpy(s.mx, ParseHex(line).data(), sizeof(s.mx));
+        memcpy(s.m, ParseHex(line).data(), sizeof(s.m));
         std::getline(file, line); // 读取一行到字符串line
-        memcpy(s.nx, ParseHex(line).data(), sizeof(s.nx));
+        memcpy(s.n, ParseHex(line).data(), sizeof(s.n));
         std::getline(file, line); // 读取一行到字符串line
         sscanf(line.c_str(), "%llu", &s.times);
 
@@ -3077,8 +3082,8 @@ bool loadRhoState(RhoState* s, int num)
 void savers(std::ofstream& file, const RhoState& s)
 {
     file << HexStr(s.x.data) << std::endl;
-    file << HexStr(s.mx) << std::endl;
-    file << HexStr(s.nx) << std::endl;
+    file << HexStr(s.m) << std::endl;
+    file << HexStr(s.n) << std::endl;
     file << s.times << std::endl;
 }
 
@@ -3194,6 +3199,46 @@ int find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const std
     return 0;
 }
 
+bool giantStep(secp256k1_context* ctx, RhoState& s) {
+    static unsigned char cb[33] = {0};
+    static secp256k1_pubkey pk_b = {0};
+    if (pk_b.data[0] == 0 && pk_b.data[4] == 0) {
+        set_int(cb, BabyNUM /*1023*/);
+        secp256k1_ec_pubkey_create(ctx, &pk_b, cb);
+    }
+    secp256k1_pubkey pk_ = s.x;
+    secp256k1_pubkey* ins[2] = {&pk_, &pk_b};
+    int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
+    assert(r == 1);
+    r = secp256k1_ec_seckey_tweak_add(ctx, s.m, cb);
+    assert(r == 1);
+    return true;
+}
+
+int giantStepi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs)
+{
+    int count = 0;
+    secp256k1_pubkey pk_;
+
+    static unsigned char cb_neg[33] = {0};
+    static secp256k1_pubkey pk_b_neg = {0};
+    if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
+        set_int(cb_neg, BabyNUM /*1023*/);
+        secp256k1_ec_seckey_negate(ctx, cb_neg);
+        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
+    }
+    const secp256k1_pubkey* ins2[2] = {&src_rs->x, &pk_b_neg};
+    secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
+
+    ret_rs[count].x = pk_;
+    memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
+    memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
+    secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, cb_neg);
+    count++;
+
+    return count;
+}
+
 bool rho_F(secp256k1_context* ctx, RhoState& s)
 {
     char c = (s.x.data[0] & 0xF);
@@ -3202,9 +3247,9 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         _mul_n[31] = t;
         int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, _mul_n);
         assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_mul(ctx, s.mx, _mul_n);
+        r = secp256k1_ec_seckey_tweak_mul(ctx, s.m, _mul_n);
         assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_mul(ctx, s.nx, _mul_n);
+        r = secp256k1_ec_seckey_tweak_mul(ctx, s.n, _mul_n);
         assert(r == 1);
     };
     switch (/*c*/ 0) {
@@ -3219,7 +3264,7 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         secp256k1_pubkey* ins[2] = {&pk_, &pk_b};
         int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
         assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_add(ctx, s.mx, cb);
+        r = secp256k1_ec_seckey_tweak_add(ctx, s.m, cb);
         assert(r == 1);
         break;
     }
@@ -3234,7 +3279,7 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         secp256k1_pubkey* ins[2] = {&pk_, &pk_mvp};
         int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
         assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_add(ctx, s.nx, c1);
+        r = secp256k1_ec_seckey_tweak_add(ctx, s.n, c1);
         assert(r == 1);
         break;
     }
@@ -3264,9 +3309,9 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
     c = pk_.data[0];
     if (true /* (c & 0xF) == 0*/) {
         ret_rs[count].x = pk_;
-        memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
-        memcpy(ret_rs[count].nx, src_rs->nx, sizeof(src_rs->nx));
-        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].mx, cb_neg);
+        memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
+        memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
+        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, cb_neg);
         count++;
     } /*
     static secp256k1_pubkey pk_mvp_neg = {0};
@@ -3282,9 +3327,9 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
     c = pk_.data[0];
     if ((c & 0xF) == 1) {
         ret_rs[count].x = pk_;
-        memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
-        memcpy(ret_rs[count].nx,src_rs->nx,sizeof(src_rs->nx));
-        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].nx, c1_neg);
+        memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
+        memcpy(ret_rs[count].n,src_rs->n,sizeof(src_rs->n));
+        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].n, c1_neg);
         count++;
     }
 
@@ -3310,40 +3355,48 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
         c = pk_.data[0];
         if ((c & 0xF) == i) {
             ret_rs[count].x = pk_;
-            memcpy(ret_rs[count].mx, src_rs->mx, sizeof(src_rs->mx));
-            memcpy(ret_rs[count].nx, src_rs->nx, sizeof(src_rs->nx));
-            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].mx, scalars[i]);
-            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].nx, scalars[i]);
+            memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
+            memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
+            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].m, scalars[i]);
+            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].n, scalars[i]);
             count++;
         }
     }*/
     return count;
 }
 
-bool bingo(const secp256k1_context* ctx, CKey& r, const RhoState& rs, int m)
+bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, const SecPair& sp2)
 {
-    // assert(check(ctx, &r.x, r.mx, r.nx));
-    unsigned char c1[33] = {0};
-    c1[31] = 0x01;
-    unsigned char cm[33] = {0};
-    set_int(cm, m > 0 ? m : -m);
-    if (m > 0) {
-        secp256k1_ec_seckey_negate(ctx, cm);
-    } else {
-        secp256k1_ec_seckey_negate(ctx, c1);
-    }
+    unsigned char cm1[33] = {0};
+    unsigned char cn1[33] = {0};
     unsigned char cm2[33] = {0};
-    memcpy(cm2, rs.mx, sizeof(rs.mx));
     unsigned char cn2[33] = {0};
-    memcpy(cn2, rs.nx, sizeof(rs.nx));
-    secp256k1_ec_seckey_negate(ctx, cn2);
-    secp256k1_ec_seckey_tweak_add(ctx, cn2, c1);
-    secp256k1_ec_seckey_tweak_add(ctx, cm2, cm);
-    unsigned char cn2i[33] = {0};
-    secp256k1_ec_seckey_inverse(ctx, cn2i, cn2);
-    secp256k1_ec_seckey_tweak_mul(ctx, cm2, cn2i);
-    r.Set(cm2, &cm2[32], false);
+    memcpy(cm1, sp1.m, sizeof(sp1.m));
+    memcpy(cn1, sp1.n, sizeof(sp1.n));
+    memcpy(cm2, sp2.m, sizeof(sp2.m));
+    memcpy(cn2, sp2.n, sizeof(sp2.n));
+
+    secp256k1_ec_seckey_negate(ctx, cn1);
+    secp256k1_ec_seckey_negate(ctx, cm2);
+    secp256k1_ec_seckey_tweak_add(ctx, cn1, cn2);
+    secp256k1_ec_seckey_tweak_add(ctx, cm1, cm2);
+    unsigned char cn1i[33] = {0};
+    secp256k1_ec_seckey_inverse(ctx, cn1i, cn1);
+    secp256k1_ec_seckey_tweak_mul(ctx, cm1, cn1i);
+    r.Set(cm1, &cm1[32], false);
     return true;
+}
+
+bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp, int m)
+{
+    SecPair sp2 = {0};
+    set_int(sp2.m, m > 0 ? m : -m);
+    set_int(sp2.n, 0x01);
+    if (m < 0) {
+        secp256k1_ec_seckey_negate(ctx, sp2.m);
+        secp256k1_ec_seckey_negate(ctx, sp2.n);
+    } 
+    return bingo(ctx, r, sp, sp2);
 }
 
 #include <chrono>
@@ -3389,8 +3442,8 @@ static RPCHelpMan testmvp()
         "testmvp",
         "test around mvp",
         {
-            {"ta", RPCArg::Type::NUM, RPCArg::Optional::NO, "test args"},
-            {"num", RPCArg::Type::NUM, RPCArg::Optional::NO, "test args"},
+            {"ta", RPCArg::Type::NUM, RPCArg::Optional::NO, "test arg"},
+            {"ta2", RPCArg::Type::NUM, RPCArg::Optional::NO, "test arg2"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "", {
@@ -3402,7 +3455,7 @@ static RPCHelpMan testmvp()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
             NodeContext& node = EnsureAnyNodeContext(request.context);
             int32_t ta = self.Arg<std::int32_t>("ta");
-            int32_t babynum = self.Arg<std::int32_t>("num");
+            int32_t ta2 = self.Arg<std::int32_t>("ta2");
             UniValue unspent(UniValue::VOBJ);
             unspent.pushKV("str", "");
             unspent.pushKV("str2", "");
@@ -3535,8 +3588,8 @@ static RPCHelpMan testmvp()
                 secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
                 auto n2 = ParseHex("4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0d");
                 auto m2 = ParseHex("cad9954ad40d7e586df711835bdde9f5327f99ed4d59ac4ea19f811b17340a1c");
-                memcpy(rs.nx, n2.data(), n2.size());
-                memcpy(rs.mx, m2.data(), m2.size());
+                memcpy(rs.n, n2.data(), n2.size());
+                memcpy(rs.m, m2.data(), m2.size());
                 CKey mvp_mock;
                 int m = 0x1ffffff;
                 bingo(ctx, mvp_mock, rs, m);
@@ -3555,8 +3608,8 @@ static RPCHelpMan testmvp()
                 secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
                 auto n2_neg = ParseHex("b76a58f34def9cb37355d0a681a542fd7fbf151ab1d403ad8ef68aab6cc57334");
                 auto m2_neg = ParseHex("35266ab52bf281a79208ee7ca4221609882f42f961eef3ed1e32dd71b9023725");
-                memcpy(rs.nx, n2_neg.data(), n2_neg.size());
-                memcpy(rs.mx, m2_neg.data(), m2_neg.size());
+                memcpy(rs.n, n2_neg.data(), n2_neg.size());
+                memcpy(rs.m, m2_neg.data(), m2_neg.size());
                 CKey mvp_mock2;
                 bingo(ctx, mvp_mock2, rs, -m);
                 assert(memcmp(mvp_mock.data(), mvp_mock2.data(), mvp_mock.size()) == 0);
@@ -3564,19 +3617,19 @@ static RPCHelpMan testmvp()
 
             //生成babystep
             if (ta == 118) {
-                if (babynum) {
-                    BabyNUM = babynum;
+                if (ta2) {
+                    BabyNUM = ta2;
                 } else {
-                    babynum = BabyNUM;
+                    ta2 = BabyNUM;
                 }
 
-                int batch = (babynum + 5) / 6; // 0x10000000;
-                int times = babynum / batch + 1;
+                int batch = (ta2 + 5) / 6; // 0x10000000;
+                int times = ta2 / batch + 1;
                 int64_t total = 0;
                 for (int i = 0; i < times; i++) {
                     int base = 1 + i * batch;
                     if (i == times - 1) {
-                        batch = babynum % batch;
+                        batch = ta2 % batch;
                     }
                     std::map<uint64_t, int> babyMap;
                     buildBabyMap(babyMap, batch, base);
@@ -3592,7 +3645,7 @@ static RPCHelpMan testmvp()
             if (ta == 119) {
                 std::vector<uint64_t> _Xvec;
                 std::vector<int> _Mvec;
-                if (babynum == 888) {
+                if (ta2 == 888) {
                     read_babymap(_Xvec, _Mvec, 0);
                     saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
                     saveVectorToFile<int>(_Mvec, _Mvec_name);
@@ -3629,7 +3682,7 @@ static RPCHelpMan testmvp()
                 create(ctx, &pk_combine, cm, cn);
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_combine) == BabyNUM);
 
-                if (babynum == 0) {
+                if (ta2 == 0) {
                     _log.ofs << "BabyNUM: " << BabyNUM << std::endl;
                 }
             }
@@ -3640,9 +3693,9 @@ static RPCHelpMan testmvp()
                     CKey secret1, secret2;
                     secret1.MakeNewKey(false);
                     secret2.MakeNewKey(false);
-                    memcpy(r.mx, secret1.data(), sizeof(r.mx));
-                    memcpy(r.nx, secret2.data(), sizeof(r.nx));
-                    create(ctx, &r.x, r.mx, r.nx);
+                    memcpy(r.m, secret1.data(), sizeof(r.m));
+                    memcpy(r.n, secret2.data(), sizeof(r.n));
+                    create(ctx, &r.x, r.m, r.n);
                     r.times = 0;
                 }
                 saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
@@ -3656,27 +3709,33 @@ static RPCHelpMan testmvp()
                 _log.ofs << "====RhoState refreshed at " << std::put_time(localTime, "%Y-%m-%d %H:%M:%S") << std::endl;
             };
             //生成RhoState
-            if (ta == 120 && babynum == 888) {
+            if (ta == 120 && ta2 == 888) {
                 initRhoState();
 
                 RhoState rs2[32] = {0};
                 loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState));
                 for (RhoState& r : rs2) {
-                    assert(check(ctx, &r.x, r.mx, r.nx));
+                    assert(check(ctx, &r.x, r.m, r.n));
                 }
             }
-            //测试 rho_F 与 rho_Fi
+            //测试 rho_F 与 rho_Fi 或者 giantStep 与 giantStepi
             if (ta == 121) {
                 RhoState rs[32] = {0};
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
+                auto f = rho_F;
+                auto fi = rho_Fi;
+                if (ta2 == 1) {
+                    f = giantStep;
+                    fi = giantStepi;
+                }
                 for (int ii = 0; ii < 32; ii++) {
                     int i = 10000;
                     while (--i > 0) {
-                        assert(check(ctx, &rs[ii].x, rs[ii].mx, rs[ii].nx));
+                        assert(check(ctx, &rs[ii].x, rs[ii].m, rs[ii].n));
                         RhoState tmp = rs[ii];
-                        rho_F(ctx, rs[ii]);
+                        f(ctx, rs[ii]);
                         RhoState ret[32] = {0};
-                        int c = rho_Fi(ctx, &rs[ii], ret);
+                        int c = fi(ctx, &rs[ii], ret);
                         bool b = false;
                         for (int j = 0; j < c; j++) {
                             b = b || (secp256k1_ec_pubkey_cmp(ctx, &ret[j].x, &tmp.x) == 0);
@@ -3687,14 +3746,14 @@ static RPCHelpMan testmvp()
             }
 
             if (ta == 8) {
-                if (babynum == 1) {
+                if (ta2 == 1) {
                     initRhoState();
                 }
                 RhoState rs[32] = {0};
                 std::string _logvec[32];
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
                 for (RhoState& r : rs) {
-                    assert(check(ctx, &r.x, r.mx, r.nx));
+                    assert(check(ctx, &r.x, r.m, r.n));
                 }
                 std::vector<uint64_t> _Xvec;
                 std::vector<int> _Mvec;
@@ -3712,7 +3771,7 @@ static RPCHelpMan testmvp()
                             ++count_try;
                             if (count_try % 10000 == 0)
                                 node.rpc_interruption_point();
-                            rho_F(ctx, rs[i]);
+                            giantStep(ctx, rs[i]);
                             uint64_t t = *(uint64_t*)rs[i].x.data;
                             if ((t & 0xFFFFFFFF) == 0) {
                                 ++count_zero;
