@@ -52,7 +52,7 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
 #include "../rpc/blockchain.cpp"
 #include <stack>
 int main(int argc, char* argv[]) {
-    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    INIT _init;
     int limit = 10000;
     std::queue<RhoState> rs_q;
     std::stack<RhoState> rs_s;
@@ -94,6 +94,5 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < 32; i++) {
         std::cout << counts[i] << " ";
     }
-    secp256k1_context_destroy(ctx);
     return 0;
 }

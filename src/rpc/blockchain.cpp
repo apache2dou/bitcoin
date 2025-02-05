@@ -3040,12 +3040,20 @@ class SecPair
 public:
     unsigned char m[32];
     unsigned char n[32];
+    bool rand() {
+
+    }
 };
 
-class RhoState:public SecPair
+class RhoPoint : public SecPair
 {
 public:
     secp256k1_pubkey x;
+};
+
+class RhoState : public RhoPoint
+{
+public:
     uint64_t times;
 };
 
@@ -3099,7 +3107,22 @@ bool saveRhoState(const RhoState* s, int num)
 
 static int64_t BabyNUM = 0x3fffffff;
 static CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
+static secp256k1_context* ctx = nullptr;
+static secp256k1_pubkey pk_mvp;
 
+class INIT
+{
+public:
+    INIT()
+    {
+        ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
+    }
+    ~INIT()
+    {
+        secp256k1_context_destroy(ctx);
+    }
+};
 
 static auto set_int = [](unsigned char* cn, int n) {
     unsigned char* p = (unsigned char*)&n;
@@ -3113,9 +3136,6 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
 {
     if (num <= 0)
         return;
-    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-    secp256k1_pubkey pk_mvp;
-    secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
     unsigned char cone[33] = {0};
     cone[31] = 0x01;
     _map.clear();
@@ -3148,17 +3168,11 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
     }
     for (auto& t : threads) {
         t.join();
-    }
-    
-    secp256k1_context_destroy(ctx);
+    }    
 }
 
 void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n)
 {
-    static secp256k1_pubkey pk_mvp = {0};
-    if (pk_mvp.data[0] == 0) {
-        secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
-    }
     secp256k1_pubkey mG;
     secp256k1_pubkey pk_tmp = pk_mvp;
     secp256k1_pubkey* ins[2] = {&pk_tmp, &mG};
@@ -3269,10 +3283,6 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         break;
     }
     case 1: {
-        static secp256k1_pubkey pk_mvp = {0};
-        if (pk_mvp.data[0] == 0) {
-            secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
-        }
         unsigned char c1[33] = {0};
         c1[31] = 0x01;
         secp256k1_pubkey pk_ = s.x;
@@ -3490,7 +3500,7 @@ static RPCHelpMan testmvp()
                 }
             }
 
-            secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+            INIT _init;
             iLog _log;
             if (ta == 12) {
                 //计算公钥对应的地址===============================================
@@ -3810,7 +3820,6 @@ static RPCHelpMan testmvp()
                     _log.ofs << _logvec[i];
             }
 
-            secp256k1_context_destroy(ctx);
             return unspent;
         },
     };
