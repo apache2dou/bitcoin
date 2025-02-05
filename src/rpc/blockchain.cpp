@@ -3032,8 +3032,10 @@ static RPCHelpMan luckytxout()
 }
 
 #include <util/strencodings.h>
-
 #include "../../secp256k1/include/secp256k1.h"
+
+static secp256k1_context* ctx = nullptr;
+void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 
 class SecPair
 {
@@ -3041,7 +3043,12 @@ public:
     unsigned char m[32];
     unsigned char n[32];
     bool rand() {
-
+        CKey secret1, secret2;
+        secret1.MakeNewKey(false);
+        secret2.MakeNewKey(false);
+        memcpy(m, secret1.data(), sizeof(m));
+        memcpy(n, secret2.data(), sizeof(n));
+        return true;
     }
 };
 
@@ -3049,6 +3056,11 @@ class RhoPoint : public SecPair
 {
 public:
     secp256k1_pubkey x;
+    bool rand() {
+        SecPair::rand();
+        create(ctx, &x, m, n);
+        return true;
+    }
 };
 
 class RhoState : public RhoPoint
@@ -3057,28 +3069,28 @@ public:
     uint64_t times;
 };
 
-void loadrs(std::ifstream& file,RhoState& s)
-{
-    std::string line;
-    if (file.is_open()) {
-        std::getline(file, line); // 读取一行到字符串line
-        memcpy(s.x.data, ParseHex(line).data(), sizeof(s.x.data));
-        std::getline(file, line); // 读取一行到字符串line
-        memcpy(s.m, ParseHex(line).data(), sizeof(s.m));
-        std::getline(file, line); // 读取一行到字符串line
-        memcpy(s.n, ParseHex(line).data(), sizeof(s.n));
-        std::getline(file, line); // 读取一行到字符串line
-        sscanf(line.c_str(), "%llu", &s.times);
 
-    } else {
-        std::cerr << "Unable to open file" << std::endl;
-    }
-}
 
 bool loadRhoState(RhoState* s, int num)
 {
-    std::ifstream file("D:\\RhoState.txt"); // 打开文件
+    auto loadrs = [](std::ifstream& file, RhoState& s) {
+        std::string line;
+        if (file.is_open()) {
+            std::getline(file, line); // 读取一行到字符串line
+            memcpy(s.x.data, ParseHex(line).data(), sizeof(s.x.data));
+            std::getline(file, line); // 读取一行到字符串line
+            memcpy(s.m, ParseHex(line).data(), sizeof(s.m));
+            std::getline(file, line); // 读取一行到字符串line
+            memcpy(s.n, ParseHex(line).data(), sizeof(s.n));
+            std::getline(file, line); // 读取一行到字符串line
+            sscanf(line.c_str(), "%llu", &s.times);
 
+        } else {
+            std::cerr << "Unable to open file" << std::endl;
+        }
+    };
+
+    std::ifstream file("D:\\RhoState.txt"); // 打开文件
     for (int i = 0; i < num; i++) {
         loadrs(file, s[i]);
     }
@@ -3087,16 +3099,15 @@ bool loadRhoState(RhoState* s, int num)
     return true;
 }
 
-void savers(std::ofstream& file, const RhoState& s)
-{
-    file << HexStr(s.x.data) << std::endl;
-    file << HexStr(s.m) << std::endl;
-    file << HexStr(s.n) << std::endl;
-    file << s.times << std::endl;
-}
 
 bool saveRhoState(const RhoState* s, int num)
 {
+    auto savers = [](std::ofstream& file, const RhoState& s) {
+        file << HexStr(s.x.data) << std::endl;
+        file << HexStr(s.m) << std::endl;
+        file << HexStr(s.n) << std::endl;
+        file << s.times << std::endl;
+    };
     std::ofstream file("D:\\RhoState.txt"); // 打开文件
     for (int i = 0; i < num; i++) {
         savers(file, s[i]);
@@ -3106,8 +3117,7 @@ bool saveRhoState(const RhoState* s, int num)
 }
 
 static int64_t BabyNUM = 0x3fffffff;
-static CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
-static secp256k1_context* ctx = nullptr;
+static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 static secp256k1_pubkey pk_mvp;
 
 class INIT
@@ -3286,7 +3296,7 @@ bool rho_F(secp256k1_context* ctx, RhoState& s)
         unsigned char c1[33] = {0};
         c1[31] = 0x01;
         secp256k1_pubkey pk_ = s.x;
-        secp256k1_pubkey* ins[2] = {&pk_, &pk_mvp};
+        const secp256k1_pubkey* ins[2] = {&pk_, &pk_mvp};
         int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
         assert(r == 1);
         r = secp256k1_ec_seckey_tweak_add(ctx, s.n, c1);
@@ -3700,12 +3710,7 @@ static RPCHelpMan testmvp()
             auto initRhoState = [&]() {
                 RhoState rs[32] = {0};
                 for (RhoState& r : rs) {
-                    CKey secret1, secret2;
-                    secret1.MakeNewKey(false);
-                    secret2.MakeNewKey(false);
-                    memcpy(r.m, secret1.data(), sizeof(r.m));
-                    memcpy(r.n, secret2.data(), sizeof(r.n));
-                    create(ctx, &r.x, r.m, r.n);
+                    r.rand();                    
                     r.times = 0;
                 }
                 saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
