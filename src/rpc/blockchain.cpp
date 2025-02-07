@@ -3134,12 +3134,16 @@ public:
     }
 };
 
-static auto set_int = [](unsigned char* cn, int n) {
+static auto set_int = [](unsigned char* cn, int64_t n) {
     unsigned char* p = (unsigned char*)&n;
     cn[31] = p[0];
     cn[30] = p[1];
     cn[29] = p[2];
     cn[28] = p[3];
+    cn[27] = p[4];
+    cn[26] = p[5];
+    cn[25] = p[6];
+    cn[24] = p[7];
 };
 
 void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
@@ -3156,10 +3160,10 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
         m[t] = n;
     };
     auto calc = [&](int _n, int _b) {
-        secp256k1_pubkey pk_tmp = pk_mvp;
+        secp256k1_pubkey pk_tmp = {0};
         unsigned char cb[33] = {0};
         set_int(cb, _b);
-        secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, cb);
+        secp256k1_ec_pubkey_create(ctx, &pk_tmp, cb);
         pushKey(_map, pk_tmp, _b);
         for (int i = 1; i < _n; i++) {
             secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, cone);
@@ -3181,14 +3185,29 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
     }    
 }
 
+bool isZero(const unsigned char* m) {
+    char t[32] = {0};
+    return memcmp(m, t, sizeof(t)) == 0;
+}
+
 void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n)
 {
-    secp256k1_pubkey mG;
+    secp256k1_pubkey mG = {0};
     secp256k1_pubkey pk_tmp = pk_mvp;
     secp256k1_pubkey* ins[2] = {&pk_tmp, &mG};
-    secp256k1_ec_pubkey_create(ctx, &mG, m);
-    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_tmp, n);
-    secp256k1_ec_pubkey_combine(ctx, pk, ins, 2);
+    bool m0 = isZero(m);
+    bool n0 = isZero(n);
+    *pk = {0};
+    if (!m0) {
+        secp256k1_ec_pubkey_create(ctx, &mG, m);
+        *pk = mG;
+    }
+    if (!n0) {
+        secp256k1_ec_pubkey_tweak_mul(ctx, &pk_tmp, n);
+        *pk = pk_tmp;
+    }
+    if (!m0 && !n0)
+        secp256k1_ec_pubkey_combine(ctx, pk, ins, 2);
 }
 
 int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n)
@@ -3211,13 +3230,12 @@ int find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const std
     std::ptrdiff_t index = std::distance(_x.begin(), i);
     int n = _m[index];
 
-    unsigned char c1[33] = {0};
-    c1[31] = 0x01;
+    unsigned char c0[33] = {0};
     unsigned char cn[33] = {0};
 
     if (n > 0) {        
         set_int(cn, n);
-        int c = check(ctx, &pk, cn, c1);
+        int c = check(ctx, &pk, cn, c0);
         return n * c;
     }
     return 0;
@@ -3227,7 +3245,7 @@ bool giantStep(secp256k1_context* ctx, RhoState& s) {
     static unsigned char cb[33] = {0};
     static secp256k1_pubkey pk_b = {0};
     if (pk_b.data[0] == 0 && pk_b.data[4] == 0) {
-        set_int(cb, BabyNUM /*1023*/);
+        set_int(cb, BabyNUM * 2);
         secp256k1_ec_pubkey_create(ctx, &pk_b, cb);
     }
     secp256k1_pubkey pk_ = s.x;
@@ -3236,6 +3254,7 @@ bool giantStep(secp256k1_context* ctx, RhoState& s) {
     assert(r == 1);
     r = secp256k1_ec_seckey_tweak_add(ctx, s.m, cb);
     assert(r == 1);
+    s.times++;
     return true;
 }
 
@@ -3247,7 +3266,7 @@ int giantStepi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoSt
     static unsigned char cb_neg[33] = {0};
     static secp256k1_pubkey pk_b_neg = {0};
     if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
-        set_int(cb_neg, BabyNUM /*1023*/);
+        set_int(cb_neg, BabyNUM * 2);
         secp256k1_ec_seckey_negate(ctx, cb_neg);
         secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
     }
@@ -3411,10 +3430,8 @@ bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp, int m)
 {
     SecPair sp2 = {0};
     set_int(sp2.m, m > 0 ? m : -m);
-    set_int(sp2.n, 0x01);
     if (m < 0) {
         secp256k1_ec_seckey_negate(ctx, sp2.m);
-        secp256k1_ec_seckey_negate(ctx, sp2.n);
     } 
     return bingo(ctx, r, sp, sp2);
 }
@@ -3601,12 +3618,12 @@ static RPCHelpMan testmvp()
                 //5294873c75604180f16f2dec603b8e786da8feefc71baa101e6138205f8d5ba1  sec
                 //2a9d0567a5531408a7927116cdebd3d2e246df1ed423bfb95ef661f7be5e0b3d  05838517687b13e266e3464a7acd81e85d049a9128bbbf1e6375bfa473714eb8
                 //m=1ffffff
-                //n2=4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0d
+                //n2=4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0c
                 //m2=cad9954ad40d7e586df711835bdde9f5327f99ed4d59ac4ea19f811b17340a1c
-                CPubKey cpbkey_x(ParseHex("0426ca9cdb76480823bdb3704aff808419e4a42d9a7d809165309dc1e8e553fbb594072adeda50865c4a871bb178d0093d7df365d30f16b745b42d80daa2772ea3"));
+                CPubKey cpbkey_x(ParseHex("04e785ae5d44cac354b410c1b2b90ff2ff848333f059a53daec1fd693592a47c7d491b8040ed7a05bebcd057cb50f8427abced2a6bdd5028fa16f280faeaf60cee"));
                 RhoState rs = {0};
                 secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
-                auto n2 = ParseHex("4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0d");
+                auto n2 = ParseHex("4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0c");
                 auto m2 = ParseHex("cad9954ad40d7e586df711835bdde9f5327f99ed4d59ac4ea19f811b17340a1c");
                 memcpy(rs.n, n2.data(), n2.size());
                 memcpy(rs.m, m2.data(), m2.size());
@@ -3616,23 +3633,28 @@ static RPCHelpMan testmvp()
                 CPubKey pk_got = mvp_mock.GetPubKey();
                 CPubKey pk_mock(ParseHex("042a9d0567a5531408a7927116cdebd3d2e246df1ed423bfb95ef661f7be5e0b3d05838517687b13e266e3464a7acd81e85d049a9128bbbf1e6375bfa473714eb8"));
                 assert(pk_got == pk_mock);
-                secp256k1_pubkey pk_mock_parse_mul;
-                secp256k1_ec_pubkey_parse(ctx, &pk_mock_parse_mul, pk_mock.data(), pk_mock.size());
-                unsigned char cm[33] = {0};
-                set_int(cm, m);
-                secp256k1_ec_pubkey_tweak_add(ctx, &pk_mock_parse_mul, cm);
-                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_mock_parse_mul, &rs.x) == 0);
+                secp256k1_pubkey pk_1ffffff;                
+                unsigned char c_1ffffff[33] = {0};
+                set_int(c_1ffffff, m);
+                secp256k1_ec_pubkey_create(ctx, &pk_1ffffff, c_1ffffff);
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_1ffffff, &rs.x) == 0);
+
+                //测试 create
+                RhoPoint rp = {0};
+                create(ctx, &rp.x, c_1ffffff, rp.n);
+                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_1ffffff, &rp.x) == 0);
 
                 //测试 bingo 负值的情况
-                CPubKey cpbkey_x_neg(ParseHex("0426ca9cdb76480823bdb3704aff808419e4a42d9a7d809165309dc1e8e553fbb56bf8d52125af79a3b578e44e872ff6c2820c9a2cf0e948ba4bd27f245d88cd8c"));
+                CPubKey cpbkey_x_neg(ParseHex("04e785ae5d44cac354b410c1b2b90ff2ff848333f059a53daec1fd693592a47c7db6e47fbf1285fa41432fa834af07bd854312d59422afd705e90d7f041509ef41"));
                 secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
-                auto n2_neg = ParseHex("b76a58f34def9cb37355d0a681a542fd7fbf151ab1d403ad8ef68aab6cc57334");
+                auto n2_neg = ParseHex("b76a58f34def9cb37355d0a681a542fd7fbf151ab1d403ad8ef68aab6cc57335");
                 auto m2_neg = ParseHex("35266ab52bf281a79208ee7ca4221609882f42f961eef3ed1e32dd71b9023725");
                 memcpy(rs.n, n2_neg.data(), n2_neg.size());
                 memcpy(rs.m, m2_neg.data(), m2_neg.size());
                 CKey mvp_mock2;
                 bingo(ctx, mvp_mock2, rs, -m);
                 assert(memcmp(mvp_mock.data(), mvp_mock2.data(), mvp_mock.size()) == 0);
+
             }
 
             //生成babystep
@@ -3675,32 +3697,55 @@ static RPCHelpMan testmvp()
                 }
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
-                //4GG+mvp
-                CPubKey cpbkey1(ParseHex("04f2046923f3d5060fec6d47770bef9ba2823ac38e317ef33544c2947dbc77f938739f18b1175ca0034752c519d420e2378c9caa6d1806581c7f4e30b8a962847e"));
+                //4GG
+                CPubKey cpbkey1(ParseHex("04100f44da696e71672791d0a09b7bde459f1215a29b3c03bfefd7835b39a48db0dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
                 secp256k1_pubkey pk_parsed;
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey1.data(), cpbkey1.size());
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0);
-                //1G+mvp
-                CPubKey cpbkey2(ParseHex("0437428773f4bec8f6909ddc53627d892b9e96745c4898f51ffd37fa8c2dafaedc3ab158f7ece4572be1dd7cdf43ffa7171bead852f1650b9ee4dd4dc8d6e8fcde"));
+                //1G
+                CPubKey cpbkey2(ParseHex("0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2.data(), cpbkey2.size());
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 1);
-                //-(0x123G+mvp)
-                CPubKey cpbkey2neg(ParseHex("042fd9083bb6db687452d321c9c30018dc18a79e5e02f28fcd5d79260a14f0f4c9b653336b2143edbef0d880e6bcc7fc62c40818ed2f8c66010bf679fd45d60e2a"));
+                //-(0x123G )
+                CPubKey cpbkey2neg(ParseHex("049bdf9e67a5d0c9956a075a010fe762beb633500431dee78efebc527e53313b336bd9b9de5a69f1f11db3d86d90e9352d6f80d9c989d172a5e816b5017162d07f"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2neg.data(), cpbkey2neg.size());
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == -0x123);
-                // fffffffG+mvp
-                CPubKey cpbkey3(ParseHex("04abe5f23b66d0b2efdc7537f047297fa72641df9d49a8bbcc143142c5cfd2f873c74643e4a1160acbb234d537b0537efbeed96af5d21d15bada929a5648810c8d"));
+                // fffffffG
+                CPubKey cpbkey3(ParseHex("045091541f5851647a93df0c14152a4516169b5bd6acf793dee8c9dfa27710e4b0ec29eeaf3d880023f13d2608200ec283c971081ee88ec05247bf6d65b57e8537"));
                 secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey3.data(), cpbkey3.size());
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0xfffffff);
                 unspent.pushKV("num", _Xvec.size());
-                //BabyNUM G+mvp
-                secp256k1_pubkey pk_combine;
-                unsigned char cm[33] = {0};
-                unsigned char cn[33] = {0};
+                //BabyNUM G
+                secp256k1_pubkey pk_babynum;
+                unsigned char cm[33] = {0};                
                 set_int(cm, BabyNUM);
-                set_int(cn, 1);
-                create(ctx, &pk_combine, cm, cn);
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_combine) == BabyNUM);
+                secp256k1_ec_pubkey_create(ctx, &pk_babynum, cm);
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_babynum) == BabyNUM);
+                secp256k1_ec_pubkey_negate(ctx, &pk_babynum);
+                assert(find_baby(ctx, _Xvec, _Mvec, pk_babynum) == -BabyNUM);
+
+                //测试 giantStep
+                unsigned char c_babynum_neg[33] = {0};
+                set_int(c_babynum_neg, BabyNUM);
+                secp256k1_ec_seckey_negate(ctx, c_babynum_neg);
+
+                auto N_1 = ParseHex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140");
+                int find_ret[3] = {BabyNUM - 1, -1, -BabyNUM};
+                RhoState rs = {0};
+                memcpy(rs.m, N_1.data(), N_1.size());
+                for (int j = 0; j < 3; j++) {
+                    secp256k1_ec_seckey_tweak_add(ctx, rs.m, c_babynum_neg);
+                    if (j == 2) {
+                        unsigned char c_one[33] = {0};
+                        c_one[31] = 0x01;
+                        secp256k1_ec_seckey_tweak_add(ctx, rs.m, c_one);
+                    }
+                    create(ctx, &rs.x, rs.m, rs.n);                    
+                    RhoState tmp = rs;
+                    assert(find_baby(ctx, _Xvec, _Mvec, tmp.x) == 0);
+                    giantStep(ctx, tmp);
+                    assert(find_baby(ctx, _Xvec, _Mvec, tmp.x) == find_ret[j]);
+                }
 
                 if (ta2 == 0) {
                     _log.ofs << "BabyNUM: " << BabyNUM << std::endl;
