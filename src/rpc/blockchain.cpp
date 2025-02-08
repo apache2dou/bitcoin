@@ -2789,12 +2789,15 @@ class iLog
 {
 public:
     std::ofstream ofs;
-    iLog()
+    std::ifstream ifs;
+    iLog(const std::string& filename)
     {
-        ofs.open("D:\\iLog.txt", std::ios::app);
+        ofs.open(filename.c_str(), std::ios::app);
+        ifs.open(filename.c_str());
     }
     ~iLog()
     {
+        ifs.close();
         ofs.close();
     }
 };
@@ -3050,6 +3053,10 @@ public:
         memcpy(n, secret2.data(), sizeof(n));
         return true;
     }
+    bool operator==(const SecPair& other) const
+    {
+        return std::equal(this->m, m + 32, other.m) && std::equal(this->n, n + 32, other.n);
+    }
 };
 
 class RhoPoint : public SecPair
@@ -3120,6 +3127,24 @@ static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 static secp256k1_pubkey pk_mvp;
 
+static auto s2 = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f36681b20a1");
+static auto s4 = ParseHex("bfffffffffffffffffffffffffffffff0c0325ad0376782ccfddc6e99c18b0f1");
+static auto s8 = ParseHex("dffffffffffffffffffffffffffffffee3590149d95f8c3447d811bb362f7919");
+static auto s16 = ParseHex("51745d1745d1745d1745d1745d1745d10cda8c1adaae61874ff17b2ccde2b7ac");
+static auto s32 = ParseHex("8a3d70a3d70a3d70a3d70a3d70a3d7098dc4d3725469c72a812f0a18d6d59e0e");
+static auto s64 = ParseHex("451eb851eb851eb851eb851eb851eb84c6e269b92a34e3954097850c6b6aca0f");
+static auto s128 = ParseHex("4b3e45306eb3e45306eb3e45306eb3e3f3690462f00f4ac5740e4392e6b60021");
+static auto s256 = ParseHex("9c4111fadce5754c335f096b05fe49a10b33ef4929ead477c96a91e5c992fd05");
+static auto s512 = ParseHex("311c0193eb7d0aa6758c07e2997135400d5408d906037aa54c70bcef9f7617f5");
+static auto s1024 = ParseHex("6cfacbb5a8479eda94328e3ff023afb41f05ab3c09d02becd3d3caf1f83bc628");
+static auto s2048 = ParseHex("367d65dad3a3cf6d4a19471ff811d7da3f82d59e04e815f669e9e578fc1de314");
+static auto s4096 = ParseHex("c1b5fd75f38d2d1e4117710f04ccc01cc429dcd91a6b4dbced421509bff49970");
+static auto s8192 = ParseHex("596d25371ee2ff16dc346b5eca4ca74240e367013a83835177fd8524d7342f72");
+static auto s16384 = ParseHex("2e432b87f8b58ce64a75fb126b16eb37d01a3756e529eb50caa33362c6de4bc1");
+const unsigned char* adds_sec[0x10] = {nullptr, nullptr, s2.data(), s4.data(), s8.data(), s16.data(), s32.data(), s64.data(), s128.data(), s256.data(), s512.data(), s1024.data(), s2048.data(), s4096.data(), s8192.data(), s16384.data()};
+static secp256k1_pubkey adds_pub[2][0x10] = {0};
+static unsigned char adds_sec_neg[0x10][33] = {0};
+
 class INIT
 {
 public:
@@ -3127,6 +3152,13 @@ public:
     {
         ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
         secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
+
+        for (int i = 2; i < 16; i++) {
+            memcpy(adds_sec_neg[i], adds_sec[i], s2.size());
+            secp256k1_ec_seckey_negate(ctx, adds_sec_neg[i]);
+            secp256k1_ec_pubkey_create(ctx, &adds_pub[0][i], adds_sec[i]);
+            secp256k1_ec_pubkey_create(ctx, &adds_pub[1][i], adds_sec_neg[i]);
+        }
     }
     ~INIT()
     {
@@ -3282,50 +3314,45 @@ int giantStepi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoSt
     return count;
 }
 
+auto fun_add = [](RhoState& s, unsigned char t) {
+    secp256k1_pubkey pk = s.x;
+    secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t]};
+    int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
+    assert(r == 1);
+    r = secp256k1_ec_seckey_tweak_add(ctx, s.m, adds_sec[t]);
+    assert(r == 1);
+};
+
+auto fun_mul = [](RhoState& s, unsigned char t) {
+    unsigned char _mul_n[33] = {0};
+    _mul_n[31] = t;
+    int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, _mul_n);
+    assert(r == 1);
+    r = secp256k1_ec_seckey_tweak_mul(ctx, s.m, _mul_n);
+    assert(r == 1);
+    r = secp256k1_ec_seckey_tweak_mul(ctx, s.n, _mul_n);
+    assert(r == 1);
+};
 bool rho_F(secp256k1_context* ctx, RhoState& s)
 {
     char c = (s.x.data[0] & 0xF);
-    auto fun = [&](unsigned char t) {
-        unsigned char _mul_n[33] = {0};
-        _mul_n[31] = t;
-        int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, _mul_n);
-        assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_mul(ctx, s.m, _mul_n);
-        assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_mul(ctx, s.n, _mul_n);
-        assert(r == 1);
-    };
-    switch (/*c*/ 0) {
-    case 0: {
-        static unsigned char cb[33] = {0};
-        static secp256k1_pubkey pk_b = {0};
-        if (pk_b.data[0] == 0 && pk_b.data[4] == 0) {
-            set_int(cb, BabyNUM/*1023*/);
-            secp256k1_ec_pubkey_create(ctx, &pk_b, cb);
-        }
-        secp256k1_pubkey pk_ = s.x;
-        secp256k1_pubkey* ins[2] = {&pk_, &pk_b};
-        int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
-        assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_add(ctx, s.m, cb);
-        assert(r == 1);
+    switch (c) {
+    case 0:
+        fun_mul(s, 2);
         break;
-    }
     case 1: {
         unsigned char c1[33] = {0};
         c1[31] = 0x01;
-        secp256k1_pubkey pk_ = s.x;
-        const secp256k1_pubkey* ins[2] = {&pk_, &pk_mvp};
+        secp256k1_pubkey pk = s.x;
+        const secp256k1_pubkey* ins[2] = {&pk, &pk_mvp};
         int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
         assert(r == 1);
         r = secp256k1_ec_seckey_tweak_add(ctx, s.n, c1);
         assert(r == 1);
         break;
     }
-    default: {
-        char mul[0x10] = {1, 1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43};
-        fun(mul[c]);
-    }
+    default:
+        fun_add(s, c);
     }
     s.times++;
     return true;
@@ -3336,23 +3363,18 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
     int count = 0;
     secp256k1_pubkey pk_;
     char c;
-    static unsigned char cb_neg[33] = {0};
-    static secp256k1_pubkey pk_b_neg = {0};
-    if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
-        set_int(cb_neg, BabyNUM/*1023*/);
-        secp256k1_ec_seckey_negate(ctx, cb_neg);
-        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
-    }
-    const secp256k1_pubkey* ins2[2] = {&src_rs->x, &pk_b_neg};
-    secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
+    static auto half = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1");
+    pk_ = src_rs->x;
+    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_, half.data());    
     c = pk_.data[0];
-    if (true /* (c & 0xF) == 0*/) {
+    if ((c & 0xF) == 0) {
         ret_rs[count].x = pk_;
         memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
         memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
-        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, cb_neg);
+        secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].m, half.data());
+        secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].n, half.data());
         count++;
-    } /*
+    } 
     static secp256k1_pubkey pk_mvp_neg = {0};
     static unsigned char c1_neg[33] = {0};    
     if (pk_mvp_neg.data[0] == 0) {
@@ -3371,41 +3393,27 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
         secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].n, c1_neg);
         count++;
     }
-
-    static auto half = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1");
-    static auto s3 = ParseHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9d1c9e899ca306ad27fe1945de0242b81");
-    static auto s5 = ParseHex("66666666666666666666666666666665e445f1f5dfb6a67e4cba8c385348e6e7");
-    static auto s7 = ParseHex("49249249249249249249249249249248c79facd43214c011123c1b03a93412a5");
-    static auto s11 = ParseHex("a2e8ba2e8ba2e8ba2e8ba2e8ba2e8ba219b51835b55cc30ebfe2f6599bc56f58");
-    static auto s13 = ParseHex("13b13b13b13b13b13b13b13b13b13b139834d5ea5c40a9dd3623dfe3727a53ca");
-    static auto s17 = ParseHex("b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b3cf1205578ac9da84876751cccf355b3d");
-    static auto s19 = ParseHex("5e50d79435e50d79435e50d79435e50d0168d81f18283b088a0a22d59013fd18");
-    static auto s23 = ParseHex("de9bd37a6f4de9bd37a6f4de9bd37a6e33075be9fc98324a377f471645bfdfb3");
-    static auto s29 = ParseHex("34f72c234f72c234f72c234f72c234f6e8d4baf1ef4cd1b4160836df57375cf3");
-    static auto s31 = ParseHex("c6318c6318c6318c6318c6318c6318c535b0ab052cdd6347081ebcd01d113ac7");
-    static auto s37 = ParseHex("59f22983759f22983759f22983759f2225ea694a21e915b420cd5f7d95437eb6");
-    static auto s41 = ParseHex("3831f3831f3831f3831f3831f3831f37ea8a4977522f296ac6346c2b65e6723a");
-    static auto s43 = ParseHex("ee23b88ee23b88ee23b88ee23b88ee2289f00efa4fb4acde4746ab4d686218fb");
-
-    const unsigned char* scalars[0x10] = {nullptr, nullptr, half.data(), s3.data(), s5.data(), s7.data(), s11.data(), s13.data(), s17.data(), s19.data(), s23.data(), s29.data(), s31.data(), s37.data(), s41.data(), s43.data()};
+        
     for (int i = 2; i < 0x10; i++) {
-        pk_ = src_rs->x;
-        secp256k1_ec_pubkey_tweak_mul(ctx, &pk_, scalars[i]);
+        const secp256k1_pubkey* ins2[2] = {&src_rs->x, &adds_pub[1][i]};
+        secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
         c = pk_.data[0];
         if ((c & 0xF) == i) {
             ret_rs[count].x = pk_;
             memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
             memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
-            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].m, scalars[i]);
-            secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].n, scalars[i]);
+            secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, adds_sec_neg[i]);
             count++;
         }
-    }*/
+    }
     return count;
 }
 
 bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, const SecPair& sp2)
 {
+    if (sp1 == sp2) {
+        return false;
+    }
     unsigned char cm1[33] = {0};
     unsigned char cn1[33] = {0};
     unsigned char cm2[33] = {0};
@@ -3528,7 +3536,31 @@ static RPCHelpMan testmvp()
             }
 
             INIT _init;
-            iLog _log;
+            iLog _log("D:\\iLog.txt");
+            iLog _dplog("D:\\DistinguishablePoints.txt");
+
+            auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
+                std::string line;
+                if (fs.is_open()) {
+                    while (std::getline(fs, line)) {
+                        uint64_t dp_index;
+                        SecPair sp;
+                        sscanf(line.c_str(), "%llu", &dp_index);
+                        std::getline(fs, line);
+                        memcpy(sp.m, ParseHex(line).data(), sizeof(sp.m));
+                        std::getline(fs, line);
+                        memcpy(sp.n, ParseHex(line).data(), sizeof(sp.n));
+                        dpMap[dp_index] = sp;
+                    }
+                }
+            };
+            auto saveDP = [](std::ofstream& fs, uint64_t index, SecPair& sp) {
+                static RecursiveMutex dplog_mutex;
+                LOCK(dplog_mutex);
+                fs << index << std::endl;
+                fs << HexStr(sp.m) << std::endl;
+                fs << HexStr(sp.n) << std::endl;
+            };
             if (ta == 12) {
                 //计算公钥对应的地址===============================================
                 //地址为 1E2hARCudWzdmMoteP12w8ceYruPaqyrrZ
@@ -3655,6 +3687,31 @@ static RPCHelpMan testmvp()
                 bingo(ctx, mvp_mock2, rs, -m);
                 assert(memcmp(mvp_mock.data(), mvp_mock2.data(), mvp_mock.size()) == 0);
 
+                SecPair sp1 = {0};
+                sp1.rand();
+                SecPair sp2 = sp1;
+                assert(sp2 == sp1);
+                assert(memcmp(sp1.m, sp2.m, sizeof(sp1.m)) == 0);
+                assert(memcmp(sp1.n, sp2.n, sizeof(sp1.n)) == 0);
+
+                //测试 saveDP 和 loadDP                
+                {
+                    iLog _testlog("D:\\test.txt");
+                    std::map<uint64_t, SecPair> _testMap;
+                    RhoState rss[1024];
+                    for (RhoState& r : rss) {
+                        r.rand();
+                        uint64_t t = *(uint64_t*)r.x.data;
+                        saveDP(_testlog.ofs, t, r);
+                    }
+                    loadDP(_testlog.ifs, _testMap);
+                    for (RhoState& r : rss) {
+                        uint64_t t = *(uint64_t*)r.x.data;
+                        auto it = _testMap.find(t);
+                        assert(it != _testMap.end() && it->second == r);
+                    }
+                }
+                std::remove("D:\\test.txt");
             }
 
             //生成babystep
@@ -3805,10 +3862,16 @@ static RPCHelpMan testmvp()
                 }
             }
 
-            if (ta == 8) {
-                if (ta2 == 1) {
-                    initRhoState();
+            auto distinguishable = [](const secp256k1_pubkey& x) {
+                uint64_t r = 0;
+                uint64_t t = *(uint64_t*)x.data;
+                if ((t & 0xFFFFFFFF) == 0) {
+                    r = *(uint64_t*)(x.data + 4);
                 }
+                return r;
+            };
+
+            if (ta == 8) {
                 RhoState rs[32] = {0};
                 std::string _logvec[32];
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
@@ -3822,19 +3885,43 @@ static RPCHelpMan testmvp()
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
                 bool stop = false;
+
+                std::map<uint64_t, SecPair> dpMap;
+                RecursiveMutex dpMap_mutex;
+                {
+                    LOCK(dpMap_mutex);
+                    loadDP(_dplog.ifs, dpMap);
+                }
+                
                 auto T = [&](int i) {
                     uint64_t count_try{0};
-                    unsigned int count_zero{0};
+                    unsigned int count_dstg{0};
                     auto start = std::chrono::high_resolution_clock::now();
                     while (!stop) {
                         try {
                             ++count_try;
                             if (count_try % 10000 == 0)
                                 node.rpc_interruption_point();
-                            giantStep(ctx, rs[i]);
-                            uint64_t t = *(uint64_t*)rs[i].x.data;
-                            if ((t & 0xFFFFFFFF) == 0) {
-                                ++count_zero;
+                            rho_F(ctx, rs[i]);
+                            if (auto d = distinguishable(rs[i].x)) {
+                                ++count_dstg;
+                                saveDP(_dplog.ofs, d, rs[i]);
+                                LOCK(dpMap_mutex);
+                                auto iter = dpMap.find(d);
+                                if (iter != dpMap.end()) {
+                                    CKey k;
+                                    if (bingo(ctx, k, rs[i], iter->second)) {
+                                        save_key(k);
+                                        stop = true;
+                                    } else {
+                                        _logvec[i] += "!!!!short circulation!!!!\n";
+                                    }
+                                } else {
+                                    dpMap[d] = rs[i];
+                                }
+                                if (i !=0) {
+                                    rs[i].rand();
+                                }
                             }
                             int b = find_baby(ctx, _Xvec, _Mvec, rs[i].x);
                             if (b != 0) {
@@ -3842,6 +3929,8 @@ static RPCHelpMan testmvp()
                                 if (bingo(ctx, k, rs[i], b)) {
                                     save_key(k);
                                     stop = true;
+                                } else {
+                                    _logvec[i] += "!!!!short circulation!!!!\n";
                                 }
                             }
                         } catch (...) {
@@ -3850,9 +3939,9 @@ static RPCHelpMan testmvp()
                     }
                     std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
                     std::stringstream ss;
-                    ss << count_try << " points, " << count_zero
-                       << " begain with 32 zero. in " << elapsed.count() << " s" << std::endl;
-                    _logvec[i] = ss.str();
+                    ss << count_try << " points, " << count_dstg
+                       << " distinguishable. in " << elapsed.count() << " s" << std::endl;
+                    _logvec[i] += ss.str();
                 };
 
                 std::vector<std::thread> threads;

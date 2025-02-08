@@ -55,14 +55,11 @@ int main(int argc, char* argv[]) {
     INIT _init;
     int limit = 10000;
     std::queue<RhoState> rs_q;
-    std::stack<RhoState> rs_s;
-    RhoState tmp1[32];
-    loadRhoState(tmp1, 32);
-    for (int i = 0; i < limit; i++) {
-        rs_s.push(tmp1[1]);
-        rho_F(ctx, tmp1[1]);
-    }
-    rs_q.push(tmp1[1]);
+
+    RhoState tmp_origin;
+    tmp_origin.rand();
+    rho_F(ctx, tmp_origin);
+
     int count = 0;
 
     int counts[32] = {0};
@@ -75,19 +72,18 @@ int main(int argc, char* argv[]) {
     };
 
     while (count < limit)  {
-        auto& iter = rs_q.front();
+        tmp_origin.rand();
+        //rho_F(ctx, tmp_origin);
         RhoState ret[32] = {0};
-        int c = rho_Fi(ctx, &iter, ret);
+        int c = rho_Fi(ctx, &tmp_origin, ret);
         count++;
         counts[c]++;
         for (int i = 0; i < c; i++) {
-            rs_q.push(ret[i]);
             RhoState tmp = ret[i];
             assert(check(ctx, &tmp.x, tmp.m, tmp.n));
             rho_F(ctx, tmp);
-            assert(secp256k1_ec_pubkey_cmp(ctx, &tmp.x, &iter.x) == 0);
+            assert(secp256k1_ec_pubkey_cmp(ctx, &tmp.x, &tmp_origin.x) == 0);
         }
-        rs_q.pop();
         std::cout << c << " ";
     }
     std::cout << "\r\n";
