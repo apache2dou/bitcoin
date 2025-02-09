@@ -3481,6 +3481,118 @@ std::vector<T> loadVectorFromFile(const std::string& filename)
     }
     return vec;
 }
+
+
+auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
+    std::string line;
+    if (fs.is_open()) {
+        while (std::getline(fs, line)) {
+            uint64_t dp_index;
+            SecPair sp;
+            sscanf(line.c_str(), "%llu", &dp_index);
+            std::getline(fs, line);
+            memcpy(sp.m, ParseHex(line).data(), sizeof(sp.m));
+            std::getline(fs, line);
+            memcpy(sp.n, ParseHex(line).data(), sizeof(sp.n));
+            dpMap[dp_index] = sp;
+        }
+    }
+};
+auto saveDP = [](std::ofstream& fs, uint64_t index, SecPair& sp) {
+    static RecursiveMutex dplog_mutex;
+    LOCK(dplog_mutex);
+    fs << index << std::endl;
+    fs << HexStr(sp.m) << std::endl;
+    fs << HexStr(sp.n) << std::endl;
+};
+
+auto distinguishable = [](const secp256k1_pubkey& x) {
+    uint64_t r = 0;
+    uint64_t t = *(uint64_t*)x.data;
+    if ((t & 0xFFFFFFFF) == 0) {
+        r = *(uint64_t*)(x.data + 4);
+    }
+    return r;
+};
+
+static const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
+static const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
+class BabyGiant
+{
+private:
+    std::vector<uint64_t> _Xvec;
+    std::vector<int> _Mvec;
+
+public:
+    void prepare()
+    {
+        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
+        _Mvec = loadVectorFromFile<int>(_Mvec_name);
+        BabyNUM = _Xvec.size();
+        assert(_Xvec.size() == _Mvec.size());
+    }
+    bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
+    {
+        giantStep(ctx, rs);
+        if (auto d = distinguishable(rs.x)) {
+            ++count_dstg;
+        }
+        int b = find_baby(ctx, _Xvec, _Mvec, rs.x);
+        if (b != 0) {
+            CKey k;
+            if (bingo(ctx, k, rs, b)) {
+                save_key(k);
+            } else {
+                log += "!!!!short circulation!!!!\n";
+            }
+            return false;
+        }
+        return true;
+    }
+};
+
+class Rho
+{
+private:
+    std::map<uint64_t, SecPair> dpMap;
+    RecursiveMutex dpMap_mutex;
+    iLog _dplog;
+
+public:
+    Rho() : _dplog("D:\\DistinguishablePoints.txt") {}
+    void prepare()
+    {
+        LOCK(dpMap_mutex);
+        loadDP(_dplog.ifs, dpMap);
+    }
+
+    bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
+    {
+        rho_F(ctx, rs);
+        if (auto d = distinguishable(rs.x)) {
+            ++count_dstg;
+            saveDP(_dplog.ofs, d, rs);
+            LOCK(dpMap_mutex);
+            auto iter = dpMap.find(d);
+            if (iter != dpMap.end()) {
+                CKey k;
+                if (bingo(ctx, k, rs, iter->second)) {
+                    save_key(k);
+                } else {
+                    log += "!!!!short circulation!!!!\n";
+                }
+                return false;
+            } else {
+                dpMap[d] = rs;
+            }
+            if (i != 0 && count_dstg % 3 == 0) {
+                rs.rand();
+            }
+        }
+        return true;
+    }
+};
+
 static RPCHelpMan testmvp()
 {
     return RPCHelpMan{
@@ -3537,30 +3649,7 @@ static RPCHelpMan testmvp()
 
             INIT _init;
             iLog _log("D:\\iLog.txt");
-            iLog _dplog("D:\\DistinguishablePoints.txt");
 
-            auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
-                std::string line;
-                if (fs.is_open()) {
-                    while (std::getline(fs, line)) {
-                        uint64_t dp_index;
-                        SecPair sp;
-                        sscanf(line.c_str(), "%llu", &dp_index);
-                        std::getline(fs, line);
-                        memcpy(sp.m, ParseHex(line).data(), sizeof(sp.m));
-                        std::getline(fs, line);
-                        memcpy(sp.n, ParseHex(line).data(), sizeof(sp.n));
-                        dpMap[dp_index] = sp;
-                    }
-                }
-            };
-            auto saveDP = [](std::ofstream& fs, uint64_t index, SecPair& sp) {
-                static RecursiveMutex dplog_mutex;
-                LOCK(dplog_mutex);
-                fs << index << std::endl;
-                fs << HexStr(sp.m) << std::endl;
-                fs << HexStr(sp.n) << std::endl;
-            };
             if (ta == 12) {
                 //计算公钥对应的地址===============================================
                 //地址为 1E2hARCudWzdmMoteP12w8ceYruPaqyrrZ
@@ -3738,8 +3827,6 @@ static RPCHelpMan testmvp()
                 }
                 unspent.pushKV("num", total);
             }
-            const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
-            const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
             //加载babystep 并简单测试
             if (ta == 119) {
                 std::vector<uint64_t> _Xvec;
@@ -3862,37 +3949,16 @@ static RPCHelpMan testmvp()
                 }
             }
 
-            auto distinguishable = [](const secp256k1_pubkey& x) {
-                uint64_t r = 0;
-                uint64_t t = *(uint64_t*)x.data;
-                if ((t & 0xFFFFFFFF) == 0) {
-                    r = *(uint64_t*)(x.data + 4);
-                }
-                return r;
-            };
-
             if (ta == 8) {
-                RhoState rs[32] = {0};
                 std::string _logvec[32];
+                RhoState rs[32] = {0};
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
                 for (RhoState& r : rs) {
                     assert(check(ctx, &r.x, r.m, r.n));
                 }
-                std::vector<uint64_t> _Xvec;
-                std::vector<int> _Mvec;
-                _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
-                _Mvec = loadVectorFromFile<int>(_Mvec_name);
-                BabyNUM = _Xvec.size();
-                assert(_Xvec.size() == _Mvec.size());
                 bool stop = false;
-
-                std::map<uint64_t, SecPair> dpMap;
-                RecursiveMutex dpMap_mutex;
-                {
-                    LOCK(dpMap_mutex);
-                    loadDP(_dplog.ifs, dpMap);
-                }
-                
+                Rho _rho;
+                _rho.prepare();
                 auto T = [&](int i) {
                     uint64_t count_try{0};
                     unsigned int count_dstg{0};
@@ -3900,39 +3966,9 @@ static RPCHelpMan testmvp()
                     while (!stop) {
                         try {
                             ++count_try;
-                            if (count_try % 10000 == 0)
+                            if ((count_try & 0x1FFF) == 0)
                                 node.rpc_interruption_point();
-                            rho_F(ctx, rs[i]);
-                            if (auto d = distinguishable(rs[i].x)) {
-                                ++count_dstg;
-                                saveDP(_dplog.ofs, d, rs[i]);
-                                LOCK(dpMap_mutex);
-                                auto iter = dpMap.find(d);
-                                if (iter != dpMap.end()) {
-                                    CKey k;
-                                    if (bingo(ctx, k, rs[i], iter->second)) {
-                                        save_key(k);
-                                        stop = true;
-                                    } else {
-                                        _logvec[i] += "!!!!short circulation!!!!\n";
-                                    }
-                                } else {
-                                    dpMap[d] = rs[i];
-                                }
-                                if (i !=0) {
-                                    rs[i].rand();
-                                }
-                            }
-                            int b = find_baby(ctx, _Xvec, _Mvec, rs[i].x);
-                            if (b != 0) {
-                                CKey k;
-                                if (bingo(ctx, k, rs[i], b)) {
-                                    save_key(k);
-                                    stop = true;
-                                } else {
-                                    _logvec[i] += "!!!!short circulation!!!!\n";
-                                }
-                            }
+                            _rho.shoot(i, rs[i], count_dstg, _logvec[i]);
                         } catch (...) {
                             stop = true;
                         }
