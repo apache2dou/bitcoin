@@ -2790,6 +2790,7 @@ class iLog
 public:
     std::ofstream ofs;
     std::ifstream ifs;
+    iLog() = delete;
     iLog(const std::string& filename)
     {
         ofs.open(filename.c_str(), std::ios::app);
@@ -3038,6 +3039,7 @@ static RPCHelpMan luckytxout()
 #include "../../secp256k1/include/secp256k1.h"
 
 static secp256k1_context* ctx = nullptr;
+static iLog* g_log = nullptr;
 void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 
 class SecPair
@@ -3147,9 +3149,13 @@ static unsigned char adds_sec_neg[0x10][33] = {0};
 
 class INIT
 {
+private:
+    iLog _log;
+
 public:
-    INIT()
+    INIT() : _log("D:\\iLog.txt")
     {
+        g_log = &_log;
         ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
         secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
 
@@ -3162,6 +3168,7 @@ public:
     }
     ~INIT()
     {
+        g_log = nullptr;
         secp256k1_context_destroy(ctx);
     }
 };
@@ -3483,6 +3490,15 @@ std::vector<T> loadVectorFromFile(const std::string& filename)
 }
 
 
+auto distinguishable = [](const secp256k1_pubkey& x) {
+    uint64_t r = 0;
+    uint64_t t = *(uint64_t*)x.data;
+    if ((t & 0xFFFFFFFF) == 0) {
+        r = *(uint64_t*)(x.data + 4);
+    }
+    return r;
+};
+
 auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
     std::string line;
     if (fs.is_open()) {
@@ -3494,6 +3510,11 @@ auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
             memcpy(sp.m, ParseHex(line).data(), sizeof(sp.m));
             std::getline(fs, line);
             memcpy(sp.n, ParseHex(line).data(), sizeof(sp.n));
+
+            secp256k1_pubkey x_tmp;
+            create(ctx, &x_tmp, sp.m, sp.n);
+            assert(dp_index == distinguishable(x_tmp));
+            assert(dpMap.find(dp_index) == dpMap.end());
             dpMap[dp_index] = sp;
         }
     }
@@ -3504,15 +3525,6 @@ auto saveDP = [](std::ofstream& fs, uint64_t index, SecPair& sp) {
     fs << index << std::endl;
     fs << HexStr(sp.m) << std::endl;
     fs << HexStr(sp.n) << std::endl;
-};
-
-auto distinguishable = [](const secp256k1_pubkey& x) {
-    uint64_t r = 0;
-    uint64_t t = *(uint64_t*)x.data;
-    if ((t & 0xFFFFFFFF) == 0) {
-        r = *(uint64_t*)(x.data + 4);
-    }
-    return r;
 };
 
 static const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
@@ -3593,6 +3605,72 @@ public:
     }
 };
 
+static bool gameover = false;
+
+auto get_time()
+{
+    // 获取当前时间点
+    auto now = std::chrono::system_clock::now();
+    // 将时间点转换为时间戳
+    std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
+    std::tm* localTime = std::localtime(&currentTime);
+    return std::put_time(localTime, "%Y-%m-%d %H:%M:%S");
+}
+
+template <typename PLAYER>
+void play() {
+    std::string _logvec[32];
+    RhoState rs[32] = {0};
+    loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
+    for (RhoState& r : rs) {
+        assert(check(ctx, &r.x, r.m, r.n));
+    }
+    PLAYER _player;
+    _player.prepare();
+    auto T = [&](int i) {
+        uint64_t count_try{0};
+        unsigned int count_dstg{0};
+        auto start = std::chrono::high_resolution_clock::now();
+        while (!gameover) {
+            try {
+                ++count_try;
+                _player.shoot(i, rs[i], count_dstg, _logvec[i]);
+            } catch (...) {
+                gameover = true;
+            }
+        }
+        std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
+        if (elapsed.count() > 1800) {
+            std::stringstream ss;
+            if (i == 0) {
+                ss << count_try << " points, " << count_dstg
+                   << " distinguishable. in " << elapsed.count() << " s" << std::endl;
+            } else {
+                ss << count_dstg << " ";
+            }
+
+            _logvec[i] += ss.str();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
+    assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
+    threads.reserve(n_tasks);
+    for (int i = 0; i < n_tasks; ++i) {
+        threads.emplace_back(T, i);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
+    g_log->ofs << get_time() << " : ";
+    for (int i = 0; i < n_tasks; i++) {
+        g_log->ofs << _logvec[i];
+    }
+    g_log->ofs << " distinguishable aside." << std::endl;
+}
+
 static RPCHelpMan testmvp()
 {
     return RPCHelpMan{
@@ -3648,7 +3726,6 @@ static RPCHelpMan testmvp()
             }
 
             INIT _init;
-            iLog _log("D:\\iLog.txt");
 
             if (ta == 12) {
                 //计算公钥对应的地址===============================================
@@ -3892,7 +3969,7 @@ static RPCHelpMan testmvp()
                 }
 
                 if (ta2 == 0) {
-                    _log.ofs << "BabyNUM: " << BabyNUM << std::endl;
+                    g_log->ofs << "BabyNUM: " << BabyNUM << std::endl;
                 }
             }
 
@@ -3904,13 +3981,8 @@ static RPCHelpMan testmvp()
                 }
                 saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
 
-                // 获取当前时间点
-                auto now = std::chrono::system_clock::now();
-                // 将时间点转换为时间戳
-                std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
-                std::tm* localTime = std::localtime(&currentTime);
 
-                _log.ofs << "====RhoState refreshed at " << std::put_time(localTime, "%Y-%m-%d %H:%M:%S") << std::endl;
+                g_log->ofs << "====RhoState refreshed at " << get_time() << std::endl;
             };
             //生成RhoState
             if (ta == 120 && ta2 == 888) {
@@ -3950,49 +4022,18 @@ static RPCHelpMan testmvp()
             }
 
             if (ta == 8) {
-                std::string _logvec[32];
-                RhoState rs[32] = {0};
-                loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
-                for (RhoState& r : rs) {
-                    assert(check(ctx, &r.x, r.m, r.n));
-                }
-                bool stop = false;
-                Rho _rho;
-                _rho.prepare();
-                auto T = [&](int i) {
-                    uint64_t count_try{0};
-                    unsigned int count_dstg{0};
-                    auto start = std::chrono::high_resolution_clock::now();
-                    while (!stop) {
+                auto judge = [&node]() {
+                    while (!gameover) {
                         try {
-                            ++count_try;
-                            if ((count_try & 0x1FFF) == 0)
-                                node.rpc_interruption_point();
-                            _rho.shoot(i, rs[i], count_dstg, _logvec[i]);
+                            Sleep(1000);
+                            node.rpc_interruption_point();
                         } catch (...) {
-                            stop = true;
+                            gameover = true;
                         }
                     }
-                    std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
-                    std::stringstream ss;
-                    ss << count_try << " points, " << count_dstg
-                       << " distinguishable. in " << elapsed.count() << " s" << std::endl;
-                    _logvec[i] += ss.str();
                 };
-
-                std::vector<std::thread> threads;
-                int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
-                assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
-                threads.reserve(n_tasks);
-                for (int i = 0; i < n_tasks; ++i) {
-                    threads.emplace_back(T, i);
-                }
-                for (auto& t : threads) {
-                    t.join();
-                }
-                saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
-                for (int i = 0; i < n_tasks; i++)
-                    _log.ofs << _logvec[i];
+                std::thread t(judge);
+                play<Rho>();
             }
 
             return unspent;

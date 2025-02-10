@@ -51,8 +51,9 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
 
 #include "../rpc/blockchain.cpp"
 #include <stack>
-int main(int argc, char* argv[]) {
-    INIT _init;
+
+void test()
+{
     int limit = 10000;
     std::queue<RhoState> rs_q;
 
@@ -63,7 +64,7 @@ int main(int argc, char* argv[]) {
     int count = 0;
 
     int counts[32] = {0};
-    //打印一个key 方便测试。
+    // 打印一个key 方便测试。
     auto print_pkey = [&](secp256k1_pubkey* pk) {
         CPubKey cpk3;
         size_t clen = CPubKey::SIZE;
@@ -71,9 +72,9 @@ int main(int argc, char* argv[]) {
         std::cout << HexStr(cpk3) << std::endl;
     };
 
-    while (count < limit)  {
+    while (count < limit) {
         tmp_origin.rand();
-        //rho_F(ctx, tmp_origin);
+        // rho_F(ctx, tmp_origin);
         RhoState ret[32] = {0};
         int c = rho_Fi(ctx, &tmp_origin, ret);
         count++;
@@ -90,5 +91,26 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < 32; i++) {
         std::cout << counts[i] << " ";
     }
+}
+
+#include <csignal>
+// 信号处理函数
+void signalHandler(int signum)
+{
+    std::cout << "Interrupt signal (" << signum << ") received." << std::endl;
+    // 在这里可以添加程序退出前的清理代码
+    // 例如关闭文件、释放资源等
+    gameover = true;
+}
+void work() {
+    // 注册信号处理函数，捕获 SIGINT 信号
+    signal(SIGINT, signalHandler);
+    std::cout << "game starting..." << std::endl;
+    play<Rho>();
+}
+int main(int argc, char* argv[])
+{
+    INIT _init;
+    work();
     return 0;
 }
