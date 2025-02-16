@@ -363,6 +363,7 @@ private:
                 assert(ret);
             } else {
                 store_point(key);
+                std::cout << step_count_ << " ";
             }
         }
         return ret;
@@ -412,6 +413,7 @@ private:
             }
             BN_free(d);
         }
+        std::cout << "short circulation!\n";
         BN_free(denominator);
         return nullptr;
     }
