@@ -124,6 +124,49 @@ constexpr int r = 16;
 constexpr char STEP_FILE[] = "precomputed_steps.bin";
 constexpr char SAVE_FILE[] = "rho_distinguishpoints.bin";
 constexpr char KEY_FILE[] = "ec_keypair.txt";
+constexpr char LOG_FILE[] = "pollard_rho.log";
+
+class Logger
+{
+public:
+    static void init()
+    {
+        log_file.open(LOG_FILE, std::ios::app);
+        if (!log_file.is_open()) {
+            std::cerr << "Failed to open log file\n";
+        }
+        log("========== New Session ==========");
+    }
+
+    static void log(const std::string& message)
+    {
+        const auto now = std::time(nullptr);
+        char timestamp[64];
+        std::strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S] ", std::localtime(&now));
+
+        const std::string log_entry = timestamp + message + "\n";
+
+        // 输出到控制台
+        std::cout << log_entry;
+
+        // 写入日志文件
+        if (log_file.is_open()) {
+            log_file << log_entry;
+            //log_file.flush();
+        }
+    }
+
+    static void cleanup()
+    {
+        if (log_file.is_open()) {
+            log_file.close();
+        }
+    }
+
+private:
+    static std::ofstream log_file;
+};
+std::ofstream Logger::log_file;
 
 // 椭圆曲线上下文管理
 struct CurveContext {
@@ -414,7 +457,44 @@ public:
         return ret;
     }
 
-//private:
+    // 设置起始点函数
+    void set_initial(const BIGNUM* a, const BIGNUM* b)
+    {
+        // 复制并规范化输入参数
+        BN_mod(a_, a, ctx_->order, ctx_->bn_ctx);
+        BN_mod(b_, b, ctx_->order, ctx_->bn_ctx);
+
+        // 重新计算当前点
+        EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
+
+        // 重置步数计数器
+        step_count_ = 0;
+
+        // 记录日志
+        std::stringstream ss;
+        char* a_hex = BN_bn2hex(a_);
+        char* b_hex = BN_bn2hex(b_);
+        ss << "Set initial point - a: 0x" << a_hex << ", b: 0x" << b_hex;
+        Logger::log(ss.str());
+
+        // 打印初始点坐标
+        BIGNUM *x = BN_new(), *y = BN_new();
+        EC_POINT_get_affine_coordinates(ctx_->group, current_, x, y, ctx_->bn_ctx);
+        char* x_hex = BN_bn2hex(x);
+        char* y_hex = BN_bn2hex(y);
+        Logger::log("Initial point coordinates (x, y):\n"
+                    "X: 0x" +
+                    std::string(x_hex) + "\n" +
+                    "Y: 0x" + std::string(y_hex));
+
+        OPENSSL_free(a_hex);
+        OPENSSL_free(b_hex);
+        OPENSSL_free(x_hex);
+        OPENSSL_free(y_hex);
+        BN_free(x);
+        BN_free(y);
+    }
+    //private:
     bool load_precomputed_steps()
     {
         if (!fs::exists(STEP_FILE)) return false;
@@ -483,7 +563,7 @@ public:
                 assert(ret);
             } else {
                 store_point(key);
-                if ((key & 0xffff000000000000) == 0)
+                if ((key & 0xffffff0000000000) == 0)
                     std::cout << step_count_ << " ";
             }
         }
@@ -514,12 +594,14 @@ public:
         const uint64_t tail_length = dp.step;
         const uint64_t cycle_length = step_count_ - dp.step;
 
-        std::cout << "\n=== Cycle Detected ===\n"
-                  << "Tail length:  " << tail_length << "\n"
-                  << "Cycle length: " << cycle_length << "\n"
-                  << "Total steps:  " << step_count_ << "\n"
-                  << "Storage size: " << points_.size() << "\n"
-                  << "========================\n";
+        std::stringstream ss;
+        ss << "\n=== Cycle Detected ===\n"
+           << "Tail length:  " << tail_length << "\n"
+           << "Cycle length: " << cycle_length << "\n"
+           << "Total steps:  " << step_count_ << "\n"
+           << "Storage size: " << points_.size() << "\n"
+           << "========================\n";
+        Logger::log(ss.str());
 
         BIGNUM* denominator = BN_new();
         BN_mod_sub(denominator, b_, dp.b, ctx_->order, ctx_->bn_ctx);
@@ -532,7 +614,7 @@ public:
             }
             BN_free(d);
         }
-        std::cout << "short circulation!\n";
+        Logger::log("short circulation!");
         BN_free(denominator);
         return nullptr;
     }
@@ -703,7 +785,7 @@ void test_112() {
         // 验证结果
         if (BN_cmp(found, priv) == 0) {
             char* hex = BN_bn2hex(found);
-            std::cout << "\nSuccess! Private key: " << hex << "\n";
+            Logger::log("\nSuccess! Private key: " + std::string(hex));
             OPENSSL_free(hex);
         }
 
@@ -729,7 +811,11 @@ int main(int argc, char* argv[])
 {
     /* INIT _init;
     work();*/
+
+    Logger::init();
     test_112();
+    Logger::cleanup();
+
     std::wcout << L"请按任意键结束..." << std::endl;
     _getch(); // 等待用户按下任意键
     return 0;
