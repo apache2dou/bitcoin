@@ -111,8 +111,8 @@ void work() {
 
 
 //=======>>>>>>>>>>>>>
-#pragma comment(lib, "F:\\github\\bitcoin\\build\\vcpkg_installed\\x64-windows\\lib\\libcrypto.lib")
-#pragma comment(lib, "F:\\github\\bitcoin\\build\\vcpkg_installed\\x64-windows\\lib\\libssl.lib")
+#pragma comment(lib, "..\\..\\..\\build\\vcpkg_installed\\x64-windows\\lib\\libcrypto.lib")
+#pragma comment(lib, "..\\..\\..\\build\\vcpkg_installed\\x64-windows\\lib\\libssl.lib")
 
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
@@ -121,9 +121,9 @@ void work() {
 
 // 算法参数配置
 constexpr int r = 16;
-constexpr uint32_t DISTINGUISH_MASK = 0xFFFFFFFF;
 constexpr char STEP_FILE[] = "precomputed_steps.bin";
 constexpr char SAVE_FILE[] = "rho_distinguishpoints.bin";
+constexpr char KEY_FILE[] = "ec_keypair.txt";
 
 // 椭圆曲线上下文管理
 struct CurveContext {
@@ -132,12 +132,54 @@ struct CurveContext {
     BN_CTX* bn_ctx;
     const EC_POINT* Q; // 目标公钥
 
-    CurveContext(int nid = NID_secp112r1) : group(EC_GROUP_new_by_curve_name(nid)),
-                                            order(BN_new()),
+    CurveContext(int nid = NID_secp112r1) : order(BN_new()),
                                             bn_ctx(BN_CTX_new()),
                                             Q(nullptr)
     {
-        EC_GROUP_get_order(group, order, bn_ctx);
+        if (nid != 0) {
+            group = EC_GROUP_new_by_curve_name(nid);
+            EC_GROUP_get_order(group, order, bn_ctx);                                            
+        } else {
+            const char* p_hex = "800000000000001d";
+            const char* a_hex = "1";
+            const char* b_hex = "23";
+            const char* n_hex = "80000000b60d4577";
+            const char* gx_hex = "30d739f3e0467dd";
+            const char* gy_hex = "6993cc78c1d6fa3";
+            const char* h_hex = "1";
+
+            EC_POINT* G = NULL;
+            BIGNUM *p = BN_new(), *a = BN_new(), *b = BN_new();
+            BIGNUM *n = BN_new(), *h = BN_new(), *gx = BN_new(), *gy = BN_new();
+
+            // 设置示例参数（16 进制）
+            BN_hex2bn(&p, p_hex);
+            BN_hex2bn(&a, a_hex);
+            BN_hex2bn(&b, b_hex);
+            BN_hex2bn(&n, n_hex);
+            BN_hex2bn(&h, h_hex);
+            BN_hex2bn(&gx, gx_hex);
+            BN_hex2bn(&gy, gy_hex);
+            // 创建椭圆曲线群
+            group = EC_GROUP_new_curve_GFp(p, a, b, NULL);
+            if (!group) goto err;
+            // 创建生成点 G
+            G = EC_POINT_new(group);
+            EC_POINT_set_affine_coordinates(group, G, gx, gy, NULL);
+            // 设置群的生成点、阶数和余因子
+            EC_GROUP_set_generator(group, G, n, h);
+
+            EC_GROUP_get_order(group, order, bn_ctx);    
+        err:
+            BN_free(p);
+            BN_free(a);
+            BN_free(b);
+            BN_free(n);
+            BN_free(h);
+            BN_free(gx);
+            BN_free(gy);
+            if (G != NULL) EC_POINT_free(G);
+        }
     }
 
     ~CurveContext()
@@ -151,6 +193,83 @@ struct CurveContext {
     void set_target(const EC_POINT* target)
     {
         Q = EC_POINT_dup(target, group);
+    }
+    // 新增密钥管理方法
+    bool load_keypair(BIGNUM** priv_key, EC_POINT** pub_key)
+    {
+        std::ifstream file(KEY_FILE);
+        if (!file.is_open()) return false;
+
+        std::string line;
+
+        try {
+            // 解析私钥
+            std::getline(file, line);
+            BN_hex2bn(priv_key, line.c_str());
+
+            // 解析公钥坐标
+            BIGNUM* x = BN_new();
+            BIGNUM* y = BN_new();
+            std::getline(file, line);
+            BN_hex2bn(&x, line.c_str());
+            std::getline(file, line);
+            BN_hex2bn(&y, line.c_str());
+
+            // 创建公钥点
+            *pub_key = EC_POINT_new(group);
+            EC_POINT_set_affine_coordinates(group, *pub_key, x, y, bn_ctx);
+
+            // 验证点是否在曲线上
+            if (!EC_POINT_is_on_curve(group, *pub_key, bn_ctx)) {
+                EC_POINT_free(*pub_key);
+                BN_free(x);
+                BN_free(y);
+                return false;
+            }
+
+            BN_free(x);
+            BN_free(y);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void generate_and_save_keypair(BIGNUM** priv_key, EC_POINT** pub_key)
+    {
+        // 生成新密钥对
+        *priv_key = BN_new();
+        BN_rand_range(*priv_key, order);
+
+        *pub_key = EC_POINT_new(group);
+        EC_POINT_mul(group, *pub_key, *priv_key, nullptr, nullptr, bn_ctx);
+
+        // 保存到文件
+        std::ofstream file(KEY_FILE);
+        if (file.is_open()) {
+            // 写入私钥
+            char* priv_hex = BN_bn2hex(*priv_key);
+            file << priv_hex << "\n";
+            OPENSSL_free(priv_hex);
+
+            // 写入公钥坐标
+            BIGNUM *x = BN_new(), *y = BN_new();
+            EC_POINT_get_affine_coordinates(group, *pub_key, x, y, bn_ctx);
+
+            char* x_hex = BN_bn2hex(x);
+            char* y_hex = BN_bn2hex(y);
+            file << x_hex << "\n";
+            file << y_hex << "\n";
+
+            OPENSSL_free(x_hex);
+            OPENSSL_free(y_hex);
+            BN_free(x);
+            BN_free(y);
+
+            std::cout << "New keypair generated and saved to " << KEY_FILE << "\n";
+        } else {
+            std::cerr << "Warning: Failed to save keypair to file\n";
+        }
     }
 };
 
@@ -295,7 +414,7 @@ public:
         return ret;
     }
 
-private:
+//private:
     bool load_precomputed_steps()
     {
         if (!fs::exists(STEP_FILE)) return false;
@@ -357,13 +476,15 @@ private:
     BIGNUM* process_distinguished_point()
     {
         BIGNUM* ret = nullptr;
-        if (const auto key = calculate_key(); key != INVALID_KEY) {
+        const auto key = calculate_key(); 
+        if (key != INVALID_KEY) {
             if (auto it = points_.find(key); it != points_.end()) {
                 ret = handle_collision(it->second);
                 assert(ret);
             } else {
                 store_point(key);
-                std::cout << step_count_ << " ";
+                if ((key & 0xffff000000000000) == 0)
+                    std::cout << step_count_ << " ";
             }
         }
         return ret;
@@ -378,15 +499,13 @@ private:
         const size_t len = BN_bn2bin(x, bin);
         BN_free(x);
 
-        // 检查前4字节是否为0
-        if (len < 4 || *reinterpret_cast<uint32_t*>(bin) != 0) {
+        // 检查后2个字节是否为0
+        if (len < 4 || *reinterpret_cast<uint16_t*>(bin + 6) != 0) {
             return INVALID_KEY;
         }
 
-        // 提取后续8字节作为键
-        uint64_t key = 0;
-        const size_t offset = (len > 12) ? len - 8 : 4;
-        memcpy(&key, bin + offset, sizeof(key));
+        // 提取8字节作为键
+        uint64_t key = *reinterpret_cast<uint64_t*>(bin);
         return key;
     }
 
@@ -516,6 +635,18 @@ private:
         std::cout << "Loaded " << count << " points from disk\n";
     }
 
+    auto lastPoint() {
+        auto maxIt = points_.begin();
+        auto maxValue = maxIt->second.step;
+        for (auto it = std::next(points_.begin()); it != points_.end(); ++it) {
+            if (it->second.step > maxValue) {
+                maxValue = it->second.step;
+                maxIt = it;
+            }
+        }
+        return maxIt;
+    }
+
     static void write_bignum(std::ostream& os, const BIGNUM* num)
     {
         const size_t len = BN_num_bytes(num);
@@ -543,7 +674,7 @@ private:
 
     std::shared_ptr<CurveContext> ctx_;
     std::vector<PrecomputedStep> steps_;
-    std::unordered_map<uint64_t, DistinguishedPoint> points_;
+    std::map<uint64_t, DistinguishedPoint> points_;
     EC_POINT* current_;
     BIGNUM* a_;
     BIGNUM* b_;
@@ -554,13 +685,16 @@ private:
 
 void test_112() {
     try {
-        auto ctx = std::make_shared<CurveContext>();
+        auto ctx = std::make_shared<CurveContext>(0);
 
         // 生成测试密钥对
-        BIGNUM* priv = BN_new();
-        EC_POINT* pub = EC_POINT_new(ctx->group);
-        BN_rand_range(priv, ctx->order);
-        EC_POINT_mul(ctx->group, pub, priv, nullptr, nullptr, ctx->bn_ctx);
+        BIGNUM* priv = nullptr;
+        EC_POINT* pub = nullptr;
+        // 尝试加载现有密钥对
+        if (!ctx->load_keypair(&priv, &pub)) {
+            // 生成并保存新密钥对
+            ctx->generate_and_save_keypair(&priv, &pub);
+        }
         ctx->set_target(pub);
 
         PollardSolver solver(ctx);
@@ -581,11 +715,22 @@ void test_112() {
     }
 }
 
+void test_112_helper() {
+    auto ctx = std::make_shared<CurveContext>(0);
+    PollardSolver solver(ctx);
+    solver.load_progress();
+    auto last = solver.lastPoint();
+    std::cout << last->second.step << std::endl;
+}
+
 //========<<<<<<<<<<<<<<
+#include <conio.h>
 int main(int argc, char* argv[])
 {
     /* INIT _init;
     work();*/
     test_112();
+    std::wcout << L"请按任意键结束..." << std::endl;
+    _getch(); // 等待用户按下任意键
     return 0;
 }
