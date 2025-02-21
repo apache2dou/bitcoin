@@ -321,33 +321,41 @@ struct PrecomputedStep {
     EC_POINT* point;
     BIGNUM* s;
     BIGNUM* t;
+    EC_POINT* inverse_point; // 逆步长点
 
     PrecomputedStep(const CurveContext& ctx) : point(EC_POINT_new(ctx.group)),
+                                               inverse_point(EC_POINT_new(ctx.group)),
                                                s(BN_new()),
                                                t(BN_new())
     {
         BN_rand_range(s, ctx.order);
         BN_rand_range(t, ctx.order);
         EC_POINT_mul(ctx.group, point, s, ctx.Q, t, ctx.bn_ctx);
+        EC_POINT_copy(inverse_point, point);
+        EC_POINT_invert(ctx.group, inverse_point, ctx.bn_ctx);
     }
 
     ~PrecomputedStep()
     {
         EC_POINT_free(point);
+        EC_POINT_free(inverse_point);
         BN_free(s);
         BN_free(t);
     }
 
     PrecomputedStep(PrecomputedStep&& other) noexcept : point(other.point),
+                                                        inverse_point(other.inverse_point),
                                                         s(other.s),
                                                         t(other.t)
     {
         other.point = nullptr;
+        other.inverse_point = nullptr;
         other.s = nullptr;
         other.t = nullptr;
     }
     // 从文件加载构造
     PrecomputedStep(const CurveContext& ctx, std::istream& is) : point(EC_POINT_new(ctx.group)),
+                                                                 inverse_point(EC_POINT_new(ctx.group)),
                                                                  s(BN_new()),
                                                                  t(BN_new())
     {
@@ -371,6 +379,9 @@ struct PrecomputedStep {
         std::vector<unsigned char> point_buf(point_len);
         is.read(reinterpret_cast<char*>(point_buf.data()), point_len);
         EC_POINT_oct2point(ctx.group, point, point_buf.data(), point_len, ctx.bn_ctx);
+
+        EC_POINT_copy(inverse_point, point);
+        EC_POINT_invert(ctx.group, inverse_point, ctx.bn_ctx);
     }
 
     void save(const CurveContext& ctx, std::ostream& os) const
@@ -651,18 +662,68 @@ public:
 
     void walk_step()
     {
-        const size_t idx = get_step_index();
+        const size_t idx = get_step_index_for_point(current_);
         const auto& step = steps_[idx];
 
         EC_POINT_add(ctx_->group, current_, current_, step.point, ctx_->bn_ctx);
         BN_mod_add(a_, a_, step.s, ctx_->order, ctx_->bn_ctx);
         BN_mod_add(b_, b_, step.t, ctx_->order, ctx_->bn_ctx);
     }
+    /**
+     * 逆向步进函数
+     * @param current_point 当前点
+     * @param a 当前a标量
+     * @param b 当前b标量
+     * @return 包含所有可能前驱点及其参数的列表，格式为：
+     *         vector<tuple<前驱点EC_POINT*, 前驱a BIGNUM*, 前驱b BIGNUM*>>
+     */
+    std::vector<std::tuple<EC_POINT*, BIGNUM*, BIGNUM*>>
+    reverse_walk_step(const EC_POINT* current_point,
+                      const BIGNUM* a,
+                      const BIGNUM* b)
+    {
+        std::vector<std::tuple<EC_POINT*, BIGNUM*, BIGNUM*>> predecessors;
 
-    size_t get_step_index() const
+        // 遍历所有预计算步长
+        for (size_t i = 0; i < steps_.size(); ++i) {
+            const auto& step = steps_[i];
+
+            // 计算候选前驱点：candidate = current - step_i
+            EC_POINT* candidate = EC_POINT_new(ctx_->group);
+            EC_POINT_copy(candidate, current_point);
+
+            // 执行点减法：current + (-step_i)
+            EC_POINT_add(ctx_->group, candidate, candidate, step.inverse_point, ctx_->bn_ctx);
+
+            // 验证候选点有效性
+            if (!EC_POINT_is_on_curve(ctx_->group, candidate, ctx_->bn_ctx)) {
+                EC_POINT_free(candidate);
+                continue;
+            }
+
+            // 验证候选点的下一步是否指向当前点
+            size_t candidate_idx = get_step_index_for_point(candidate);
+            if (candidate_idx != i) {
+                EC_POINT_free(candidate);
+                continue;
+            }
+
+            // 计算对应的前驱标量
+            BIGNUM* prev_a = BN_dup(a);
+            BIGNUM* prev_b = BN_dup(b);
+            BN_mod_sub(prev_a, prev_a, step.s, ctx_->order, ctx_->bn_ctx);
+            BN_mod_sub(prev_b, prev_b, step.t, ctx_->order, ctx_->bn_ctx);
+
+            // 添加到结果列表
+            predecessors.emplace_back(candidate, prev_a, prev_b);
+        }
+
+        return predecessors;
+    }
+    size_t get_step_index_for_point(const EC_POINT* point) const
     {
         BIGNUM* x = BN_new();
-        EC_POINT_get_affine_coordinates(ctx_->group, current_, x, nullptr, ctx_->bn_ctx);
+        EC_POINT_get_affine_coordinates(ctx_->group, point, x, nullptr, ctx_->bn_ctx);
 
         unsigned char bin[32];
         BN_bn2bin(x, bin);
@@ -671,7 +732,24 @@ public:
         const size_t offset = (BN_num_bytes(x) > 2) ? BN_num_bytes(x) - 2 : 0;
         return *reinterpret_cast<uint16_t*>(bin + offset) % r;
     }
+    int reverse_walk_demo(const EC_POINT* current_point,
+                           const BIGNUM* a, const BIGNUM* b)
+    {
+        // 执行逆向步进
+        auto predecessors = reverse_walk_step(current_point, a, b);
 
+        int ret = predecessors.size();
+
+
+        for (const auto& [point, prev_a, prev_b] : predecessors) {
+            
+            // 清理临时资源
+            EC_POINT_free(const_cast<EC_POINT*>(point));
+            BN_free(const_cast<BIGNUM*>(prev_a));
+            BN_free(const_cast<BIGNUM*>(prev_b));
+        }
+        return ret;
+    }
     void save_progress() const
     {
         std::ofstream file(SAVE_FILE, std::ios::binary);
@@ -785,7 +863,7 @@ void test_112() {
         // 验证结果
         if (BN_cmp(found, priv) == 0) {
             char* hex = BN_bn2hex(found);
-            Logger::log("\nSuccess! Private key: " + std::string(hex));
+            Logger::log("Success! Private key: " + std::string(hex));
             OPENSSL_free(hex);
         }
 
