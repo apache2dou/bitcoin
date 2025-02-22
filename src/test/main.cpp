@@ -491,6 +491,7 @@ public:
 
     BIGNUM* solve()
     {
+        printPoint();
         BIGNUM* ret = nullptr;
         while (ret == nullptr) {
             ++step_count_;
@@ -635,49 +636,108 @@ public:
 
     BIGNUM* handle_collision(const DistinguishedPoint& dp)
     {
-        const uint64_t tail_length = dp.step;
-        const uint64_t cycle_length = step_count_ - dp.step;
+        BIGNUM* result = nullptr;
+        BIGNUM* current_x = BN_new();
+        BIGNUM* current_y = BN_new();
+        BIGNUM* stored_x = BN_new();
+        BIGNUM* stored_y = BN_new();
+        EC_POINT* stored_point = EC_POINT_new(ctx_->group);
 
-        std::stringstream ss;
-        ss << "\n=== Cycle Detected ===\n"
-           << "run_id_: " << run_id_ << "\n"
-           << "Tail length:  " << tail_length << "\n"
-           << "Cycle length: " << cycle_length << "\n"
-           << "Total steps:  " << step_count_ << "\n"
-           << "Storage size: " << points_.size() << "\n"
-           << "========================";
-        Logger::log(ss.str());
+        EC_POINT_get_affine_coordinates(ctx_->group, current_,
+                                        current_x, current_y,
+                                        ctx_->bn_ctx);
+        EC_POINT_mul(ctx_->group, stored_point, dp.a, ctx_->Q, dp.b, ctx_->bn_ctx);
+        EC_POINT_get_affine_coordinates(ctx_->group, stored_point,
+                                        stored_x, stored_y,
+                                        ctx_->bn_ctx);
 
-        BIGNUM* denominator = BN_new();
-        BN_mod_sub(denominator, b_, dp.b, ctx_->order, ctx_->bn_ctx);
-
-        if (!BN_is_zero(denominator)) {
-            BIGNUM* d = calculate_private_key(dp, denominator);
-            if (validate_key(d)) {
-                BN_free(denominator);
-                return d; 
+        int collision_type = -1;
+        if (EC_POINT_cmp(ctx_->group, current_, stored_point, ctx_->bn_ctx) == 0) {
+            collision_type = 0;
+        } else if (BN_cmp(current_x, stored_x) == 0) {
+            BIGNUM* sum_y = BN_new();
+            BN_mod_add(sum_y, current_y, stored_y, ctx_->order, ctx_->bn_ctx);
+            if (BN_is_zero(sum_y)) {
+                collision_type = 1;
             }
-            BN_free(d);
+            BN_free(sum_y);
         }
-        Logger::log("short circulation!");
-        BN_free(denominator);
-        return nullptr;
+
+        if (collision_type != -1) {
+            const uint64_t tail_length = dp.step;
+            const uint64_t cycle_length = step_count_ - dp.step;
+
+            std::stringstream ss;
+            ss << "\n=== Cycle Detected ===\n"
+               << "run_id_: " << run_id_ << "\n"
+               << "Tail length:  " << tail_length << "\n"
+               << "Cycle length: " << cycle_length << "\n"
+               << "Total steps:  " << step_count_ << "\n"
+               << "Storage size: " << points_.size() << "\n"
+               << "========================";
+            Logger::log(ss.str());
+
+            result = process_collision_case(dp, collision_type);
+        }
+
+        BN_free(current_x);
+        BN_free(current_y);
+        BN_free(stored_x);
+        BN_free(stored_y);
+        return result;
     }
 
-    BIGNUM* calculate_private_key(const DistinguishedPoint& dp, BIGNUM* denominator) const
+    BIGNUM* process_collision_case(const DistinguishedPoint& dp, int case_type)
     {
+        BIGNUM* denominator = BN_new();
         BIGNUM* numerator = BN_new();
-        BN_mod_sub(numerator, dp.a, a_, ctx_->order, ctx_->bn_ctx);
-
-        BIGNUM* inv = BN_new();
-        BN_mod_inverse(inv, denominator, ctx_->order, ctx_->bn_ctx);
-
+        BIGNUM* inv_denominator = BN_new();
         BIGNUM* d = BN_new();
-        BN_mod_mul(d, numerator, inv, ctx_->order, ctx_->bn_ctx);
+        // 返回一个非空值，方便退出循环。
+        BIGNUM* result = BN_new();
 
+        do {
+            if (case_type == 0) { // 常规碰撞
+                if (!BN_mod_sub(numerator, dp.a, a_, ctx_->order, ctx_->bn_ctx)) break;
+                if (!BN_mod_sub(denominator, b_, dp.b, ctx_->order, ctx_->bn_ctx)) break;
+            } else { // x相同y相反的情况
+                if (!BN_mod_add(numerator, dp.a, a_, ctx_->order, ctx_->bn_ctx)) break;
+                if (!BN_mod_add(denominator, dp.b, b_, ctx_->order, ctx_->bn_ctx)) break;
+                if (!BN_mod_sub(numerator, ctx_->order, numerator, ctx_->order, ctx_->bn_ctx)) break;
+            }
+
+            if (BN_is_zero(denominator)) {
+                Logger::log("Zero denominator encountered");
+                break;
+            }
+
+            if (!BN_mod_inverse(inv_denominator, denominator, ctx_->order, ctx_->bn_ctx)) {
+                Logger::log("Failed to compute modular inverse");
+                break;
+            }
+
+            if (!BN_mod_mul(d, numerator, inv_denominator, ctx_->order, ctx_->bn_ctx)) {
+                Logger::log("Failed to compute private key candidate");
+                break;
+            }
+
+            // 规范化为非负表示
+            if (BN_is_negative(d)) {
+                BN_add(d, d, ctx_->order);
+            }
+
+            if (validate_key(d)) {
+                BN_free(result);
+                result = BN_dup(d); // 转移所有权给调用者
+                Logger::log("Valid private key found");
+            }
+        } while (false);
+
+        BN_free(denominator);
         BN_free(numerator);
-        BN_free(inv);
-        return d;
+        BN_free(inv_denominator);
+        BN_free(d);
+        return result;
     }
 
     bool validate_key(BIGNUM* d) const
@@ -761,9 +821,8 @@ public:
 
         unsigned char bin[32];
         BN_bn2bin(x, bin);
-        BN_free(x);
-
         const size_t offset = (BN_num_bytes(x) > 2) ? BN_num_bytes(x) - 2 : 0;
+        BN_free(x);
         return *reinterpret_cast<uint16_t*>(bin + offset) % r;
     }
     int reverse_walk_demo(const EC_POINT* current_point,
@@ -848,6 +907,40 @@ public:
         return maxIt;
     }
 
+    void printPoint() const{
+        // 记录详细的初始点信息
+        std::stringstream log_ss;
+        log_ss << "Initial Point Configuration [Run ID: " << run_id_ << "]\n";
+
+        // 记录标量参数
+        char* a_hex = BN_bn2hex(a_);
+        char* b_hex = BN_bn2hex(b_);
+        log_ss << "  Scalar a: 0x" << a_hex << "\n";
+        log_ss << "  Scalar b: 0x" << b_hex << "\n";
+        OPENSSL_free(a_hex);
+        OPENSSL_free(b_hex);
+
+        // 获取并记录点坐标
+        BIGNUM *x = BN_new(), *y = BN_new();
+        if (EC_POINT_get_affine_coordinates(ctx_->group, current_, x, y, ctx_->bn_ctx)) {
+            char* x_hex = BN_bn2hex(x);
+            char* y_hex = BN_bn2hex(y);
+
+            log_ss << "  Point Coordinates:\n"
+                   << "    X: 0x" << x_hex << "\n"
+                   << "    Y: 0x" << y_hex << "\n";
+
+            OPENSSL_free(x_hex);
+            OPENSSL_free(y_hex);
+            Logger::log(log_ss.str());
+        } else {
+            Logger::log("Error: Failed to get initial point coordinates");
+        }
+
+        BN_free(x);
+        BN_free(y);
+    }
+
     static void write_bignum(std::ostream& os, const BIGNUM* num)
     {
         const size_t len = BN_num_bytes(num);
@@ -890,46 +983,54 @@ unsigned get_core_count()
     return (cores > 2) ? (cores - 2) : 1;
 }
 
-void test_112() {
-    try {
-        auto ctx = std::make_shared<CurveContext>(0);
+void test_112()
+{
+    const unsigned num_solvers = get_core_count();
+    std::vector<std::thread> threads;
 
-        // 生成测试密钥对
-        BIGNUM* priv = nullptr;
-        EC_POINT* pub = nullptr;
-        // 尝试加载现有密钥对
-        if (!ctx->load_keypair(&priv, &pub)) {
-            // 生成并保存新密钥对
-            ctx->generate_and_save_keypair(&priv, &pub);
-        }
-        ctx->set_target(pub);
+    auto _run = []() {
+        try {
+            PollardSolver* solver = nullptr;
+            // 生成测试密钥对
+            BIGNUM* priv = nullptr;
+            EC_POINT* pub = nullptr;
+            {
+                static RecursiveMutex init_mutex;
+                LOCK(init_mutex);
+                auto ctx = std::make_shared<CurveContext>(0);
 
-        const unsigned num_solvers = get_core_count();
-        std::vector<std::thread> threads;
+                // 尝试加载现有密钥对
+                if (!ctx->load_keypair(&priv, &pub)) {
+                    // 生成并保存新密钥对
+                    ctx->generate_and_save_keypair(&priv, &pub);
+                }
+                ctx->set_target(pub);
 
-        auto _run = [](std::shared_ptr<CurveContext>ctx, BIGNUM* priv) {
-            PollardSolver solver(ctx);
-            BIGNUM* found = solver.solve(); // 验证结果
+                solver = new PollardSolver(ctx);
+            }
+            BIGNUM* found = solver->solve(); // 验证结果
             if (BN_cmp(found, priv) == 0) {
                 char* hex = BN_bn2hex(found);
                 Logger::log("Success! Private key: " + std::string(hex));
                 OPENSSL_free(hex);
-                BN_free(found);
+            } else {
+                Logger::log("Failed!!!");
             }
-        };
-        // 创建并启动线程
-        for (unsigned i = 0; i < num_solvers; ++i) {
-            threads.emplace_back(_run, ctx, priv);
+            BN_free(found);
+            BN_free(priv);
+            EC_POINT_free(pub);
+            if (solver) delete solver;
+        } catch (...) {
+            std::cout << "\nException handling!!!\n";
         }
-        // 等待所有线程完成
-        for (auto& t : threads) {
-            if (t.joinable()) t.join();
-        }
-        
-        BN_free(priv);
-        EC_POINT_free(pub);
-    } catch (...) {
-        std::cout << "\nException handling!!!\n";
+    };
+    // 创建并启动线程
+    for (unsigned i = 0; i < num_solvers; ++i) {
+        threads.emplace_back(_run);
+    }
+    // 等待所有线程完成
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
     }
 }
 
