@@ -122,9 +122,42 @@ void work() {
 // 算法参数配置
 constexpr int r = 16;
 constexpr char STEP_FILE[] = "precomputed_steps.bin";
-constexpr char SAVE_FILE[] = "rho_distinguishpoints.bin";
+constexpr char SAVE_FILE[] = "rho_distinguishpoints_%04d.bin";
 constexpr char KEY_FILE[] = "ec_keypair.txt";
 constexpr char LOG_FILE[] = "pollard_rho.log";
+// ID管理类
+class IDManager
+{
+public:
+    static int get_next()
+    {
+        static std::atomic<int> counter(load_counter());
+        int current = counter++;
+        save_counter(current);
+        return current;
+    }
+
+private:
+    static int load_counter()
+    {
+        try {
+            if (fs::exists("rho.id")) {
+                std::ifstream file("rho.id");
+                int val;
+                file >> val;
+                return val;
+            }
+        } catch (...) {
+        }
+        return 1;
+    }
+
+    static void save_counter(int val)
+    {
+        std::ofstream file("rho.id");
+        file << val;
+    }
+};
 
 class Logger
 {
@@ -442,7 +475,7 @@ public:
                                                        current_(EC_POINT_new(ctx_->group)),
                                                        a_(BN_new()),
                                                        b_(BN_new()),
-                                                       step_count_(0)
+                                                       step_count_(0), run_id_(IDManager::get_next()) 
     {
         // 初始化随机起点
         BN_rand_range(a_, ctx_->order);
@@ -607,11 +640,12 @@ public:
 
         std::stringstream ss;
         ss << "\n=== Cycle Detected ===\n"
+           << "run_id_: " << run_id_ << "\n"
            << "Tail length:  " << tail_length << "\n"
            << "Cycle length: " << cycle_length << "\n"
            << "Total steps:  " << step_count_ << "\n"
            << "Storage size: " << points_.size() << "\n"
-           << "========================\n";
+           << "========================";
         Logger::log(ss.str());
 
         BIGNUM* denominator = BN_new();
@@ -752,7 +786,7 @@ public:
     }
     void save_progress() const
     {
-        std::ofstream file(SAVE_FILE, std::ios::binary);
+        std::ofstream file(format_filename(SAVE_FILE, run_id_), std::ios::binary);
         const uint64_t count = points_.size();
 
         // 写入记录数量
@@ -769,9 +803,16 @@ public:
         std::cout << "Progress saved: " << count << " points\n";
     }
 
+    std::string format_filename(const std::string& pattern, int id) const
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf), pattern.c_str(), id);
+        return buf;
+    }
+
     void load_progress()
     {
-        std::ifstream file(SAVE_FILE, std::ios::binary);
+        std::ifstream file(format_filename(SAVE_FILE, 1), std::ios::binary);
         if (!file) return;
 
         uint64_t count;
@@ -839,9 +880,15 @@ public:
     BIGNUM* a_;
     BIGNUM* b_;
     uint64_t step_count_;
+    const int run_id_;
 };
 
-
+// 获取系统核心数
+unsigned get_core_count()
+{
+    unsigned cores = std::thread::hardware_concurrency();
+    return (cores > 2) ? (cores - 2) : 1;
+}
 
 void test_112() {
     try {
@@ -857,19 +904,30 @@ void test_112() {
         }
         ctx->set_target(pub);
 
-        PollardSolver solver(ctx);
-        BIGNUM* found = solver.solve();
+        const unsigned num_solvers = get_core_count();
+        std::vector<std::thread> threads;
 
-        // 验证结果
-        if (BN_cmp(found, priv) == 0) {
-            char* hex = BN_bn2hex(found);
-            Logger::log("Success! Private key: " + std::string(hex));
-            OPENSSL_free(hex);
+        auto _run = [](std::shared_ptr<CurveContext>ctx, BIGNUM* priv) {
+            PollardSolver solver(ctx);
+            BIGNUM* found = solver.solve(); // 验证结果
+            if (BN_cmp(found, priv) == 0) {
+                char* hex = BN_bn2hex(found);
+                Logger::log("Success! Private key: " + std::string(hex));
+                OPENSSL_free(hex);
+                BN_free(found);
+            }
+        };
+        // 创建并启动线程
+        for (unsigned i = 0; i < num_solvers; ++i) {
+            threads.emplace_back(_run, ctx, priv);
         }
-
+        // 等待所有线程完成
+        for (auto& t : threads) {
+            if (t.joinable()) t.join();
+        }
+        
         BN_free(priv);
         EC_POINT_free(pub);
-        BN_free(found);
     } catch (...) {
         std::cout << "\nException handling!!!\n";
     }
