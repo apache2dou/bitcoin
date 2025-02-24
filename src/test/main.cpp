@@ -103,8 +103,6 @@ void signalHandler(int signum)
     gameover = true;
 }
 void work() {
-    // 注册信号处理函数，捕获 SIGINT 信号
-    signal(SIGINT, signalHandler);
     std::cout << "game starting..." << std::endl;
     play<Rho>();
 }
@@ -126,36 +124,142 @@ constexpr char SAVE_FILE[] = "rho_distinguishpoints_%04d.bin";
 constexpr char KEY_FILE[] = "ec_keypair.txt";
 constexpr char LOG_FILE[] = "pollard_rho.log";
 // ID管理类
+
+enum class IDState { RUNNING,
+                     PAUSED,
+                     COMPLETED };
+
 class IDManager
 {
-public:
-    static int get_next()
-    {
-        static std::atomic<int> counter(load_counter());
-        int current = counter++;
-        save_counter(current);
-        return current;
-    }
-
 private:
-    static int load_counter()
+    std::map<int, IDState> id_states;
+    int max_id = 0;
+    const std::string filename = "rho.id";
+    mutable std::mutex mtx;
+
+    void update_max_id()
     {
-        try {
-            if (fs::exists("rho.id")) {
-                std::ifstream file("rho.id");
-                int val;
-                file >> val;
-                return val;
-            }
-        } catch (...) {
+        if (!id_states.empty()) {
+            max_id = std::max_element(id_states.begin(), id_states.end(),
+                                      [](const auto& a, const auto& b) { return a.first < b.first; })
+                         ->first;
         }
-        return 1;
     }
 
-    static void save_counter(int val)
+public:
+    IDManager()
     {
-        std::ofstream file("rho.id");
-        file << val;
+        load_from_file();
+    }
+
+    ~IDManager()
+    {
+        save_to_file();
+    }
+
+    // 请求可用ID（优先返回暂停状态的ID）
+    int request_id()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        // 优先查找暂停状态的ID
+        auto paused_it = std::find_if(id_states.begin(), id_states.end(),
+                                      [](const auto& p) { return p.second == IDState::PAUSED; });
+
+        if (paused_it != id_states.end()) {
+            paused_it->second = IDState::RUNNING;
+            return paused_it->first;
+        }
+
+        // 生成新ID
+        int new_id = ++max_id;
+        id_states[new_id] = IDState::RUNNING;
+        return new_id;
+    }
+
+    // 暂停指定ID的工作
+    bool pause_id(int id)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = id_states.find(id);
+        if (it != id_states.end() && it->second == IDState::RUNNING) {
+            it->second = IDState::PAUSED;
+            return true;
+        }
+        return false;
+    }
+
+    // 标记ID为完成状态
+    bool complete_id(int id)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = id_states.find(id);
+        if (it != id_states.end()) {
+            id_states.erase(it);
+            return true;
+        }
+        return false;
+    }
+
+    // 获取ID状态
+    IDState get_state(int id) const
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = id_states.find(id);
+        return (it != id_states.end()) ? it->second : IDState::COMPLETED;
+    }
+
+    // 持久化到文件
+    void save_to_file() const
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::ofstream file(filename);
+        if (!file.is_open()) return;
+
+        for (const auto& [id, state] : id_states) {
+            file << id << "," << static_cast<int>(state) << "\n";
+        }
+    }
+
+    // 从文件加载状态
+    void load_from_file()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::ifstream file(filename);
+        if (!file.is_open()) return;
+
+        id_states.clear();
+        std::string line;
+        while (std::getline(file, line)) {
+            std::istringstream iss(line);
+            std::string id_str, state_str;
+
+            if (std::getline(iss, id_str, ',') &&
+                std::getline(iss, state_str)) {
+                try {
+                    int id = std::stoi(id_str);
+                    IDState state = static_cast<IDState>(std::stoi(state_str));
+
+                    if (state != IDState::COMPLETED) {
+                        id_states[id] = state;
+                        max_id = std::max(max_id, id);
+                    }
+                } catch (...) {
+                    // 忽略格式错误行
+                }
+            }
+        }
+    }
+
+    // 获取所有未完成ID列表
+    std::vector<int> get_active_ids() const
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::vector<int> ids;
+        for (const auto& [id, state] : id_states) {
+            ids.push_back(id);
+        }
+        return ids;
     }
 };
 
@@ -168,10 +272,10 @@ public:
         if (!log_file.is_open()) {
             std::cerr << "Failed to open log file\n";
         }
-        log("========== New Session ==========");
+        enable(true);
     }
 
-    static void log(const std::string& message)
+    static void log(const std::string& message, bool flush = false)
     {
         const auto now = std::time(nullptr);
         char timestamp[64];
@@ -183,9 +287,10 @@ public:
         std::cout << log_entry;
 
         // 写入日志文件
-        if (log_file.is_open()) {
+        if (log_file.is_open() && enable_) {
             log_file << log_entry;
-            //log_file.flush();
+            if (flush)
+                log_file.flush();
         }
     }
 
@@ -195,10 +300,15 @@ public:
             log_file.close();
         }
     }
+    static void enable(bool e) {
+        enable_ = e;
+    }
 
 private:
+    static bool enable_;
     static std::ofstream log_file;
 };
+bool Logger::enable_;
 std::ofstream Logger::log_file;
 
 // 椭圆曲线上下文管理
@@ -471,11 +581,13 @@ struct DistinguishedPoint {
 class PollardSolver
 {
 public:
-    PollardSolver(std::shared_ptr<CurveContext> ctx) : ctx_(ctx),
-                                                       current_(EC_POINT_new(ctx_->group)),
-                                                       a_(BN_new()),
-                                                       b_(BN_new()),
-                                                       step_count_(0), run_id_(IDManager::get_next()) 
+    PollardSolver(std::shared_ptr<CurveContext> ctx, IDManager& manager) : ctx_(ctx),
+                                                                           current_(EC_POINT_new(ctx_->group)),
+                                                                           a_(BN_new()),
+                                                                           b_(BN_new()),
+                                                                           step_count_(0),
+                                                                           id_manager(manager),
+                                                                           run_id_(id_manager.request_id())
     {
         // 初始化随机起点
         BN_rand_range(a_, ctx_->order);
@@ -483,7 +595,7 @@ public:
         EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
 
         // 尝试加载预计算步长
-        if (!load_precomputed_steps()) {
+        if (!load_precomputed_steps(steps_)) {
             generate_precomputed_steps();
             save_precomputed_steps();
         }
@@ -491,9 +603,15 @@ public:
 
     BIGNUM* solve()
     {
-        printPoint();
+        bool loaded = load_progress(run_id_);
+        if (!loaded)
+            printPoint();
         BIGNUM* ret = nullptr;
         while (ret == nullptr) {
+            if (gameover) {
+                id_manager.pause_id(run_id_);
+                break;
+            }
             ++step_count_;
             ret = process_distinguished_point();
             walk_step();
@@ -540,7 +658,7 @@ public:
         BN_free(y);
     }
     //private:
-    bool load_precomputed_steps()
+    bool load_precomputed_steps(std::vector<PrecomputedStep>& step_vec)
     {
         if (!fs::exists(STEP_FILE)) return false;
 
@@ -556,16 +674,16 @@ public:
                 return false;
             }
 
-            steps_.reserve(r);
+            step_vec.reserve(r);
             for (int i = 0; i < r; ++i) {
-                steps_.emplace_back(*ctx_, file);
+                step_vec.emplace_back(*ctx_, file);
             }
 
             std::cout << "Loaded " << r << " precomputed steps from file\n";
             return true;
         } catch (...) {
             std::cerr << "Error loading precomputed steps\n";
-            steps_.clear();
+            step_vec.clear();
             return false;
         }
     }
@@ -605,6 +723,7 @@ public:
         if (key != INVALID_KEY) {
             if (auto it = points_.find(key); it != points_.end()) {
                 ret = handle_collision(it->second);
+                id_manager.complete_id(run_id_);
                 assert(ret);
             } else {
                 store_point(key);
@@ -636,7 +755,8 @@ public:
 
     BIGNUM* handle_collision(const DistinguishedPoint& dp)
     {
-        BIGNUM* result = nullptr;
+        // 返回一个非空值，方便退出循环。
+        BIGNUM* result = BN_new();
         BIGNUM* current_x = BN_new();
         BIGNUM* current_y = BN_new();
         BIGNUM* stored_x = BN_new();
@@ -670,6 +790,7 @@ public:
             std::stringstream ss;
             ss << "\n=== Cycle Detected ===\n"
                << "run_id_: " << run_id_ << "\n"
+               << "collision_type: " << collision_type << "\n"
                << "Tail length:  " << tail_length << "\n"
                << "Cycle length: " << cycle_length << "\n"
                << "Total steps:  " << step_count_ << "\n"
@@ -677,7 +798,11 @@ public:
                << "========================";
             Logger::log(ss.str());
 
-            result = process_collision_case(dp, collision_type);
+            BIGNUM* result_tmp = process_collision_case(dp, collision_type);
+            if (result_tmp != nullptr) {
+                BN_free(result);
+                result = result_tmp;
+            }
         }
 
         BN_free(current_x);
@@ -693,8 +818,7 @@ public:
         BIGNUM* numerator = BN_new();
         BIGNUM* inv_denominator = BN_new();
         BIGNUM* d = BN_new();
-        // 返回一个非空值，方便退出循环。
-        BIGNUM* result = BN_new();
+        BIGNUM* result = nullptr;
 
         do {
             if (case_type == 0) { // 常规碰撞
@@ -727,7 +851,6 @@ public:
             }
 
             if (validate_key(d)) {
-                BN_free(result);
                 result = BN_dup(d); // 转移所有权给调用者
                 Logger::log("Valid private key found");
             }
@@ -869,10 +992,10 @@ public:
         return buf;
     }
 
-    void load_progress()
+    bool load_progress(int id)
     {
-        std::ifstream file(format_filename(SAVE_FILE, 1), std::ios::binary);
-        if (!file) return;
+        std::ifstream file(format_filename(SAVE_FILE, id), std::ios::binary);
+        if (!file) return false;
 
         uint64_t count;
         file.read(reinterpret_cast<char*>(&count), sizeof(count));
@@ -893,6 +1016,7 @@ public:
         }
 
         std::cout << "Loaded " << count << " points from disk\n";
+        return true;
     }
 
     auto lastPoint() {
@@ -974,6 +1098,7 @@ public:
     BIGNUM* b_;
     uint64_t step_count_;
     const int run_id_;
+    IDManager& id_manager;
 };
 
 // 获取系统核心数
@@ -987,8 +1112,8 @@ void test_112()
 {
     const unsigned num_solvers = get_core_count();
     std::vector<std::thread> threads;
-
-    auto _run = []() {
+    IDManager id_mgr;
+    auto _run = [&id_mgr]() {
         try {
             PollardSolver* solver = nullptr;
             // 生成测试密钥对
@@ -1006,17 +1131,19 @@ void test_112()
                 }
                 ctx->set_target(pub);
 
-                solver = new PollardSolver(ctx);
+                solver = new PollardSolver(ctx, id_mgr);
             }
             BIGNUM* found = solver->solve(); // 验证结果
-            if (BN_cmp(found, priv) == 0) {
-                char* hex = BN_bn2hex(found);
-                Logger::log("Success! Private key: " + std::string(hex));
-                OPENSSL_free(hex);
-            } else {
-                Logger::log("Failed!!!");
+            if (found != nullptr) {
+                if (BN_cmp(found, priv) == 0) {
+                    char* hex = BN_bn2hex(found);
+                    Logger::log("Success! Private key: " + std::string(hex), true);
+                    OPENSSL_free(hex);
+                } else {
+                    Logger::log("Failed!!!", true);
+                }
+                BN_free(found);
             }
-            BN_free(found);
             BN_free(priv);
             EC_POINT_free(pub);
             if (solver) delete solver;
@@ -1035,9 +1162,11 @@ void test_112()
 }
 
 void test_112_helper() {
+    Logger::enable(false);
     auto ctx = std::make_shared<CurveContext>(0);
-    PollardSolver solver(ctx);
-    solver.load_progress();
+    IDManager id_mgr;
+    PollardSolver solver(ctx, id_mgr);
+    solver.load_progress(1);
     auto last = solver.lastPoint();
     std::cout << last->second.step << std::endl;
 }
@@ -1046,6 +1175,9 @@ void test_112_helper() {
 #include <conio.h>
 int main(int argc, char* argv[])
 {
+    // 注册信号处理函数，捕获 SIGINT 信号
+    signal(SIGINT, signalHandler);
+
     /* INIT _init;
     work();*/
 
@@ -1053,7 +1185,7 @@ int main(int argc, char* argv[])
     test_112();
     Logger::cleanup();
 
-    std::wcout << L"请按任意键结束..." << std::endl;
+    std::cout << "Finish. Press any key..." << std::endl;
     _getch(); // 等待用户按下任意键
     return 0;
 }
