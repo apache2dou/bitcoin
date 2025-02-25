@@ -604,6 +604,11 @@ public:
     BIGNUM* solve()
     {
         bool loaded = load_progress(run_id_);
+        if (loaded) {
+            auto last = lastPoint();
+            assert(last != points_.end());
+            set_initial(last->second.a, last->second.b, last->second.step);
+        }
         if (!loaded)
             printPoint();
         BIGNUM* ret = nullptr;
@@ -613,15 +618,15 @@ public:
                 break;
             }
             ++step_count_;
-            ret = process_distinguished_point();
             walk_step();
+            ret = process_distinguished_point();
         }
         save_progress();
         return ret;
     }
 
     // 设置起始点函数
-    void set_initial(const BIGNUM* a, const BIGNUM* b)
+    void set_initial(const BIGNUM* a, const BIGNUM* b, uint64_t step_count)
     {
         // 复制并规范化输入参数
         BN_mod(a_, a, ctx_->order, ctx_->bn_ctx);
@@ -631,7 +636,7 @@ public:
         EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
 
         // 重置步数计数器
-        step_count_ = 0;
+        step_count_ = step_count;
 
         // 记录日志
         std::stringstream ss;
@@ -946,7 +951,7 @@ public:
         BN_bn2bin(x, bin);
         const size_t offset = (BN_num_bytes(x) > 2) ? BN_num_bytes(x) - 2 : 0;
         BN_free(x);
-        return *reinterpret_cast<uint16_t*>(bin + offset) % r;
+        return *reinterpret_cast<uint16_t*>(bin + offset) & 0xF;
     }
     int reverse_walk_demo(const EC_POINT* current_point,
                            const BIGNUM* a, const BIGNUM* b)
@@ -1097,8 +1102,8 @@ public:
     BIGNUM* a_;
     BIGNUM* b_;
     uint64_t step_count_;
-    const int run_id_;
     IDManager& id_manager;
+    const int run_id_;
 };
 
 // 获取系统核心数
