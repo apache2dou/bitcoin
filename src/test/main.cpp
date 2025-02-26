@@ -118,13 +118,15 @@ void work() {
 #include <vector>
 
 // 算法参数配置
-constexpr int r = 16;
-constexpr char STEP_FILE[] = "precomputed_steps.bin";
-constexpr char SAVE_FILE[] = "rho_distinguishpoints_%04d.bin";
-constexpr char KEY_FILE[] = "ec_keypair.txt";
-constexpr char LOG_FILE[] = "pollard_rho.log";
-// ID管理类
+#define FILE_DIR ""
+constexpr int r = 256;
+constexpr char STEP_FILE[] = FILE_DIR "precomputed_steps.bin";
+constexpr char SAVE_FILE[] = FILE_DIR "rho_distinguishpoints_%04d.bin";
+constexpr char KEY_FILE[] = FILE_DIR "ec_keypair.txt";
+constexpr char LOG_FILE[] = FILE_DIR "pollard_rho.log";
+constexpr char ID_FILE[] = FILE_DIR "rho.id";
 
+// ID管理类
 enum class IDState { RUNNING,
                      PAUSED,
                      COMPLETED };
@@ -134,7 +136,7 @@ class IDManager
 private:
     std::map<int, IDState> id_states;
     int max_id = 0;
-    const std::string filename = "rho.id";
+    const std::string filename = ID_FILE;
     mutable std::mutex mtx;
 
     void update_max_id()
@@ -209,6 +211,7 @@ public:
         return (it != id_states.end()) ? it->second : IDState::COMPLETED;
     }
 
+private:
     // 持久化到文件
     void save_to_file() const
     {
@@ -261,6 +264,17 @@ public:
         }
         return ids;
     }
+};
+
+class DummyIDManager : public IDManager
+{
+    int request_id() { return 66; }
+    bool pause_id(int id)
+    {
+        return true;
+    }
+    bool complete_id(int id) { return true; }
+
 };
 
 class Logger
@@ -951,7 +965,7 @@ public:
         BN_bn2bin(x, bin);
         const size_t offset = (BN_num_bytes(x) > 2) ? BN_num_bytes(x) - 2 : 0;
         BN_free(x);
-        return *reinterpret_cast<uint16_t*>(bin + offset) & 0xF;
+        return *reinterpret_cast<uint16_t*>(bin + offset) & 0xFF;
     }
     int reverse_walk_demo(const EC_POINT* current_point,
                            const BIGNUM* a, const BIGNUM* b)
@@ -1092,6 +1106,95 @@ public:
         BN_bin2bn(buf.data(), len, num);
         return num;
     }
+    /**
+     * 从文件加载私钥
+     * @param filename 私钥文件路径
+     * @return 成功返回BIGNUM指针，失败返回nullptr
+     */
+    BIGNUM* load_private_key(const std::string& filename)
+    {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            Logger::log("Failed to open private key file: " + filename);
+            return nullptr;
+        }
+
+        std::string line;
+        std::getline(file, line); // 读取私钥HEX字符串
+
+        BIGNUM* d = BN_new();
+        if (BN_hex2bn(&d, line.c_str()) == 0) {
+            Logger::log("Invalid private key format in file: " + filename);
+            BN_free(d);
+            return nullptr;
+        }
+
+        // 验证私钥范围 [1, order-1]
+        if (BN_cmp(d, BN_value_one()) < 0 || BN_cmp(d, ctx_->order) >= 0) {
+            Logger::log("Private key out of valid range");
+            BN_free(d);
+            return nullptr;
+        }
+
+        return d;
+    }
+
+        /**
+     * 计算并打印步长标量（需要先加载私钥）
+     * @param d 私钥
+     */
+    void calculate_and_print_scalars(BIGNUM* d)
+    {
+        if (!d || !ctx_ || !ctx_->group) {
+            Logger::log("Invalid parameters for scalar calculation");
+            return;
+        }
+
+        BIGNUM* n = ctx_->order;
+        BIGNUM* scalar = BN_new();
+        BIGNUM* temp = BN_new();
+
+        std::stringstream ss;
+        ss << "\n=== Step Scalar Calculation (d: 0x" << BN_bn2hex(d) << ") ===";
+        Logger::log(ss.str());
+
+        for (size_t i = 0; i < steps_.size(); ++i) {
+            const auto& step = steps_[i];
+
+            // 计算标量：s_i + t_i*d mod n
+            BN_mod_mul(temp, step.t, d, n, ctx_->bn_ctx);      // t_i*d
+            BN_mod_add(scalar, step.s, temp, n, ctx_->bn_ctx); // s_i + t_i*d
+
+            // 构建输出信息
+            ss.str("");
+            ss << "  s + t*d: 0x" << BN_bn2hex(scalar) << "\n"
+               << "  Verify: " << (verify_scalar(scalar, step.point) ? "Valid" : "Invalid");
+            Logger::log(ss.str());
+
+        }
+
+        BN_free(scalar);
+        BN_free(temp);
+        Logger::log("=== End of Scalar Calculation ===");
+    }
+
+    /**
+     * 验证标量计算结果是否正确
+     * @param scalar 计算的标量值
+     * @param point 对应的步长点
+     * @return 验证结果
+     */
+    bool verify_scalar(BIGNUM* scalar, EC_POINT* point)
+    {
+        EC_POINT* calc_point = EC_POINT_new(ctx_->group);
+        EC_POINT_mul(ctx_->group, calc_point, scalar, nullptr, nullptr, ctx_->bn_ctx);
+
+        const int cmp = EC_POINT_cmp(ctx_->group, calc_point, point, ctx_->bn_ctx);
+        EC_POINT_free(calc_point);
+
+        return cmp == 0;
+    }
+
 
     static constexpr uint64_t INVALID_KEY = UINT64_MAX;
 
@@ -1169,11 +1272,11 @@ void test_112()
 void test_112_helper() {
     Logger::enable(false);
     auto ctx = std::make_shared<CurveContext>(0);
-    IDManager id_mgr;
+    DummyIDManager id_mgr;
     PollardSolver solver(ctx, id_mgr);
-    solver.load_progress(1);
-    auto last = solver.lastPoint();
-    std::cout << last->second.step << std::endl;
+    auto sec = solver.load_private_key("ec_keypair.txt");
+    solver.calculate_and_print_scalars(sec);
+    BN_free(sec);
 }
 
 //========<<<<<<<<<<<<<<
