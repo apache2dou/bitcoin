@@ -830,6 +830,85 @@ public:
         return valid;
     }
 
+        // 斐波那契模式预计算步长生成
+    void generate_fibonacci_steps(int num_steps)
+    {
+        if (num_steps < 2) {
+            Logger::log("Fibonacci steps require at least 2 steps");
+            return;
+        }
+
+        // 清理现有步长
+        steps_.clear();
+        steps_.reserve(num_steps);
+
+        // 初始化前两个步长
+        BIGNUM* s[2] = {BN_new(), BN_new()};
+        BIGNUM* t[2] = {BN_new(), BN_new()};
+
+        // 生成初始随机值（可改为固定种子）
+        BN_rand_range(s[0], ctx_->order);
+        BN_rand_range(t[0], ctx_->order);
+        BN_rand_range(s[1], ctx_->order);
+        BN_rand_range(t[1], ctx_->order);
+
+        // 添加前两步
+        add_fib_step(s[0], t[0]);
+        add_fib_step(s[1], t[1]);
+
+        // 生成后续步长
+        for (int i = 2; i < num_steps; ++i) {
+            BIGNUM* new_s = BN_new();
+            BIGNUM* new_t = BN_new();
+
+            // s_i = (s_{i-1} + s_{i-2}) mod n
+            BN_mod_add(new_s, s[1], s[0], ctx_->order, ctx_->bn_ctx);
+            // t_i = (t_{i-1} + t_{i-2}) mod n
+            BN_mod_add(new_t, t[1], t[0], ctx_->order, ctx_->bn_ctx);
+
+            // 验证并添加新步长
+            if (!add_fib_step(new_s, new_t)) break;
+
+            // 滚动更新缓存
+            BN_free(s[0]);
+            BN_free(t[0]);
+            s[0] = s[1];
+            t[0] = t[1];
+            s[1] = new_s;
+            t[1] = new_t;
+        }
+
+        // 清理剩余资源
+        BN_free(s[0]);
+        BN_free(t[0]);
+        BN_free(s[1]);
+        BN_free(t[1]);
+    }
+
+    bool add_fib_step(BIGNUM* s, BIGNUM* t)
+    {
+        PrecomputedStep new_step(*ctx_);
+
+        // 计算点坐标
+        if (!EC_POINT_mul(ctx_->group, new_step.point, s, ctx_->Q, t, ctx_->bn_ctx)) {
+            Logger::log("Failed to compute step point");
+            return false;
+        }
+
+        // 验证点有效性
+        if (!EC_POINT_is_on_curve(ctx_->group, new_step.point, ctx_->bn_ctx)) {
+            Logger::log("Generated point is not on curve");
+            return false;
+        }
+
+        // 复制标量值
+        BN_copy(new_step.s, s);
+        BN_copy(new_step.t, t);
+
+        steps_.push_back(std::move(new_step));
+        return true;
+    }
+
 
     BIGNUM* process_distinguished_point()
     {
@@ -842,7 +921,7 @@ public:
                 assert(ret);
             } else {
                 store_point(key);
-                if ((key & 0xffffff0000000000) == 0)
+                if ((key & 0xfffffff000000000) == 0)
                     std::cout << step_count_ << " ";
             }
         }
@@ -1384,10 +1463,14 @@ void test_112_helper() {
     solver.calculate_and_print_scalars(sec);
     BN_free(sec);*/
 
+    //测试斐波那契 step
+    //solver.generate_fibonacci_steps(r);
+
     //将最后一个step 改为之前step之和
     std::vector<PrecomputedStep> steps2;
     solver.load_precomputed_steps(STEP_FILE, steps2);
     solver.adjust_last_step();
+
     solver.save_precomputed_steps();
     solver.load_precomputed_steps(STEP_FILE, solver.steps_);
     int i = 0;
