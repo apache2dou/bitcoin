@@ -494,10 +494,10 @@ struct PrecomputedStep {
 
     ~PrecomputedStep()
     {
-        EC_POINT_free(point);
-        EC_POINT_free(inverse_point);
-        BN_free(s);
-        BN_free(t);
+        if (point) EC_POINT_free(point);
+        if (inverse_point) EC_POINT_free(inverse_point);
+        if (s) BN_free(s);
+        if (t) BN_free(t);
     }
 
     PrecomputedStep(PrecomputedStep&& other) noexcept : point(other.point),
@@ -510,6 +510,31 @@ struct PrecomputedStep {
         other.s = nullptr;
         other.t = nullptr;
     }
+
+    PrecomputedStep& operator=(PrecomputedStep&& other) noexcept
+    {
+        if (this != &other) {
+            // 1. 清理现有资源
+            if (point) EC_POINT_free(point);
+            if (inverse_point) EC_POINT_free(inverse_point);
+            if (s) BN_free(s);
+            if (t) BN_free(t);
+
+            // 2. 转移资源所有权
+            point = other.point;
+            inverse_point = other.inverse_point;
+            s = other.s;
+            t = other.t;
+
+            // 3. 置空源对象指针
+            other.point = nullptr;
+            other.inverse_point = nullptr;
+            other.s = nullptr;
+            other.t = nullptr;
+        }
+        return *this;
+    }
+
     // 从文件加载构造
     PrecomputedStep(const CurveContext& ctx, std::istream& is) : point(EC_POINT_new(ctx.group)),
                                                                  inverse_point(EC_POINT_new(ctx.group)),
@@ -609,7 +634,7 @@ public:
         EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
 
         // 尝试加载预计算步长
-        if (!load_precomputed_steps(steps_)) {
+        if (!load_precomputed_steps(STEP_FILE, steps_)) {
             generate_precomputed_steps();
             save_precomputed_steps();
         }
@@ -624,7 +649,7 @@ public:
             set_initial(last->second.a, last->second.b, last->second.step);
         }
         if (!loaded)
-            printPoint();
+            printPoint(a_, b_, current_);
         BIGNUM* ret = nullptr;
         while (ret == nullptr) {
             if (gameover) {
@@ -677,12 +702,12 @@ public:
         BN_free(y);
     }
     //private:
-    bool load_precomputed_steps(std::vector<PrecomputedStep>& step_vec)
+    bool load_precomputed_steps(const char* filename, std::vector<PrecomputedStep>& step_vec)
     {
-        if (!fs::exists(STEP_FILE)) return false;
+        if (!fs::exists(filename)) return false;
 
         try {
-            std::ifstream file(STEP_FILE, std::ios::binary);
+            std::ifstream file(filename, std::ios::binary);
             if (!file) return false;
 
             // 验证文件头
@@ -693,6 +718,7 @@ public:
                 return false;
             }
 
+            step_vec.clear();
             step_vec.reserve(r);
             for (int i = 0; i < r; ++i) {
                 step_vec.emplace_back(*ctx_, file);
@@ -735,6 +761,76 @@ public:
 
         std::cout << "Saved " << r << " precomputed steps to file\n";
     }
+
+    // 在加载/生成预计算步长后调用此函数
+    void adjust_last_step()
+    {
+        if (steps_.size() < 2) {
+            Logger::log("Not enough steps to adjust, need at least 2 elements");
+            return;
+        }
+
+        // 初始化累加器
+        EC_POINT* sum_point = EC_POINT_new(ctx_->group);
+        BIGNUM* sum_s = BN_new();
+        BIGNUM* sum_t = BN_new();
+        BN_zero(sum_s);
+        BN_zero(sum_t);
+
+        // 遍历前N-1个元素进行累加
+        const size_t last_index = steps_.size() - 1;
+        for (size_t i = 0; i < last_index; ++i) {
+            const auto& step = steps_[i];
+
+            // 累加点坐标
+            EC_POINT_add(ctx_->group, sum_point, sum_point, step.point, ctx_->bn_ctx);
+
+            // 累加标量值（模运算）
+            BN_mod_add(sum_s, sum_s, step.s, ctx_->order, ctx_->bn_ctx);
+            BN_mod_add(sum_t, sum_t, step.t, ctx_->order, ctx_->bn_ctx);
+        }
+
+        // 创建新的最后一步
+        PrecomputedStep new_last_step(*ctx_);
+        EC_POINT_copy(new_last_step.point, sum_point);
+        BN_copy(new_last_step.s, sum_s);
+        BN_copy(new_last_step.t, sum_t);
+
+        // 验证新步长的有效性
+        if (!validate_step(new_last_step)) {
+            Logger::log("Failed to validate adjusted last step");
+            EC_POINT_free(sum_point);
+            BN_free(sum_s);
+            BN_free(sum_t);
+            return;
+        }
+
+        // 替换最后一步（带资源清理）
+        steps_.back() = std::move(new_last_step);
+
+        // 释放临时资源
+        EC_POINT_free(sum_point);
+        BN_free(sum_s);
+        BN_free(sum_t);
+
+        Logger::log("Successfully adjusted last step to sum of previous steps");
+    }
+
+    // 验证步长有效性
+    bool validate_step(const PrecomputedStep& step) const
+    {
+        EC_POINT* calc_point = EC_POINT_new(ctx_->group);
+        bool valid = false;
+
+        // 验证sG + tQ = point
+        EC_POINT_mul(ctx_->group, calc_point, step.s, ctx_->Q, step.t, ctx_->bn_ctx);
+        valid = (EC_POINT_cmp(ctx_->group, calc_point, step.point, ctx_->bn_ctx) == 0);
+
+        EC_POINT_free(calc_point);
+        return valid;
+    }
+
+
     BIGNUM* process_distinguished_point()
     {
         BIGNUM* ret = nullptr;
@@ -1050,14 +1146,15 @@ public:
         return maxIt;
     }
 
-    void printPoint() const{
+    void printPoint(BIGNUM* a, BIGNUM* b, EC_POINT* _point) const
+    {
         // 记录详细的初始点信息
         std::stringstream log_ss;
         log_ss << "Initial Point Configuration [Run ID: " << run_id_ << "]\n";
 
         // 记录标量参数
-        char* a_hex = BN_bn2hex(a_);
-        char* b_hex = BN_bn2hex(b_);
+        char* a_hex = BN_bn2hex(a);
+        char* b_hex = BN_bn2hex(b);
         log_ss << "  Scalar a: 0x" << a_hex << "\n";
         log_ss << "  Scalar b: 0x" << b_hex << "\n";
         OPENSSL_free(a_hex);
@@ -1065,7 +1162,7 @@ public:
 
         // 获取并记录点坐标
         BIGNUM *x = BN_new(), *y = BN_new();
-        if (EC_POINT_get_affine_coordinates(ctx_->group, current_, x, y, ctx_->bn_ctx)) {
+        if (EC_POINT_get_affine_coordinates(ctx_->group, _point, x, y, ctx_->bn_ctx)) {
             char* x_hex = BN_bn2hex(x);
             char* y_hex = BN_bn2hex(y);
 
@@ -1271,12 +1368,33 @@ void test_112()
 
 void test_112_helper() {
     Logger::enable(false);
+    BIGNUM* priv = nullptr;
+    EC_POINT* pub = nullptr;
     auto ctx = std::make_shared<CurveContext>(0);
+    ctx->load_keypair(&priv, &pub);
+    ctx->set_target(pub);
+    BN_free(priv);
+    EC_POINT_free(pub);
     DummyIDManager id_mgr;
     PollardSolver solver(ctx, id_mgr);
+
+    //研究规律
+    /*
     auto sec = solver.load_private_key("ec_keypair.txt");
     solver.calculate_and_print_scalars(sec);
-    BN_free(sec);
+    BN_free(sec);*/
+
+    //将最后一个step 改为之前step之和
+    std::vector<PrecomputedStep> steps2;
+    solver.load_precomputed_steps(STEP_FILE, steps2);
+    solver.adjust_last_step();
+    solver.save_precomputed_steps();
+    solver.load_precomputed_steps(STEP_FILE, solver.steps_);
+    int i = 0;
+    for (; i < steps2.size() - 1; i++) {
+        assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) == 0);
+    }
+    assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) != 0);
 }
 
 //========<<<<<<<<<<<<<<
