@@ -1140,26 +1140,67 @@ public:
         BN_bn2bin(x, bin);
         const size_t offset = (BN_num_bytes(x) > 2) ? BN_num_bytes(x) - 2 : 0;
         BN_free(x);
-        return *reinterpret_cast<uint16_t*>(bin + offset) & 0xFF;
+        static size_t mask = r - 1;
+        return *reinterpret_cast<uint16_t*>(bin + offset) & mask;
     }
-    int reverse_walk_demo(const EC_POINT* current_point,
-                           const BIGNUM* a, const BIGNUM* b)
+    // 返回结构封装结果和状态
+    struct StartPointResult {
+        EC_POINT* point = nullptr;
+        BIGNUM* a = nullptr;
+        BIGNUM* b = nullptr;
+        bool success = false;
+    };
+    // 生成起始点函数返回结构
+    StartPointResult generate_start_point_with_min_predecessors(
+        int min_predecessors,
+        int max_attempts = 10000)
     {
-        // 执行逆向步进
-        auto predecessors = reverse_walk_step(current_point, a, b);
+        StartPointResult result;
 
-        int ret = predecessors.size();
-
-
-        for (const auto& [point, prev_a, prev_b] : predecessors) {
-            
-            // 清理临时资源
-            EC_POINT_free(const_cast<EC_POINT*>(point));
-            BN_free(const_cast<BIGNUM*>(prev_a));
-            BN_free(const_cast<BIGNUM*>(prev_b));
+        // 创建新资源
+        EC_POINT* current_point = EC_POINT_new(ctx_->group);
+        BIGNUM* current_a = BN_new();
+        BIGNUM* current_b = BN_new();
+        if (!current_point || !current_a || !current_b) {
+            if (current_point) EC_POINT_free(current_point);
+            if (current_a) BN_free(current_a);
+            if (current_b) BN_free(current_b);
+            return result;
         }
-        return ret;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            // 生成随机参数
+            BN_rand_range(current_a, ctx_->order);
+            BN_rand_range(current_b, ctx_->order);
+            EC_POINT_mul(ctx_->group, current_point, current_a, ctx_->Q, current_b, ctx_->bn_ctx);
+
+            // 检查前置点数量
+            auto predecessors = reverse_walk_step(current_point, current_a, current_b);
+            const bool valid = predecessors.size() >= min_predecessors;
+
+            // 清理前置点资源
+            for (auto& [p, a, b] : predecessors) {
+                EC_POINT_free(p);
+                BN_free(a);
+                BN_free(b);
+            }
+
+            if (valid) {
+                // 转移资源所有权
+                result.point = current_point;
+                result.a = current_a;
+                result.b = current_b;
+                result.success = true;
+                return result;
+            }
+        }
+        // 释放尝试资源
+        EC_POINT_free(current_point);
+        BN_free(current_a);
+        BN_free(current_b);
+
+        return result;
     }
+
     void save_progress() const
     {
         std::ofstream file(format_filename(SAVE_FILE, run_id_), std::ios::binary);
@@ -1464,20 +1505,35 @@ void test_112_helper() {
     BN_free(sec);*/
 
     //测试斐波那契 step
-    //solver.generate_fibonacci_steps(r);
+    /* solver.generate_fibonacci_steps(r);
+    solver.save_precomputed_steps();*/
 
     //将最后一个step 改为之前step之和
-    std::vector<PrecomputedStep> steps2;
+    /*std::vector<PrecomputedStep> steps2;
     solver.load_precomputed_steps(STEP_FILE, steps2);
     solver.adjust_last_step();
-
     solver.save_precomputed_steps();
     solver.load_precomputed_steps(STEP_FILE, solver.steps_);
     int i = 0;
     for (; i < steps2.size() - 1; i++) {
         assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) == 0);
     }
-    assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) != 0);
+    assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) != 0);*/
+
+    //测试generate_start_point_with_min_predecessors 效果
+    for (int i = 1; i < 11; i++) {
+        solver.load_progress(i);
+    }
+    auto sp = solver.generate_start_point_with_min_predecessors(r /2, 1000000);
+    if (!sp.success) {
+        std::cout << "generate_start_point_with_min_predecessors failed\n";
+        return;
+    }
+    solver.set_initial(sp.a, sp.b, 0);
+    BIGNUM* found = solver.solve();
+    if (found != nullptr) {
+        BN_free(found);
+    }
 }
 
 //========<<<<<<<<<<<<<<
