@@ -626,6 +626,12 @@ public:
                                                                            id_manager(manager),
                                                                            run_id_(id_manager.request_id())
     {
+        // 尝试加载预计算步长
+        if (!load_precomputed_steps(STEP_FILE, steps_)) {
+            generate_precomputed_steps();
+            save_precomputed_steps();
+        }
+
         // 初始化随机起点
         auto sp = generate_start_point_with_min_predecessors(8, 1000000);
         if (!sp.success) {
@@ -640,12 +646,6 @@ public:
             a_ = sp.a;
             b_ = sp.b;
             current_ = sp.point;
-        }
-
-        // 尝试加载预计算步长
-        if (!load_precomputed_steps(STEP_FILE, steps_)) {
-            generate_precomputed_steps();
-            save_precomputed_steps();
         }
     }
 
