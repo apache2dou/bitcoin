@@ -160,7 +160,7 @@ public:
     }
 
     // 请求可用ID（优先返回暂停状态的ID）
-    int request_id()
+    virtual int request_id()
     {
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -268,6 +268,7 @@ private:
 
 class DummyIDManager : public IDManager
 {
+public:
     int request_id() { return 66; }
     bool pause_id(int id)
     {
@@ -621,17 +622,25 @@ class PollardSolver
 {
 public:
     PollardSolver(std::shared_ptr<CurveContext> ctx, IDManager& manager) : ctx_(ctx),
-                                                                           current_(EC_POINT_new(ctx_->group)),
-                                                                           a_(BN_new()),
-                                                                           b_(BN_new()),
                                                                            step_count_(0),
                                                                            id_manager(manager),
                                                                            run_id_(id_manager.request_id())
     {
         // 初始化随机起点
-        BN_rand_range(a_, ctx_->order);
-        BN_rand_range(b_, ctx_->order);
-        EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
+        auto sp = generate_start_point_with_min_predecessors(8, 1000000);
+        if (!sp.success) {
+            Logger::log("generate_start_point_with_min_predecessors failed");
+            current_ = EC_POINT_new(ctx_->group);
+            a_ = BN_new();
+            b_ = BN_new();
+            BN_rand_range(a_, ctx_->order);
+            BN_rand_range(b_, ctx_->order);
+            EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
+        } else {
+            a_ = sp.a;
+            b_ = sp.b;
+            current_ = sp.point;
+        }
 
         // 尝试加载预计算步长
         if (!load_precomputed_steps(STEP_FILE, steps_)) {
@@ -1521,13 +1530,13 @@ void test_112_helper() {
     assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) != 0);*/
 
     //测试generate_start_point_with_min_predecessors 效果
-    for (int i = 1; i < 11; i++) {
-        solver.load_progress(i);
-    }
-    auto sp = solver.generate_start_point_with_min_predecessors(r /2, 1000000);
+    auto sp = solver.generate_start_point_with_min_predecessors(8, 1000000);
     if (!sp.success) {
         std::cout << "generate_start_point_with_min_predecessors failed\n";
         return;
+    }
+    for (int i = 1; i < 11; i++) {
+        solver.load_progress(i);
     }
     solver.set_initial(sp.a, sp.b, 0);
     BIGNUM* found = solver.solve();
