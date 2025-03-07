@@ -3534,8 +3534,10 @@ class BabyGiant
 private:
     std::vector<uint64_t> _Xvec;
     std::vector<int> _Mvec;
+    iLog _dplog;
 
 public:
+    BabyGiant() : _dplog("D:\\DistinguishablePoints.txt") {}
     void prepare()
     {
         _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
@@ -3548,6 +3550,7 @@ public:
         giantStep(ctx, rs);
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
+            saveDP(_dplog.ofs, d, rs);
         }
         int b = find_baby(ctx, _Xvec, _Mvec, rs.x);
         if (b != 0) {
@@ -3597,7 +3600,7 @@ public:
             } else {
                 dpMap[d] = rs;
             }
-            if (i != 0 && count_dstg % 3 == 0) {
+            if (i != 0 && count_dstg % 31 == 0) {
                 rs.rand();
             }
         }

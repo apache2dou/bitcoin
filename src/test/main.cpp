@@ -104,7 +104,8 @@ void signalHandler(int signum)
 }
 void work() {
     std::cout << "game starting..." << std::endl;
-    play<Rho>();
+    //play<Rho>();
+    play<BabyGiant>();
 }
 
 
@@ -119,7 +120,7 @@ void work() {
 
 // 算法参数配置
 #define FILE_DIR ""
-constexpr int r = 256;
+constexpr int r = 32;
 constexpr char STEP_FILE[] = FILE_DIR "precomputed_steps.bin";
 constexpr char SAVE_FILE[] = FILE_DIR "rho_distinguishpoints_%04d.bin";
 constexpr char KEY_FILE[] = FILE_DIR "ec_keypair.txt";
@@ -626,14 +627,20 @@ public:
                                                                            id_manager(manager),
                                                                            run_id_(id_manager.request_id())
     {
-        // 尝试加载预计算步长
-        if (!load_precomputed_steps(STEP_FILE, steps_)) {
-            generate_precomputed_steps();
-            save_precomputed_steps();
+        static RecursiveMutex steps_mutex;
+        {
+            LOCK(steps_mutex);
+            // 尝试加载预计算步长
+            if (!load_precomputed_steps(STEP_FILE, steps_)) {
+                generate_precomputed_steps();
+                save_precomputed_steps();
+            }
         }
-
         // 初始化随机起点
-        auto sp = generate_start_point_with_min_predecessors(8, 1000000);
+        StartPointResult sp;
+        if (run_id_ != 66) {
+            sp = generate_start_point_with_min_predecessors(6, 1000000);
+        }
         if (!sp.success) {
             Logger::log("generate_start_point_with_min_predecessors failed");
             current_ = EC_POINT_new(ctx_->group);
@@ -960,32 +967,37 @@ public:
     {
         // 返回一个非空值，方便退出循环。
         BIGNUM* result = BN_new();
-        BIGNUM* current_x = BN_new();
-        BIGNUM* current_y = BN_new();
-        BIGNUM* stored_x = BN_new();
-        BIGNUM* stored_y = BN_new();
         EC_POINT* stored_point = EC_POINT_new(ctx_->group);
 
-        EC_POINT_get_affine_coordinates(ctx_->group, current_,
-                                        current_x, current_y,
-                                        ctx_->bn_ctx);
         EC_POINT_mul(ctx_->group, stored_point, dp.a, ctx_->Q, dp.b, ctx_->bn_ctx);
-        EC_POINT_get_affine_coordinates(ctx_->group, stored_point,
-                                        stored_x, stored_y,
-                                        ctx_->bn_ctx);
 
         int collision_type = -1;
         if (EC_POINT_cmp(ctx_->group, current_, stored_point, ctx_->bn_ctx) == 0) {
             collision_type = 0;
-        } else if (BN_cmp(current_x, stored_x) == 0) {
-            BIGNUM* sum_y = BN_new();
-            BN_mod_add(sum_y, current_y, stored_y, ctx_->order, ctx_->bn_ctx);
-            if (BN_is_zero(sum_y)) {
-                collision_type = 1;
+        } else {
+            BIGNUM* current_x = BN_new();
+            BIGNUM* current_y = BN_new();
+            BIGNUM* stored_x = BN_new();
+            BIGNUM* stored_y = BN_new();
+            EC_POINT_get_affine_coordinates(ctx_->group, current_,
+                                            current_x, current_y,
+                                            ctx_->bn_ctx);
+            EC_POINT_get_affine_coordinates(ctx_->group, stored_point,
+                                            stored_x, stored_y,
+                                            ctx_->bn_ctx);
+            if (BN_cmp(current_x, stored_x) == 0) {
+                BIGNUM* sum_y = BN_new();
+                BN_mod_add(sum_y, current_y, stored_y, ctx_->order, ctx_->bn_ctx);
+                if (BN_is_zero(sum_y)) {
+                    collision_type = 1;
+                }
+                BN_free(sum_y);
             }
-            BN_free(sum_y);
+            BN_free(current_x);
+            BN_free(current_y);
+            BN_free(stored_x);
+            BN_free(stored_y);
         }
-
         if (collision_type != -1) {
             const uint64_t tail_length = dp.step;
             const uint64_t cycle_length = step_count_ - dp.step;
@@ -1008,10 +1020,6 @@ public:
             }
         }
 
-        BN_free(current_x);
-        BN_free(current_y);
-        BN_free(stored_x);
-        BN_free(stored_y);
         return result;
     }
 
@@ -1116,10 +1124,10 @@ public:
             EC_POINT_add(ctx_->group, candidate, candidate, step.inverse_point, ctx_->bn_ctx);
 
             // 验证候选点有效性
-            if (!EC_POINT_is_on_curve(ctx_->group, candidate, ctx_->bn_ctx)) {
+            /* if (!EC_POINT_is_on_curve(ctx_->group, candidate, ctx_->bn_ctx)) {
                 EC_POINT_free(candidate);
                 continue;
-            }
+            }*/
 
             // 验证候选点的下一步是否指向当前点
             size_t candidate_idx = get_step_index_for_point(candidate);
@@ -1453,20 +1461,20 @@ void test_112()
             // 生成测试密钥对
             BIGNUM* priv = nullptr;
             EC_POINT* pub = nullptr;
-            {
-                static RecursiveMutex init_mutex;
-                LOCK(init_mutex);
-                auto ctx = std::make_shared<CurveContext>(0);
+            static RecursiveMutex keypair_mutex;
+            auto ctx = std::make_shared<CurveContext>(0);
 
+            {
+                LOCK(keypair_mutex);
                 // 尝试加载现有密钥对
                 if (!ctx->load_keypair(&priv, &pub)) {
                     // 生成并保存新密钥对
                     ctx->generate_and_save_keypair(&priv, &pub);
                 }
-                ctx->set_target(pub);
-
-                solver = new PollardSolver(ctx, id_mgr);
             }
+            ctx->set_target(pub);
+
+            solver = new PollardSolver(ctx, id_mgr);
             BIGNUM* found = solver->solve(); // 验证结果
             if (found != nullptr) {
                 if (BN_cmp(found, priv) == 0) {
@@ -1513,9 +1521,32 @@ void test_112_helper() {
     solver.calculate_and_print_scalars(sec);
     BN_free(sec);*/
 
+    /*
+    solver.load_progress(1);
+    auto last = solver.lastPoint();
+    assert(last != solver.points_.end());
+    solver.set_initial(last->second.a, last->second.b, last->second.step);
+    uint32_t stat[64] = {0};
+    do {
+        solver.walk_step();
+        auto predecessors = solver.reverse_walk_step(solver.current_, solver.a_, solver.b_);
+        std::cout << predecessors.size() << " ";
+        stat[predecessors.size()]++;
+
+        // 清理前置点资源
+        for (auto& [p, a, b] : predecessors) {
+            EC_POINT_free(p);
+            BN_free(a);
+            BN_free(b);
+        }
+    } while (solver.a_ != last->second.a && stat[1] < 10000);
+    std::cout << std::endl;
+    for (auto s: stat)
+        std::cout << s << " ";*/
+
     //测试斐波那契 step
-    /* solver.generate_fibonacci_steps(r);
-    solver.save_precomputed_steps();*/
+     solver.generate_fibonacci_steps(r);
+    solver.save_precomputed_steps();
 
     //将最后一个step 改为之前step之和
     /*std::vector<PrecomputedStep> steps2;
@@ -1530,7 +1561,7 @@ void test_112_helper() {
     assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) != 0);*/
 
     //测试generate_start_point_with_min_predecessors 效果
-    auto sp = solver.generate_start_point_with_min_predecessors(8, 1000000);
+    /* auto sp = solver.generate_start_point_with_min_predecessors(6, 1000000);
     if (!sp.success) {
         std::cout << "generate_start_point_with_min_predecessors failed\n";
         return;
@@ -1542,7 +1573,7 @@ void test_112_helper() {
     BIGNUM* found = solver.solve();
     if (found != nullptr) {
         BN_free(found);
-    }
+    }*/
 }
 
 //========<<<<<<<<<<<<<<
@@ -1552,12 +1583,12 @@ int main(int argc, char* argv[])
     // 注册信号处理函数，捕获 SIGINT 信号
     signal(SIGINT, signalHandler);
 
-    /* INIT _init;
-    work();*/
+    INIT _init;
+    work();
 
-    Logger::init();
-    test_112();
-    Logger::cleanup();
+    /* Logger::init();
+    test_112_helper();
+    Logger::cleanup();*/
 
     std::cout << "Finish. Press any key..." << std::endl;
     _getch(); // 等待用户按下任意键
