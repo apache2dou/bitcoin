@@ -3548,10 +3548,6 @@ public:
     bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
     {
         giantStep(ctx, rs);
-        if (auto d = distinguishable(rs.x)) {
-            ++count_dstg;
-            saveDP(_dplog.ofs, d, rs);
-        }
         int b = find_baby(ctx, _Xvec, _Mvec, rs.x);
         if (b != 0) {
             CKey k;
@@ -3561,6 +3557,11 @@ public:
                 log += "!!!!short circulation!!!!\n";
             }
             return false;
+        }
+        if (auto d = distinguishable(rs.x)) {
+            ++count_dstg;
+            saveDP(_dplog.ofs, d, rs);
+            rs.rand();
         }
         return true;
     }
