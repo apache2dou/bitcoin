@@ -3129,21 +3129,23 @@ static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 static secp256k1_pubkey pk_mvp;
 
-static auto s2 = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f36681b20a1");
-static auto s4 = ParseHex("bfffffffffffffffffffffffffffffff0c0325ad0376782ccfddc6e99c18b0f1");
-static auto s8 = ParseHex("dffffffffffffffffffffffffffffffee3590149d95f8c3447d811bb362f7919");
-static auto s16 = ParseHex("51745d1745d1745d1745d1745d1745d10cda8c1adaae61874ff17b2ccde2b7ac");
-static auto s32 = ParseHex("8a3d70a3d70a3d70a3d70a3d70a3d7098dc4d3725469c72a812f0a18d6d59e0e");
-static auto s64 = ParseHex("451eb851eb851eb851eb851eb851eb84c6e269b92a34e3954097850c6b6aca0f");
-static auto s128 = ParseHex("4b3e45306eb3e45306eb3e45306eb3e3f3690462f00f4ac5740e4392e6b60021");
-static auto s256 = ParseHex("9c4111fadce5754c335f096b05fe49a10b33ef4929ead477c96a91e5c992fd05");
-static auto s512 = ParseHex("311c0193eb7d0aa6758c07e2997135400d5408d906037aa54c70bcef9f7617f5");
-static auto s1024 = ParseHex("6cfacbb5a8479eda94328e3ff023afb41f05ab3c09d02becd3d3caf1f83bc628");
-static auto s2048 = ParseHex("367d65dad3a3cf6d4a19471ff811d7da3f82d59e04e815f669e9e578fc1de314");
-static auto s4096 = ParseHex("c1b5fd75f38d2d1e4117710f04ccc01cc429dcd91a6b4dbced421509bff49970");
-static auto s8192 = ParseHex("596d25371ee2ff16dc346b5eca4ca74240e367013a83835177fd8524d7342f72");
-static auto s16384 = ParseHex("2e432b87f8b58ce64a75fb126b16eb37d01a3756e529eb50caa33362c6de4bc1");
-const unsigned char* adds_sec[0x10] = {nullptr, nullptr, s2.data(), s4.data(), s8.data(), s16.data(), s32.data(), s64.data(), s128.data(), s256.data(), s512.data(), s1024.data(), s2048.data(), s4096.data(), s8192.data(), s16384.data()};
+static auto s2 = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1");
+static auto s4 = ParseHex("bfffffffffffffffffffffffffffffff0c0325ad0376782ccfddc6e99c28b0f1");
+static auto s8 = ParseHex("dffffffffffffffffffffffffffffffee3590149d95f8c3447d812bb362f7919");
+static auto s16 = ParseHex("51745d1745d1745d1745d1745d1745d10cda8c1adaae61875ff17b2ccde2b7ac");
+static auto s32 = ParseHex("8a3d70a3d70a3d70a3d70a3d70a3d7098dc4d3725469c72a812f0a18d6d59e1e");
+static auto s64 = ParseHex("451eb851eb851eb851eb851eb851eb84c6e269b92a34e3954097850c6b6acf0f");
+static auto s128 = ParseHex("4b3e45306eb3e45306eb3e45306eb3e3f3690462f00f4ac5740e4392e6b60027");
+static auto s256 = ParseHex("9c4111fadce5754c335f096b05fe49a10b33ef4929ead487c96a91e5c992fd05");
+static auto s512 = ParseHex("311c0193eb7d0aa6758c07e3997135400d5408d906037aa54c70bcef9f7617f5");
+static auto s1024 = ParseHex("6cfacbb5a7479eda94328e3ff023afb41f05ab3c09d02becd3d3caf1f83bc628");
+static auto s2048 = ParseHex("367d65dad3a3cf6d4a19471ff811d7da0f82d59e04e815f669e9e578fc1de314");
+static auto s4096 = ParseHex("c1b5fd75f38d2d1e4117710f04ccc01cc429dcd91a6b4dbced421509bff44970");
+static auto s8192 = ParseHex("596d25371ee2ff16dc346b5eca4ca74240e367013a83835077fd8524d7342f72");
+static auto s16384 = ParseHex("2e432b87f8b58ce64a75fb126b16eb37d01a3756e529eb50caa33362c6de4bc0");
+static auto s32768 = ParseHex("4d6e90ff6545be8bc41d49f20782ae205f541449f0f5d87d703462aace9cdebb");
+static auto s65536 = ParseHex("f57ccbfda0600bf6203af04c032738042e0a859d943dc7ea9bdeb8212ff11fb6");
+const unsigned char* adds_sec[0x10] = {s65536.data(), s32768.data(), s2.data(), s4.data(), s8.data(), s16.data(), s32.data(), s64.data(), s128.data(), s256.data(), s512.data(), s1024.data(), s2048.data(), s4096.data(), s8192.data(), s16384.data()};
 static secp256k1_pubkey adds_pub[2][0x10] = {0};
 static unsigned char adds_sec_neg[0x10][33] = {0};
 
@@ -3159,7 +3161,7 @@ public:
         ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
         secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
 
-        for (int i = 2; i < 16; i++) {
+        for (int i = 0; i < 16; i++) {
             memcpy(adds_sec_neg[i], adds_sec[i], s2.size());
             secp256k1_ec_seckey_negate(ctx, adds_sec_neg[i]);
             secp256k1_ec_pubkey_create(ctx, &adds_pub[0][i], adds_sec[i]);
@@ -3561,7 +3563,8 @@ public:
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            rs.rand();
+            char c = (rs.x.data[0] & 0xF);
+            fun_add(rs, c);
         }
         return true;
     }
