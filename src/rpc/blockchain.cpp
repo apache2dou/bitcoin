@@ -3563,7 +3563,7 @@ public:
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            char c = (rs.x.data[0] & 0xF);
+            char c = (d & 0xF);
             fun_add(rs, c);
         }
         return true;
