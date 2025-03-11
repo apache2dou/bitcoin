@@ -4029,18 +4029,23 @@ static RPCHelpMan testmvp()
             }
 
             if (ta == 8) {
-                auto judge = [&node]() {
-                    while (!gameover) {
-                        try {
-                            Sleep(1000);
-                            node.rpc_interruption_point();
-                        } catch (...) {
-                            gameover = true;
+                if (ta2 == 1) {
+                    Rho r;
+                    r.prepare();
+                } else {
+                    auto judge = [&node]() {
+                        while (!gameover) {
+                            try {
+                                Sleep(1000);
+                                node.rpc_interruption_point();
+                            } catch (...) {
+                                gameover = true;
+                            }
                         }
-                    }
-                };
-                std::thread t(judge);
-                play<Rho>();
+                    };
+                    std::thread t(judge);
+                    play<Rho>();
+                }
             }
 
             return unspent;
