@@ -3563,7 +3563,10 @@ public:
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            char c = (d & 0xF);
+            //char c = (d & 0xF);
+            unsigned char rnd[8];
+            GetStrongRandBytes(rnd);
+            char c = (rnd[7] & 0xF);
             fun_add(rs, c);
         }
         return true;
