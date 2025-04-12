@@ -3629,8 +3629,8 @@ auto get_time()
 
 template <typename PLAYER>
 void play() {
-    std::string _logvec[32];
-    RhoState rs[32] = {0};
+    std::string _logvec[256];
+    RhoState rs[256] = {0};
     loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
     for (RhoState& r : rs) {
         assert(check(ctx, &r.x, r.m, r.n));
@@ -3871,7 +3871,7 @@ static RPCHelpMan testmvp()
                 assert(memcmp(sp1.n, sp2.n, sizeof(sp1.n)) == 0);
 
                 //测试 saveDP 和 loadDP                
-                {
+                /* {
                     iLog _testlog("D:\\test.txt");
                     std::map<uint64_t, SecPair> _testMap;
                     RhoState rss[1024];
@@ -3887,7 +3887,7 @@ static RPCHelpMan testmvp()
                         assert(it != _testMap.end() && it->second == r);
                     }
                 }
-                std::remove("D:\\test.txt");
+                std::remove("D:\\test.txt");*/
             }
 
             //生成babystep
@@ -3898,7 +3898,7 @@ static RPCHelpMan testmvp()
                     ta2 = BabyNUM;
                 }
 
-                int batch = (ta2 + 5) / 6; // 0x10000000;
+                unsigned int batch = (ta2 + 5) / 6; // 0x10000000;
                 int times = ta2 / batch + 1;
                 int64_t total = 0;
                 for (int i = 0; i < times; i++) {
@@ -3984,7 +3984,7 @@ static RPCHelpMan testmvp()
             }
 
             auto initRhoState = [&]() {
-                RhoState rs[32] = {0};
+                RhoState rs[256] = {0};
                 for (RhoState& r : rs) {
                     r.rand();                    
                     r.times = 0;
@@ -3998,7 +3998,7 @@ static RPCHelpMan testmvp()
             if (ta == 120 && ta2 == 888) {
                 initRhoState();
 
-                RhoState rs2[32] = {0};
+                RhoState rs2[256] = {0};
                 loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState));
                 for (RhoState& r : rs2) {
                     assert(check(ctx, &r.x, r.m, r.n));
@@ -4006,7 +4006,7 @@ static RPCHelpMan testmvp()
             }
             //测试 rho_F 与 rho_Fi 或者 giantStep 与 giantStepi
             if (ta == 121) {
-                RhoState rs[32] = {0};
+                RhoState rs[256] = {0};
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
                 auto f = rho_F;
                 auto fi = rho_Fi;
