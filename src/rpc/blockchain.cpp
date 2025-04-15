@@ -3529,6 +3529,12 @@ auto saveDP = [](std::ofstream& fs, uint64_t index, SecPair& sp) {
     fs << HexStr(sp.n) << std::endl;
 };
 
+unsigned char randChar() {
+    unsigned char rnd[8];
+    GetStrongRandBytes(rnd);
+    return rnd[7];
+}
+
 static const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
 static const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
 class BabyGiant
@@ -3564,10 +3570,9 @@ public:
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
             //char c = (d & 0xF);
-            unsigned char rnd[8];
-            GetStrongRandBytes(rnd);
-            char c = (rnd[7] & 0xF);
-            fun_add(rs, c);
+            /*char c = (randChar() & 0xF);
+            fun_add(rs, c);*/
+            fun_mul(rs, 2);
         }
         return true;
     }
@@ -3869,6 +3874,12 @@ static RPCHelpMan testmvp()
                 assert(sp2 == sp1);
                 assert(memcmp(sp1.m, sp2.m, sizeof(sp1.m)) == 0);
                 assert(memcmp(sp1.n, sp2.n, sizeof(sp1.n)) == 0);
+
+                unsigned char chars[5];
+                for (auto& c : chars) {
+                    c = randChar();
+                }
+                assert(chars[0] != chars[1] || chars[2] != chars[3] || chars[1] != chars[4]);
 
                 //测试 saveDP 和 loadDP                
                 /* {
