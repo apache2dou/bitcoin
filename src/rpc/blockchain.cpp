@@ -2803,12 +2803,12 @@ public:
     }
 };
 
-void save_babymap(std::map<uint64_t, int>& _map, int base)
+void save_map(std::map<uint64_t, uint64_t>& _map, uint64_t base, const std::string& filename)
 {
     LOCK(baby_map_mutex);
     // 将map对象序列化到文件中
     char p[256] = {0};
-    sprintf(p, "D:\\baby_map\\baby_map%d.txt", base);
+    sprintf(p, filename.c_str(), base);
     std::ofstream ofs(p);
     for (const auto& kv : _map) {
         ofs << kv.first << " " << kv.second << "\n";
@@ -2816,10 +2816,10 @@ void save_babymap(std::map<uint64_t, int>& _map, int base)
     ofs << std::flush; // 确保所有数据都被写入
 }
 
-void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
+void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, const std::string& name)
 {
-    std::string baseFileName = "baby_map";
-    std::string directory = "D:\\baby_map\\";
+    std::string baseFileName = name + "_map";
+    std::string directory = "D:\\" + name + "_map\\";
     std::vector<std::ifstream> fileStreams;
     typedef struct {
         int value;
@@ -2827,20 +2827,15 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
     } tp;
     std::map<uint64_t, tp> tmp_map;
     int index = 0;
-    int load_size = 0x7fffffff;
     try {
         for (const auto& entry : fs::directory_iterator(directory)) {
             if (entry.is_regular_file()) {
                 std::string fileName = entry.path().filename().string();
                 if (fileName.starts_with(baseFileName)) { // C++20 特性
-                    int base;
-                    sscanf(fileName.c_str(), "baby_map%d.txt", &base);
-                    if (num == 0) {
-                        if (load_size == 0x7fffffff || load_size < base)
-                            load_size = base;
-                    }else if (base > num) {
-                        if (base < load_size)
-                            load_size = base;
+                    uint64_t base;
+                    std::string tmp = baseFileName + "%llu.txt";
+                    sscanf(fileName.c_str(), tmp.c_str(), &base);
+                    if (num != 0 && base >= num) {
                         continue;
                     }
                         
@@ -2849,7 +2844,7 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
                         throw std::runtime_error("Failed to open file: " + fileName);
                     }
                     uint64_t key;
-                    int value;
+                    uint64_t value;
                     file >> key >> value;
                     fileStreams.push_back(std::move(file));
                     tp _t;
@@ -2860,16 +2855,12 @@ void read_babymap(std::vector<uint64_t>& x, std::vector<int>& m, int num)
                 }
             }
         }
-        if (load_size != 0x7fffffff) {
-            x.reserve(load_size - 1);
-            m.reserve(load_size - 1);
-        }
         auto it = tmp_map.begin();
         while (it != tmp_map.end()) {
             x.push_back(it->first);
             m.push_back(it->second.value);
             uint64_t key;
-            int value;
+            uint64_t value;
             if (fileStreams[it->second.index] >> key >> value) {
                 tp _t;
                 _t.value = value;
@@ -3037,6 +3028,7 @@ static RPCHelpMan luckytxout()
 
 #include <util/strencodings.h>
 #include "../../secp256k1/include/secp256k1.h"
+#include "steps.h"
 
 static secp256k1_context* ctx = nullptr;
 static iLog* g_log = nullptr;
@@ -3129,25 +3121,10 @@ static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 static secp256k1_pubkey pk_mvp;
 
-static auto s2 = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1");
-static auto s4 = ParseHex("bfffffffffffffffffffffffffffffff0c0325ad0376782ccfddc6e99c28b0f1");
-static auto s8 = ParseHex("dffffffffffffffffffffffffffffffee3590149d95f8c3447d812bb362f7919");
-static auto s16 = ParseHex("51745d1745d1745d1745d1745d1745d10cda8c1adaae61875ff17b2ccde2b7ac");
-static auto s32 = ParseHex("8a3d70a3d70a3d70a3d70a3d70a3d7098dc4d3725469c72a812f0a18d6d59e1e");
-static auto s64 = ParseHex("451eb851eb851eb851eb851eb851eb84c6e269b92a34e3954097850c6b6acf0f");
-static auto s128 = ParseHex("4b3e45306eb3e45306eb3e45306eb3e3f3690462f00f4ac5740e4392e6b60027");
-static auto s256 = ParseHex("9c4111fadce5754c335f096b05fe49a10b33ef4929ead487c96a91e5c992fd05");
-static auto s512 = ParseHex("311c0193eb7d0aa6758c07e3997135400d5408d906037aa54c70bcef9f7617f5");
-static auto s1024 = ParseHex("6cfacbb5a7479eda94328e3ff023afb41f05ab3c09d02becd3d3caf1f83bc628");
-static auto s2048 = ParseHex("367d65dad3a3cf6d4a19471ff811d7da0f82d59e04e815f669e9e578fc1de314");
-static auto s4096 = ParseHex("c1b5fd75f38d2d1e4117710f04ccc01cc429dcd91a6b4dbced421509bff44970");
-static auto s8192 = ParseHex("596d25371ee2ff16dc346b5eca4ca74240e367013a83835077fd8524d7342f72");
-static auto s16384 = ParseHex("2e432b87f8b58ce64a75fb126b16eb37d01a3756e529eb50caa33362c6de4bc0");
-static auto s32768 = ParseHex("4d6e90ff6545be8bc41d49f20782ae205f541449f0f5d87d703462aace9cdebb");
-static auto s65536 = ParseHex("f57ccbfda0600bf6203af04c032738042e0a859d943dc7ea9bdeb8212ff11fb6");
-const unsigned char* adds_sec[0x10] = {s65536.data(), s32768.data(), s2.data(), s4.data(), s8.data(), s16.data(), s32.data(), s64.data(), s128.data(), s256.data(), s512.data(), s1024.data(), s2048.data(), s4096.data(), s8192.data(), s16384.data()};
-static secp256k1_pubkey adds_pub[2][0x10] = {0};
-static unsigned char adds_sec_neg[0x10][33] = {0};
+static RhoPoint adds_pub[2][256] = {0};
+
+int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
+int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs);
 
 class INIT
 {
@@ -3161,11 +3138,19 @@ public:
         ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
         secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
 
-        for (int i = 0; i < 16; i++) {
-            memcpy(adds_sec_neg[i], adds_sec[i], s2.size());
-            secp256k1_ec_seckey_negate(ctx, adds_sec_neg[i]);
-            secp256k1_ec_pubkey_create(ctx, &adds_pub[0][i], adds_sec[i]);
-            secp256k1_ec_pubkey_create(ctx, &adds_pub[1][i], adds_sec_neg[i]);
+        for (int i = 0; i < sizeof(adds_pub[0]) / sizeof(adds_pub[0][0]); i++) {
+            memcpy(adds_pub[0][i].x.data, ParseHex(steps[i * 3]).data(), sizeof(adds_pub[0][i].x));
+            memcpy(adds_pub[0][i].m, ParseHex(steps[i * 3 + 1]).data(), sizeof(adds_pub[0][i].m));
+            memcpy(adds_pub[0][i].n, ParseHex(steps[i * 3 + 2]).data(), sizeof(adds_pub[0][i].n));
+
+            assert(check(ctx, &adds_pub[0][i].x, adds_pub[0][i].m, adds_pub[0][i].n));
+
+            adds_pub[1][i] = adds_pub[0][i];
+            secp256k1_ec_pubkey_negate(ctx, &adds_pub[1][i].x);
+            secp256k1_ec_seckey_negate(ctx, adds_pub[1][i].m);
+            secp256k1_ec_seckey_negate(ctx, adds_pub[1][i].n);
+
+            assert(check(ctx, &adds_pub[1][i].x, adds_pub[1][i].m, adds_pub[1][i].n));
         }
     }
     ~INIT()
@@ -3187,26 +3172,82 @@ static auto set_int = [](unsigned char* cn, int64_t n) {
     cn[24] = p[7];
 };
 
-void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
+int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
 {
     if (num <= 0)
-        return;
+        return 0;
+    uint64_t max = 0;
+    _map.clear();
+    std::vector<std::thread> threads;
+    int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
+    threads.reserve(n_tasks);
+    unsigned char c_step[33] = {0};
+    set_int(c_step, n_tasks);
+
+    auto pushKey = [&max](std::map<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t counter) {
+        static RecursiveMutex _mutex;
+        LOCK(_mutex);
+        uint64_t t = *(uint64_t*)pk.data;
+        m[t] = counter;
+        if (counter > max) max = counter;
+    };
+    auto qualified = [](const secp256k1_pubkey& k) {
+        RhoState rs_ret[256];
+        RhoState rs_src;
+        rs_src.x = k;
+        int c = rho_Fi(ctx, &rs_src, rs_ret);
+        return c >= 10;
+    };
+    auto calc = [&](uint64_t _n, uint64_t _b) {
+        secp256k1_pubkey pk_tmp = {0};
+        unsigned char c_base[33] = {0};
+        set_int(c_base, _b);
+        uint64_t counter = _b;
+        secp256k1_ec_pubkey_create(ctx, &pk_tmp, c_base);
+        if (qualified(pk_tmp))
+            pushKey(_map, pk_tmp, counter);
+        for (uint64_t i = 1; i < _n; ) {
+            counter += n_tasks;
+            secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, c_step);
+            if (qualified(pk_tmp)) {
+                pushKey(_map, pk_tmp, counter);
+                i++;
+            }
+        }
+    };
+
+    for (int i = 0; i < n_tasks; ++i) {
+        uint64_t n = num / n_tasks;
+        uint64_t b = base + i;
+        if (i == n_tasks - 1) n += num % n_tasks;
+        threads.emplace_back(calc, n, b);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    return max + 1;
+}
+
+int64_t buildBabyMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
+{
+    if (num <= 0)
+        return 0;
     unsigned char cone[33] = {0};
     cone[31] = 0x01;
     _map.clear();
-    auto pushKey = [](std::map<uint64_t, int>& m, secp256k1_pubkey& pk, int n) {
+    auto pushKey = [](std::map<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t n) {
         static RecursiveMutex _mutex;
         LOCK(_mutex);
         uint64_t t = *(uint64_t*)pk.data;
         m[t] = n;
     };
-    auto calc = [&](int _n, int _b) {
+    auto calc = [&](uint64_t _n, uint64_t _b) {
         secp256k1_pubkey pk_tmp = {0};
         unsigned char cb[33] = {0};
         set_int(cb, _b);
         secp256k1_ec_pubkey_create(ctx, &pk_tmp, cb);
         pushKey(_map, pk_tmp, _b);
-        for (int i = 1; i < _n; i++) {
+        for (uint64_t i = 1; i < _n; i++) {
             secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, cone);
             pushKey(_map, pk_tmp, i + _b);
         }
@@ -3216,14 +3257,15 @@ void buildBabyMap(std::map<uint64_t, int>& _map, int64_t num, int base)
     int n_tasks = std::max(1u, std::thread::hardware_concurrency()/2);
     threads.reserve(n_tasks);
     for (int i = 0; i < n_tasks; ++i) {
-        int n = num / n_tasks;
-        int b = base + i * n;
+        uint64_t n = num / n_tasks;
+        uint64_t b = base + i * n;
         if (i == n_tasks - 1) n += num % n_tasks;
         threads.emplace_back(calc, n, b);
     }
     for (auto& t : threads) {
         t.join();
-    }    
+    }
+    return base + num + 1;
 }
 
 bool isZero(const unsigned char* m) {
@@ -3262,14 +3304,14 @@ int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsign
     return 0; 
 }
 
-int find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const std::vector<int>& _m, const secp256k1_pubkey& pk)
+int64_t find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const std::vector<uint64_t>& _m, const secp256k1_pubkey& pk)
 {
     uint64_t t = *(uint64_t*)pk.data;
     auto i = std::lower_bound(_x.begin(), _x.end(), t);
     if (i == _x.end()|| t !=*i)
         return 0;
     std::ptrdiff_t index = std::distance(_x.begin(), i);
-    int n = _m[index];
+    auto n = _m[index];
 
     unsigned char c0[33] = {0};
     unsigned char cn[33] = {0};
@@ -3323,16 +3365,18 @@ int giantStepi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoSt
     return count;
 }
 
-auto fun_add = [](RhoState& s, unsigned char t) {
+auto fun_add = [](RhoPoint& s, unsigned char t) {
     secp256k1_pubkey pk = s.x;
-    secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t]};
+    secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t].x};
     int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
     assert(r == 1);
-    r = secp256k1_ec_seckey_tweak_add(ctx, s.m, adds_sec[t]);
+    r = secp256k1_ec_seckey_tweak_add(ctx, s.m, adds_pub[0][t].m);
+    assert(r == 1);
+    r = secp256k1_ec_seckey_tweak_add(ctx, s.n, adds_pub[0][t].n);
     assert(r == 1);
 };
 
-auto fun_mul = [](RhoState& s, unsigned char t) {
+auto fun_mul = [](RhoPoint& s, unsigned char t) {
     unsigned char _mul_n[33] = {0};
     _mul_n[31] = t;
     int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, _mul_n);
@@ -3344,25 +3388,7 @@ auto fun_mul = [](RhoState& s, unsigned char t) {
 };
 bool rho_F(secp256k1_context* ctx, RhoState& s)
 {
-    char c = (s.x.data[0] & 0xF);
-    switch (c) {
-    case 0:
-        fun_mul(s, 2);
-        break;
-    case 1: {
-        unsigned char c1[33] = {0};
-        c1[31] = 0x01;
-        secp256k1_pubkey pk = s.x;
-        const secp256k1_pubkey* ins[2] = {&pk, &pk_mvp};
-        int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
-        assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_add(ctx, s.n, c1);
-        assert(r == 1);
-        break;
-    }
-    default:
-        fun_add(s, c);
-    }
+    fun_add(s, s.x.data[0]);
     s.times++;
     return true;
 }
@@ -3371,47 +3397,16 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
 {
     int count = 0;
     secp256k1_pubkey pk_;
-    char c;
-    static auto half = ParseHex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1");
-    pk_ = src_rs->x;
-    secp256k1_ec_pubkey_tweak_mul(ctx, &pk_, half.data());    
-    c = pk_.data[0];
-    if ((c & 0xF) == 0) {
-        ret_rs[count].x = pk_;
-        memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
-        memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
-        secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].m, half.data());
-        secp256k1_ec_seckey_tweak_mul(ctx, ret_rs[count].n, half.data());
-        count++;
-    } 
-    static secp256k1_pubkey pk_mvp_neg = {0};
-    static unsigned char c1_neg[33] = {0};    
-    if (pk_mvp_neg.data[0] == 0) {
-        secp256k1_ec_pubkey_parse(ctx, &pk_mvp_neg, cpbkeyMVP.data(), cpbkeyMVP.size());
-        secp256k1_ec_pubkey_negate(ctx, &pk_mvp_neg);
-        c1_neg[31] = 0x01;
-        secp256k1_ec_seckey_negate(ctx, c1_neg);
-    }
-    const secp256k1_pubkey* ins[2] = {&src_rs->x, &pk_mvp_neg};
-    secp256k1_ec_pubkey_combine(ctx, &pk_, ins, 2);
-    c = pk_.data[0];
-    if ((c & 0xF) == 1) {
-        ret_rs[count].x = pk_;
-        memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
-        memcpy(ret_rs[count].n,src_rs->n,sizeof(src_rs->n));
-        secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].n, c1_neg);
-        count++;
-    }
         
-    for (int i = 2; i < 0x10; i++) {
-        const secp256k1_pubkey* ins2[2] = {&src_rs->x, &adds_pub[1][i]};
+    for (int i = 0; i < sizeof(adds_pub[0]) / sizeof(adds_pub[0][0]); i++) {
+        const secp256k1_pubkey* ins2[2] = {&src_rs->x, &adds_pub[1][i].x};
         secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
-        c = pk_.data[0];
-        if ((c & 0xF) == i) {
+        if (pk_.data[0] == i) {
             ret_rs[count].x = pk_;
             memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
             memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
-            secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, adds_sec_neg[i]);
+            secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, adds_pub[1][i].m);
+            secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].n, adds_pub[1][i].n);
             count++;
         }
     }
@@ -3473,7 +3468,7 @@ void saveVectorToFile(const std::vector<T>& vec, const std::string& filename)
 
 // 从文件加载vector
 template <typename T>
-std::vector<T> loadVectorFromFile(const std::string& filename)
+std::vector<T> loadVectorFromFile(const std::string& filename, uint64_t count = 0)
 {
     std::vector<T> vec;
     std::ifstream inFile(filename, std::ios::binary);
@@ -3481,6 +3476,9 @@ std::vector<T> loadVectorFromFile(const std::string& filename)
         // 读取vector的大小
         size_t size;
         inFile.read(reinterpret_cast<char*>(&size), sizeof(size));
+        if (count != 0 && count < size) {
+            size = count;
+        }
         vec.resize(size);
         // 读取vector的元素
         inFile.read(reinterpret_cast<char*>(vec.data()), size * sizeof(T));
@@ -3537,11 +3535,13 @@ unsigned char randChar() {
 
 static const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
 static const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
+static const std::string _XvecL_name = "D:\\lambda_map\\Xvec.bin";
+static const std::string _MvecL_name = "D:\\lambda_map\\Mvec.bin";
 class BabyGiant
 {
 private:
     std::vector<uint64_t> _Xvec;
-    std::vector<int> _Mvec;
+    std::vector<uint64_t> _Mvec;
     iLog _dplog;
 
 public:
@@ -3549,14 +3549,14 @@ public:
     void prepare()
     {
         _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
-        _Mvec = loadVectorFromFile<int>(_Mvec_name);
+        _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
         BabyNUM = _Xvec.size();
         assert(_Xvec.size() == _Mvec.size());
     }
     bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
     {
         giantStep(ctx, rs);
-        int b = find_baby(ctx, _Xvec, _Mvec, rs.x);
+        auto b = find_baby(ctx, _Xvec, _Mvec, rs.x);
         if (b != 0) {
             CKey k;
             if (bingo(ctx, k, rs, b)) {
@@ -3569,9 +3569,6 @@ public:
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            //char c = (d & 0xF);
-            /*char c = (randChar() & 0xF);
-            fun_add(rs, c);*/
             fun_mul(rs, 2);
         }
         return true;
@@ -3581,38 +3578,36 @@ public:
 class Rho
 {
 private:
-    std::map<uint64_t, SecPair> dpMap;
-    RecursiveMutex dpMap_mutex;
+    std::vector<uint64_t> _Xvec;
+    std::vector<uint64_t> _Mvec;
     iLog _dplog;
 
 public:
     Rho() : _dplog("D:\\DistinguishablePoints.txt") {}
     void prepare()
     {
-        LOCK(dpMap_mutex);
-        loadDP(_dplog.ifs, dpMap);
+        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
+        _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
+        assert(_Xvec.size() == _Mvec.size());
     }
 
     bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
     {
         rho_F(ctx, rs);
+        auto b = find_baby(ctx, _Xvec, _Mvec, rs.x);
+        if (b != 0) {
+            CKey k;
+            if (bingo(ctx, k, rs, b)) {
+                save_key(k);
+            } else {
+                log += "!!!!short circulation!!!!\n";
+            }
+            return false;
+        }
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            LOCK(dpMap_mutex);
-            auto iter = dpMap.find(d);
-            if (iter != dpMap.end()) {
-                CKey k;
-                if (bingo(ctx, k, rs, iter->second)) {
-                    save_key(k);
-                } else {
-                    log += "!!!!short circulation!!!!\n";
-                }
-                return false;
-            } else {
-                dpMap[d] = rs;
-            }
-            if (i != 0 && count_dstg % 31 == 0) {
+            if (i != 0 && count_dstg % 3 == 0) {
                 rs.rand();
             }
         }
@@ -3693,7 +3688,7 @@ static RPCHelpMan testmvp()
         "test around mvp",
         {
             {"ta", RPCArg::Type::NUM, RPCArg::Optional::NO, "test arg"},
-            {"ta2", RPCArg::Type::NUM, RPCArg::Optional::NO, "test arg2"},
+            {"ta2", RPCArg::Type::STR, RPCArg::Optional::NO, "test arg2"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "", {
@@ -3705,7 +3700,9 @@ static RPCHelpMan testmvp()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
             NodeContext& node = EnsureAnyNodeContext(request.context);
             int32_t ta = self.Arg<std::int32_t>("ta");
-            int32_t ta2 = self.Arg<std::int32_t>("ta2");
+            std::string ta2s = self.Arg<std::string>("ta2");
+            int64_t ta2 = std::stoll(ta2s);
+
             UniValue unspent(UniValue::VOBJ);
             unspent.pushKV("str", "");
             unspent.pushKV("str2", "");
@@ -3901,41 +3898,48 @@ static RPCHelpMan testmvp()
                 std::remove("D:\\test.txt");*/
             }
 
-            //生成babystep
-            if (ta == 118) {
+            //生成babystep 或者 lambdamap
+            if (ta == 118 || ta == 128) {
                 if (ta2) {
                     BabyNUM = ta2;
                 } else {
                     ta2 = BabyNUM;
                 }
 
-                unsigned int batch = (ta2 + 5) / 6; // 0x10000000;
-                int times = ta2 / batch + 1;
+                int times = 6;
+                uint64_t batch = (ta2 + times - 1) / times; // 0x10000000;
                 int64_t total = 0;
+                uint64_t base = 1;
                 for (int i = 0; i < times; i++) {
-                    int base = 1 + i * batch;
                     if (i == times - 1) {
                         batch = ta2 % batch;
                     }
-                    std::map<uint64_t, int> babyMap;
-                    buildBabyMap(babyMap, batch, base);
-                    assert(babyMap.size() == batch);
+                    std::map<uint64_t, uint64_t> theMap;
+                    std::string filename;
+                    if (ta == 118) {
+                        base = buildBabyMap(theMap, batch, base);
+                        filename = "D:\\baby_map\\baby_map%llu.txt";
+                    } else {
+                        base = buildLambdaMap(theMap, batch, base);
+                        filename = "D:\\lambda_map\\lambda_map%llu.txt";
+                    }
+                    assert(theMap.size() == batch);
+                    save_map(theMap, total, filename);
                     total += batch;
-                    save_babymap(babyMap, base);
                 }
                 unspent.pushKV("num", total);
             }
             //加载babystep 并简单测试
             if (ta == 119) {
                 std::vector<uint64_t> _Xvec;
-                std::vector<int> _Mvec;
+                std::vector<uint64_t> _Mvec;
                 if (ta2 == 888) {
-                    read_babymap(_Xvec, _Mvec, 0);
+                    read_map(_Xvec, _Mvec, 0, "baby");
                     saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
-                    saveVectorToFile<int>(_Mvec, _Mvec_name);
+                    saveVectorToFile<uint64_t>(_Mvec, _Mvec_name);
                 } else {
                     _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
-                    _Mvec = loadVectorFromFile<int>(_Mvec_name);
+                    _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
                 }
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
@@ -4042,10 +4046,58 @@ static RPCHelpMan testmvp()
                 }
             }
 
+            // 加载lambdamap 并简单测试
+            if (ta == 129) {
+                std::vector<uint64_t> _Xvec;
+                std::vector<uint64_t> _Mvec;
+                if (ta2 == 888) {
+                    read_map(_Xvec, _Mvec, 0, "lambda");
+                    saveVectorToFile<uint64_t>(_Xvec, _XvecL_name);
+                    saveVectorToFile<uint64_t>(_Mvec, _MvecL_name);
+                } else {
+                    _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
+                    _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
+                }
+            }
             if (ta == 8) {
                 if (ta2 == 1) {
-                    Rho r;
-                    r.prepare();
+                    //检查DP文件中是否存在碰撞
+                    std::map<uint64_t, SecPair> dpMap;
+                    iLog _dplog("D:\\DistinguishablePoints.txt");
+                    loadDP(_dplog.ifs, dpMap);
+                } else if (ta2 == 2) {
+                    // 检查DP文件中是否存在碰撞，若存在则计算bingo
+                    std::map<uint64_t, SecPair> dpMap;
+                    iLog _dplog("D:\\DistinguishablePoints.txt");
+                    std::string line;
+                    if (_dplog.ifs.is_open()) {
+                        while (std::getline(_dplog.ifs, line)) {
+                            uint64_t dp_index;
+                            SecPair sp;
+                            sscanf(line.c_str(), "%llu", &dp_index);
+                            std::getline(_dplog.ifs, line);
+                            memcpy(sp.m, ParseHex(line).data(), sizeof(sp.m));
+                            std::getline(_dplog.ifs, line);
+                            memcpy(sp.n, ParseHex(line).data(), sizeof(sp.n));
+
+                            secp256k1_pubkey x_tmp;
+                            create(ctx, &x_tmp, sp.m, sp.n);
+                            assert(dp_index == distinguishable(x_tmp));
+                            auto iter = dpMap.find(dp_index);
+                            if (iter != dpMap.end()) {
+                                CKey k;
+                                if (bingo(ctx, k, sp, iter->second)) {
+                                    save_key(k);
+                                    unspent.pushKV("str", "!!!!bingo!!!!");
+                                } else {
+                                    unspent.pushKV("str", "!!!!short circulation!!!!");
+                                }
+                                break;
+                            } else {
+                                dpMap[dp_index] = sp;
+                            }
+                        }
+                    }
                 } else {
                     auto judge = [&node]() {
                         while (!gameover) {

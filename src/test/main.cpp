@@ -55,7 +55,6 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
 void test()
 {
     int limit = 10000;
-    std::queue<RhoState> rs_q;
 
     RhoState tmp_origin;
     tmp_origin.rand();
@@ -1585,6 +1584,8 @@ int main(int argc, char* argv[])
 
     INIT _init;
     work();
+
+    //test();
 
     /* Logger::init();
     test_112_helper();
