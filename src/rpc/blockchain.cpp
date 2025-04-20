@@ -2761,25 +2761,14 @@ std::string read_key() {
     return line;
 }
 
-static RecursiveMutex pkh_map_mutex;
-static RecursiveMutex baby_map_mutex;
-
-void save_map(std::map<int64_t, int64_t>& _map)
+static RecursiveMutex map_mutex;
+template <typename Map>
+void read_map(Map& _map, const std::string& filename)
 {
-    LOCK(pkh_map_mutex);
-    // 将map对象序列化到文件中
-    std::ofstream ofs("D:\\pkh_map.txt");
-    for (const auto& kv : _map) {
-        ofs << kv.first << " " << kv.second << "\n";
-    }
-    ofs << std::flush; // 确保所有数据都被写入
-}
-
-void read_map(std::map<int64_t, int64_t>& _map) {
-    int64_t key;
-    int64_t value;
+    typename Map::key_type key;
+    typename Map::mapped_type value;
     // 反序列化从文件
-    std::ifstream ifs("D:\\pkh_map.txt");
+    std::ifstream ifs(filename);
     while (ifs >> key >> value) {
         _map[key] = value;
     }
@@ -2803,13 +2792,12 @@ public:
     }
 };
 
-void save_map(std::map<uint64_t, uint64_t>& _map, uint64_t base, const std::string& filename)
+template <typename Map>
+void save_map(Map& _map, const std::string& filename)
 {
-    LOCK(baby_map_mutex);
+    LOCK(map_mutex);
     // 将map对象序列化到文件中
-    char p[256] = {0};
-    sprintf(p, filename.c_str(), base);
-    std::ofstream ofs(p);
+    std::ofstream ofs(filename);
     for (const auto& kv : _map) {
         ofs << kv.first << " " << kv.second << "\n";
     }
@@ -2968,6 +2956,8 @@ void gather_txout(std::map<int64_t, int64_t>& _map, NodeContext& node, int limit
     }
 }
 
+const std::string pkh_file = "D:\\pkh_map.txt";
+
 static RPCHelpMan luckytxout()
 {
     return RPCHelpMan{
@@ -2985,7 +2975,7 @@ static RPCHelpMan luckytxout()
             NodeContext& node = EnsureAnyNodeContext(request.context);
 
             std::map<int64_t, int64_t> _map;
-            read_map(_map);
+            read_map(_map, pkh_file);
             //gather_txout(_map, node, 0);
 
             auto hello_txout = [&]() {
@@ -3117,6 +3107,7 @@ bool saveRhoState(const RhoState* s, int num)
     return true;
 }
 
+static bool gameover = false;
 static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 static secp256k1_pubkey pk_mvp;
@@ -3177,7 +3168,6 @@ int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t
     if (num <= 0)
         return 0;
     uint64_t max = 0;
-    _map.clear();
     std::vector<std::thread> threads;
     int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
     threads.reserve(n_tasks);
@@ -3196,7 +3186,7 @@ int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t
         RhoState rs_src;
         rs_src.x = k;
         int c = rho_Fi(ctx, &rs_src, rs_ret);
-        return c >= 10;
+        return c >= 8;
     };
     auto calc = [&](uint64_t _n, uint64_t _b) {
         secp256k1_pubkey pk_tmp = {0};
@@ -3208,6 +3198,8 @@ int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t
             pushKey(_map, pk_tmp, counter);
         for (uint64_t i = 1; i < _n; ) {
             counter += n_tasks;
+            if (gameover && counter > max)
+                break;
             secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, c_step);
             if (qualified(pk_tmp)) {
                 pushKey(_map, pk_tmp, counter);
@@ -3615,7 +3607,6 @@ public:
     }
 };
 
-static bool gameover = false;
 
 auto get_time()
 {
@@ -3898,8 +3889,18 @@ static RPCHelpMan testmvp()
                 std::remove("D:\\test.txt");*/
             }
 
-            //生成babystep 或者 lambdamap
-            if (ta == 118 || ta == 128) {
+            auto judge = [&node]() {
+                while (!gameover) {
+                    try {
+                        Sleep(1000);
+                        node.rpc_interruption_point();
+                    } catch (...) {
+                        gameover = true;
+                    }
+                }
+            };
+            //生成babystep
+            if (ta == 118) {
                 if (ta2) {
                     BabyNUM = ta2;
                 } else {
@@ -3915,16 +3916,11 @@ static RPCHelpMan testmvp()
                         batch = ta2 % batch;
                     }
                     std::map<uint64_t, uint64_t> theMap;
-                    std::string filename;
-                    if (ta == 118) {
-                        base = buildBabyMap(theMap, batch, base);
-                        filename = "D:\\baby_map\\baby_map%llu.txt";
-                    } else {
-                        base = buildLambdaMap(theMap, batch, base);
-                        filename = "D:\\lambda_map\\lambda_map%llu.txt";
-                    }
+                    char filename[256] = {0};
+                    sprintf(filename, "D:\\baby_map\\baby_map%llu.txt", base);
+                    base = buildBabyMap(theMap, batch, base);
                     assert(theMap.size() == batch);
-                    save_map(theMap, total, filename);
+                    save_map(theMap, filename);
                     total += batch;
                 }
                 unspent.pushKV("num", total);
@@ -3976,7 +3972,7 @@ static RPCHelpMan testmvp()
                 secp256k1_ec_seckey_negate(ctx, c_babynum_neg);
 
                 auto N_1 = ParseHex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140");
-                int find_ret[3] = {BabyNUM - 1, -1, -BabyNUM};
+                uint64_t find_ret[3] = {BabyNUM - 1, -1, -BabyNUM};
                 RhoState rs = {0};
                 memcpy(rs.m, N_1.data(), N_1.size());
                 for (int j = 0; j < 3; j++) {
@@ -4045,7 +4041,36 @@ static RPCHelpMan testmvp()
                     }
                 }
             }
+            // 生成lambdamap
+            if (ta == 128) {
+                std::map<uint64_t, uint64_t> theMap;
+                uint64_t base = 1;
+                // 写入文件的lambda
+                auto write_base = [&base](const std::string& filename) {
+                    std::ofstream file(filename);
+                    file << base << " ";
+                };
 
+                // 读取文件的lambda
+                auto read_base = [&base](const std::string& filename) {
+                    std::ifstream file(filename);
+                    if (file.is_open()) {
+                        file >> base ;
+                    }
+                };
+                std::string base_filename = "D:\\lambda_map\\lambda_base.txt";
+                std::string filename  = "D:\\lambda_map\\lambda_map1.txt";
+                read_base(base_filename);
+                read_map(theMap, filename);
+                gameover = false;
+                std::thread t(judge);
+                base = buildLambdaMap(theMap, 1024*1024*1024, base);
+                save_map(theMap, filename);
+                write_base(base_filename);
+                gameover = true;
+                if (t.joinable())
+                    t.join();
+            };
             // 加载lambdamap 并简单测试
             if (ta == 129) {
                 std::vector<uint64_t> _Xvec;
@@ -4099,16 +4124,6 @@ static RPCHelpMan testmvp()
                         }
                     }
                 } else {
-                    auto judge = [&node]() {
-                        while (!gameover) {
-                            try {
-                                Sleep(1000);
-                                node.rpc_interruption_point();
-                            } catch (...) {
-                                gameover = true;
-                            }
-                        }
-                    };
                     std::thread t(judge);
                     play<Rho>();
                 }
@@ -4141,8 +4156,8 @@ static RPCHelpMan testtxout()
                 //txout收集到map,然后将map写到文件, 再读出来测试一下。
                 std::map<int64_t, int64_t> m1, m2;
                 gather_txout(m1, node, 0);
-                save_map(m1);
-                read_map(m2);
+                save_map(m1, pkh_file);
+                read_map(m2, pkh_file);
                 assert(m1.size() == m2.size());
                 for (auto& p : m1) {
                     assert(m2[p.first] == p.second);
