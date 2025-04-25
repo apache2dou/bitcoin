@@ -3173,6 +3173,8 @@ int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t
     threads.reserve(n_tasks);
     unsigned char c_step[33] = {0};
     set_int(c_step, n_tasks);
+    secp256k1_pubkey pk_step = {0};
+    secp256k1_ec_pubkey_create(ctx, &pk_step, c_step);
 
     auto pushKey = [&max](std::map<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t counter) {
         static RecursiveMutex _mutex;
@@ -3200,7 +3202,9 @@ int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t
             counter += n_tasks;
             if (gameover && counter > max)
                 break;
-            secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, c_step);
+            secp256k1_pubkey pk_add = pk_tmp;
+            secp256k1_pubkey* ins[2] = {&pk_add, &pk_step};
+            int r = secp256k1_ec_pubkey_combine(ctx, &pk_tmp, ins, 2);
             if (qualified(pk_tmp)) {
                 pushKey(_map, pk_tmp, counter);
                 i++;
@@ -3257,7 +3261,7 @@ int64_t buildBabyMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t b
     for (auto& t : threads) {
         t.join();
     }
-    return base + num + 1;
+    return base + num;
 }
 
 bool isZero(const unsigned char* m) {
@@ -3540,8 +3544,9 @@ public:
     BabyGiant() : _dplog("D:\\DistinguishablePoints.txt") {}
     void prepare()
     {
-        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
+        //先load _Mvec, 好让它早点儿被swapout
         _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
+        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
         BabyNUM = _Xvec.size();
         assert(_Xvec.size() == _Mvec.size());
     }
@@ -3578,8 +3583,8 @@ public:
     Rho() : _dplog("D:\\DistinguishablePoints.txt") {}
     void prepare()
     {
-        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
         _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
+        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
         assert(_Xvec.size() == _Mvec.size());
     }
 
@@ -3671,6 +3676,8 @@ void play() {
     }
     g_log->ofs << " distinguishable aside." << std::endl;
 }
+
+void validate_test();
 
 static RPCHelpMan testmvp()
 {
@@ -3887,6 +3894,9 @@ static RPCHelpMan testmvp()
                     }
                 }
                 std::remove("D:\\test.txt");*/
+
+                //测试CUDA
+                validate_test();
             }
 
             auto judge = [&node]() {
@@ -3908,12 +3918,12 @@ static RPCHelpMan testmvp()
                 }
 
                 int times = 6;
-                uint64_t batch = (ta2 + times - 1) / times; // 0x10000000;
+                uint64_t batch = (ta2 + times - 1) / times;
                 int64_t total = 0;
                 uint64_t base = 1;
                 for (int i = 0; i < times; i++) {
                     if (i == times - 1) {
-                        batch = ta2 % batch;
+                        batch = ta2 - batch * i;
                     }
                     std::map<uint64_t, uint64_t> theMap;
                     char filename[256] = {0};
@@ -3934,8 +3944,8 @@ static RPCHelpMan testmvp()
                     saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
                     saveVectorToFile<uint64_t>(_Mvec, _Mvec_name);
                 } else {
-                    _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
                     _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
+                    _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
                 }
                 BabyNUM = _Xvec.size();
                 assert(_Xvec.size() == _Mvec.size());
@@ -3965,6 +3975,9 @@ static RPCHelpMan testmvp()
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_babynum) == BabyNUM);
                 secp256k1_ec_pubkey_negate(ctx, &pk_babynum);
                 assert(find_baby(ctx, _Xvec, _Mvec, pk_babynum) == -BabyNUM);
+                //检查最大m
+                auto maxIt = std::max_element(_Mvec.begin(), _Mvec.end());
+                assert(*maxIt == BabyNUM);
 
                 //测试 giantStep
                 unsigned char c_babynum_neg[33] = {0};
@@ -4080,8 +4093,8 @@ static RPCHelpMan testmvp()
                     saveVectorToFile<uint64_t>(_Xvec, _XvecL_name);
                     saveVectorToFile<uint64_t>(_Mvec, _MvecL_name);
                 } else {
-                    _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
                     _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
+                    _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
                 }
             }
             if (ta == 8) {
