@@ -2810,7 +2810,7 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
     std::string directory = "D:\\" + name + "_map\\";
     std::vector<std::ifstream> fileStreams;
     typedef struct {
-        int value;
+        uint64_t value;
         int index;
     } tp;
     std::map<uint64_t, tp> tmp_map;
@@ -3679,6 +3679,40 @@ void play() {
 
 void validate_test();
 
+// 一次性的临时测试代码
+void test_tmp()
+{
+    uint64_t max = 0;
+    uint64_t min = 0x7FFFFFFFFFFFFFFF;
+
+    uint64_t key;
+    uint64_t value;
+    uint64_t count = 0;
+    // 反序列化从文件
+    std::ifstream ifs("D:\\baby_map\\baby_map2863311531.txt");
+    while (ifs >> key >> value) {
+        count++;
+        if (value > max)
+            max = value;
+        if (min > value)
+            min = value;
+
+        if (value == 0x123) {
+            secp256k1_pubkey pk_tmp = {0};
+            unsigned char cb[33] = {0};
+            set_int(cb, value);
+            secp256k1_ec_pubkey_create(ctx, &pk_tmp, cb);
+            uint64_t t = *(uint64_t*)pk_tmp.data;
+
+            std::cout << "pk_tmp.data: " << t << " key: " << key << std::endl;
+            assert(t == key);
+        }
+    }
+
+    std::cout << "max: " << max << " min: " << min << " count: " << count << std::endl;
+    assert(max - min + 1 == count);
+};
+
 static RPCHelpMan testmvp()
 {
     return RPCHelpMan{
@@ -3898,7 +3932,26 @@ static RPCHelpMan testmvp()
                 //测试CUDA
                 validate_test();
             }
-
+            if (ta == 13) {
+                //一次性代码，修补大babymap 创建时的bug.
+                std::map<uint64_t, uint64_t> theMap;
+                char filename[256] = {0};
+                uint64_t base = 14316557660;
+                uint64_t batch = 2863311524;
+                sprintf(filename, "D:\\baby_map\\baby_map%llu.txt", base);
+                base = buildBabyMap(theMap, batch, base);
+                assert(theMap.size() == batch);
+                uint64_t m[] = {2863311532, 5726623064, 8589934596, 11453246128};
+                for (auto i : m) {
+                    secp256k1_pubkey pk_tmp = {0};
+                    unsigned char cb[33] = {0};
+                    set_int(cb, i);
+                    secp256k1_ec_pubkey_create(ctx, &pk_tmp, cb);
+                    uint64_t t = *(uint64_t*)pk_tmp.data;
+                    theMap[t] = i;
+                }
+                save_map(theMap, filename);
+            }
             auto judge = [&node]() {
                 while (!gameover) {
                     try {
