@@ -2843,6 +2843,8 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
                 }
             }
         }
+        //先简单检测一下key冲突
+        assert(tmp_map.size() == index);
         auto it = tmp_map.begin();
         while (it != tmp_map.end()) {
             x.push_back(it->first);
@@ -2853,6 +2855,11 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
                 tp _t;
                 _t.value = value;
                 _t.index = it->second.index;
+                auto f = tmp_map.find(key);
+                if (f != tmp_map.end()) {
+                    std::cout << "key clash: " << key << " value1: " << f->second.value << " in " << f->second.index
+                              << " value2: " << value << " in " << it->second.index << std::endl;
+                }
                 tmp_map[key] = _t;
             }
             tmp_map.erase(it);
@@ -3689,7 +3696,7 @@ void test_tmp()
     uint64_t value;
     uint64_t count = 0;
     // 反序列化从文件
-    std::ifstream ifs("D:\\baby_map\\baby_map2863311531.txt");
+    std::ifstream ifs("D:\\baby_map\\baby_map11453246124.txt");
     while (ifs >> key >> value) {
         count++;
         if (value > max)
@@ -3697,7 +3704,7 @@ void test_tmp()
         if (min > value)
             min = value;
 
-        if (value == 0x123) {
+        if (value == 8589934596) {
             secp256k1_pubkey pk_tmp = {0};
             unsigned char cb[33] = {0};
             set_int(cb, value);
@@ -3982,6 +3989,7 @@ static RPCHelpMan testmvp()
                     char filename[256] = {0};
                     sprintf(filename, "D:\\baby_map\\baby_map%llu.txt", base);
                     base = buildBabyMap(theMap, batch, base);
+                    //检测key冲突,这里需要进一步的解决方案
                     assert(theMap.size() == batch);
                     save_map(theMap, filename);
                     total += batch;
@@ -3994,6 +4002,7 @@ static RPCHelpMan testmvp()
                 std::vector<uint64_t> _Mvec;
                 if (ta2 == 888) {
                     read_map(_Xvec, _Mvec, 0, "baby");
+                    std::cout << "read_map finished!" << std::endl;
                     saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
                     saveVectorToFile<uint64_t>(_Mvec, _Mvec_name);
                 } else {
@@ -4038,7 +4047,7 @@ static RPCHelpMan testmvp()
                 secp256k1_ec_seckey_negate(ctx, c_babynum_neg);
 
                 auto N_1 = ParseHex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140");
-                uint64_t find_ret[3] = {BabyNUM - 1, -1, -BabyNUM};
+                int64_t find_ret[3] = {BabyNUM - 1, -1, -BabyNUM};
                 RhoState rs = {0};
                 memcpy(rs.m, N_1.data(), N_1.size());
                 for (int j = 0; j < 3; j++) {

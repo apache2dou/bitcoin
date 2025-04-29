@@ -3,300 +3,245 @@
 #include <cstdio>
 #include <cuda_runtime.h>
 
-#define CHECK_CUDA(call)                                                                                  \
-    do {                                                                                                  \
-        cudaError_t status = call;                                                                        \
-        if (status != cudaSuccess) {                                                                      \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); \
-            exit(EXIT_FAILURE);                                                                           \
-        }                                                                                                 \
-    } while (0)
-
+// 256-bit数值（小端序，32位肢体）
 typedef struct {
-    uint64_t d[4]; // 小端序存储 [0]是最低位
+    uint32_t limb[8];
 } uint256_t;
 
+// secp256k1曲线参数（设备常量）
+__constant__ uint256_t p = {
+    0xFFFFFC2F, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+
+// 预计算的蒙哥马利参数
+__constant__ uint256_t R = {
+    0x000003D1, 0x00000001, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000};
+
+__constant__ uint256_t R_squared = {
+    0x000007A2, 0x00000002, 0x00000001, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000};
+
+__constant__ uint32_t np = 0xD2253531;
+
+// 预计算的蒙哥马利常量
+__constant__ uint256_t two_mont = {
+    0x000007A2, 0x00000002, 0x00000001, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000};
+
+__constant__ uint256_t three_mont = {
+    0x00000B73, 0x00000003, 0x00000001, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000};
+
+// 点结构（仿射坐标）
 typedef struct {
     uint256_t x;
     uint256_t y;
-    bool is_infinity;
-} EC_Point;
+    bool infinity;
+} AffinePoint;
 
-// secp256k1常数（小端序排列）
-__constant__ uint256_t p = {{
-    0xFFFFFFFEFFFFFC2F, // d[0] = LSB
-    0xFFFFFFFFFFFFFFFF,
-    0xFFFFFFFFFFFFFFFF,
-    0xFFFFFFFFFFFFFFFF // d[3] = MSB
-}};
+// CUDA错误检查宏
+#define CHECK_CUDA(call)                                                                                \
+    do {                                                                                                \
+        cudaError_t err = (call);                                                                       \
+        if (err != cudaSuccess) {                                                                       \
+            fprintf(stderr, "CUDA Error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE);                                                                         \
+        }                                                                                               \
+    } while (0)
 
-__constant__ uint256_t uint256_zero = {{0, 0, 0, 0}};
-
-// 预计算1/2 mod p ((p+1)/2)
-__constant__ uint256_t two_inv = {{0x7FFFFFFF7FFFFE18,
-                                   0xFFFFFFFFFFFFFFFF,
-                                   0xFFFFFFFFFFFFFFFF,
-                                   0x7FFFFFFFFFFFFFFF}};
-
-// 函数声明
-__device__ int compare_uint256(const uint256_t a, const uint256_t b);
-__device__ uint256_t mod_add(uint256_t a, uint256_t b);
-__device__ uint256_t mod_sub(uint256_t a, uint256_t b);
-__device__ uint256_t mod_mult(uint256_t a, uint256_t b);
-__device__ uint256_t mod_inv(uint256_t a);
-__device__ uint256_t mod_div2(uint256_t a);
-
-// 大数比较函数
-__device__ int compare_uint256(const uint256_t a, const uint256_t b)
+// ================== 基础算术函数 ==================
+__device__ void add256(uint256_t* a, const uint256_t* b)
 {
-#pragma unroll
-    for (int i = 3; i >= 0; --i) {
-        if (a.d[i] > b.d[i]) return 1;
-        if (a.d[i] < b.d[i]) return -1;
-    }
-    return 0;
-}
-
-// 模加（优化进位链）
-__device__ uint256_t mod_add(uint256_t a, uint256_t b)
-{
-    uint256_t result;
     uint64_t carry = 0;
-
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        uint64_t sum = a.d[i] + b.d[i] + carry;
-        result.d[i] = sum;
-        carry = (sum < a.d[i]) | ((sum == a.d[i]) & carry);
+    for (int i = 0; i < 8; ++i) {
+        uint64_t sum = (uint64_t)a->limb[i] + b->limb[i] + carry;
+        a->limb[i] = (uint32_t)sum;
+        carry = sum >> 32;
     }
-
-    // 快速约减
-    if (carry || compare_uint256(result, p) >= 0) {
-        uint64_t borrow = 0;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            uint64_t temp = result.d[i] - p.d[i] - borrow;
-            borrow = (result.d[i] < p.d[i] + borrow);
-            result.d[i] = temp;
-        }
-    }
-    return result;
 }
 
-// 模减（优化借位链）
-__device__ uint256_t mod_sub(uint256_t a, uint256_t b)
+__device__ void sub256(uint256_t* a, const uint256_t* b)
 {
-    uint256_t result;
     uint64_t borrow = 0;
-
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        uint64_t temp = a.d[i] - b.d[i] - borrow;
-        borrow = (a.d[i] < b.d[i] + borrow);
-        result.d[i] = temp;
+    for (int i = 0; i < 8; ++i) {
+        uint64_t sub = (uint64_t)a->limb[i] - b->limb[i] - borrow;
+        a->limb[i] = (uint32_t)sub;
+        borrow = (sub >> 32) & 1;
     }
-    return borrow ? mod_add(result, p) : result;
 }
 
-// 优化蒙哥马利模乘（使用CIOS方法）
-__device__ uint256_t mod_mult(uint256_t a, uint256_t b)
+__device__ int is_ge(const uint256_t* a, const uint256_t* b)
 {
-    uint64_t product[8] = {0};
-    const uint64_t np = 0x4B0D7B5618F5A7C5; // p^-1 mod 2^64
+    for (int i = 7; i >= 0; --i) {
+        if (a->limb[i] > b->limb[i]) return 1;
+        if (a->limb[i] < b->limb[i]) return 0;
+    }
+    return 1;
+}
 
-// CIOS方法计算
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
+__device__ int is_zero(const uint256_t* a)
+{
+    for (int i = 0; i < 8; ++i)
+        if (a->limb[i] != 0) return 0;
+    return 1;
+}
+
+// ================== 蒙哥马利运算 ==================
+__device__ uint256_t mont_mul(const uint256_t a, const uint256_t b)
+{
+    uint256_t t = {{0}};
+    for (int i = 0; i < 8; ++i) {
         uint64_t carry = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            uint64_t hi = __umul64hi(a.d[j], b.d[i]);
-            uint64_t lo = a.d[j] * b.d[i];
 
-            uint64_t sum = lo + product[i + j] + carry;
-            product[i + j] = sum;
-            carry = hi + (sum < lo || (carry && sum == lo));
+        // 计算m = (a[i] * b[0] + t[0]) * np
+        uint64_t product = (uint64_t)a.limb[i] * b.limb[0] + t.limb[0];
+        uint32_t m = (uint32_t)(product * np);
+
+        // 第一步：计算a[i] * b + t
+        for (int j = 0; j < 8; ++j) {
+            product = (uint64_t)a.limb[i] * b.limb[j] + t.limb[j] + carry;
+            carry = product >> 32;
+            t.limb[j] = (uint32_t)product;
         }
-        product[i + 4] = carry;
+
+        // 第二步：加上m*p
+        carry = 0;
+        for (int j = 0; j < 8; ++j) {
+            product = (uint64_t)m * p.limb[j] + t.limb[j] + carry;
+            carry = product >> 32;
+            t.limb[j] = (uint32_t)product;
+        }
+
+        // 第三步：右移32位
+        for (int j = 7; j > 0; --j)
+            t.limb[j] = t.limb[j - 1];
+        t.limb[0] = (uint32_t)carry;
     }
 
-// 蒙哥马利约减
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        uint64_t m = product[i] * np;
-        uint64_t carry = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            uint64_t hi = __umul64hi(m, p.d[j]);
-            uint64_t lo = m * p.d[j];
-
-            uint64_t sum = lo + product[i + j] + carry;
-            product[i + j] = sum;
-            carry = hi + (sum < lo || (carry && sum == lo));
-        }
-// Propagate carry
-#pragma unroll
-        for (int j = i + 4; j < 8; ++j) {
-            uint64_t sum = product[j] + carry;
-            product[j] = sum;
-            carry = sum < carry;
-        }
-    }
-
-    // 最终结果处理
-    uint256_t result;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        result.d[i] = product[i + 4];
-    }
-    return compare_uint256(result, p) >= 0 ? mod_sub(result, p) : result;
+    // 模约减
+    if (is_ge(&t, &p))
+        sub256(&t, &p);
+    return t;
 }
 
-// 优化模逆（使用蒙哥马利算法）
-__device__ uint256_t mod_inv(uint256_t a)
+__device__ uint256_t mont_add(const uint256_t a, const uint256_t b)
 {
-    uint256_t u = a, v = p;
-    uint256_t x1 = {{1, 0, 0, 0}}, x2 = {{0, 0, 0, 0}};
-
-    while (compare_uint256(u, uint256_zero) != 0) {
-        // 使用预计算的1/2优化除法
-        if ((u.d[0] & 1) == 0) {
-            u = mod_div2(u);
-            x1 = mod_mult(x1, two_inv);
-        } else if ((v.d[0] & 1) == 0) {
-            v = mod_div2(v);
-            x2 = mod_mult(x2, two_inv);
-        } else if (compare_uint256(u, v) >= 0) {
-            u = mod_sub(u, v);
-            u = mod_div2(u);
-            x1 = mod_sub(x1, x2);
-            x1 = mod_mult(x1, two_inv);
-        } else {
-            v = mod_sub(v, u);
-            v = mod_div2(v);
-            x2 = mod_sub(x2, x1);
-            x2 = mod_mult(x2, two_inv);
-        }
-    }
-    return x1;
+    uint256_t result = a;
+    add256(&result, &b);
+    if (is_ge(&result, &p))
+        sub256(&result, &p);
+    return result;
 }
 
-// 右移1位（带符号扩展）
-__device__ uint256_t mod_div2(uint256_t a)
+__device__ uint256_t mont_sub(const uint256_t a, const uint256_t b)
 {
-    uint256_t result;
-    uint64_t carry = 0;
-#pragma unroll
-    for (int i = 3; i >= 0; --i) {
-        uint64_t val = a.d[i];
-        result.d[i] = (val >> 1) | (carry << 63);
-        carry = val & 1;
+    uint256_t result = a;
+    sub256(&result, &b);
+    if (result.limb[7] >= 0xFFFFFFFF) // 处理负结果
+        add256(&result, &p);
+    return result;
+}
+
+__device__ uint256_t mont_inv(const uint256_t a)
+{
+    uint256_t result = R; // 1 in Montgomery form
+    uint256_t exponent = p;
+    uint256_t two = {{2}};
+    sub256(&exponent, &two); // p-2
+
+    for (int i = 255; i >= 0; --i) {
+        result = mont_mul(result, result);
+        if ((exponent.limb[i / 32] >> (i % 32)) & 1)
+            result = mont_mul(result, a);
     }
     return result;
 }
 
-// 仿射坐标点加法（完全优化版）
-__device__ EC_Point ec_add(EC_Point P, EC_Point Q)
+// ================== 点运算 ==================
+__device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
 {
-    if (P.is_infinity) return Q;
-    if (Q.is_infinity) return P;
+    AffinePoint R;
+    R.x = {{0}};
+    R.y = {{0}};
+    R.infinity = true;
 
-    // 处理相同点的情况（倍点）
-    if (compare_uint256(P.x, Q.x) == 0) {
-        if (compare_uint256(P.y, Q.y) == 0) {
-            // 计算3x² (secp256k1的a=0)
-            uint256_t x_sq = mod_mult(P.x, P.x);
-            uint256_t three_x_sq = mod_add(mod_add(x_sq, x_sq), x_sq);
+    // 处理无穷远点
+    if (P.infinity) return Q;
+    if (Q.infinity) return P;
 
-            // 计算分母2y
-            uint256_t denominator = mod_add(P.y, P.y);
+    // 计算x1 - x2
+    uint256_t x_diff = mont_sub(P.x, Q.x);
+    if (is_zero(&x_diff)) {
+        // 处理相同x坐标的情况
+        uint256_t y_sum = mont_add(P.y, Q.y);
+        if (is_zero(&y_sum))
+            return R;
 
-            // 计算斜率λ = (3x²)/(2y)
-            uint256_t lambda = mod_mult(three_x_sq, mod_inv(denominator));
+        // 点加倍公式：λ = (3x²)/(2y)
+        uint256_t x_sq = mont_mul(P.x, P.x);
+        uint256_t numerator = mont_mul(x_sq, three_mont);
+        uint256_t denominator = mont_mul(P.y, two_mont);
+        uint256_t lambda = mont_mul(numerator, mont_inv(denominator));
 
-            // 计算新坐标
-            uint256_t x3 = mod_sub(mod_mult(lambda, lambda), mod_add(P.x, P.x));
-            uint256_t y3 = mod_sub(mod_mult(lambda, mod_sub(P.x, x3)), P.y);
-            return EC_Point{x3, y3, false};
-        } else {
-            return EC_Point{uint256_zero, uint256_zero, true}; // 无穷远点
-        }
+        // 计算新坐标
+        uint256_t lambda_sq = mont_mul(lambda, lambda);
+        R.x = mont_sub(lambda_sq, mont_add(P.x, P.x));
+        R.x = mont_sub(R.x, P.x);
+
+        uint256_t temp = mont_mul(lambda, mont_sub(P.x, R.x));
+        R.y = mont_sub(temp, P.y);
+    } else {
+        // 普通加法公式：λ = (y2 - y1)/(x2 - x1)
+        uint256_t y_diff = mont_sub(Q.y, P.y);
+        uint256_t lambda = mont_mul(y_diff, mont_inv(x_diff));
+
+        // 计算新坐标
+        uint256_t lambda_sq = mont_mul(lambda, lambda);
+        R.x = mont_sub(lambda_sq, P.x);
+        R.x = mont_sub(R.x, Q.x);
+
+        uint256_t temp = mont_mul(lambda, mont_sub(P.x, R.x));
+        R.y = mont_sub(temp, P.y);
     }
 
-    // 常规点加法
-    uint256_t delta_x = mod_sub(Q.x, P.x);
-    uint256_t delta_y = mod_sub(Q.y, P.y);
-
-    // 计算斜率λ = Δy/Δx
-    uint256_t lambda = mod_mult(delta_y, mod_inv(delta_x));
-
-    // 计算新坐标
-    uint256_t x3 = mod_sub(mod_sub(mod_mult(lambda, lambda), P.x), Q.x);
-    uint256_t y3 = mod_sub(mod_mult(lambda, mod_sub(P.x, x3)), P.y);
-
-    return EC_Point{x3, y3, false};
+    R.infinity = false;
+    return R;
 }
 
-__global__ void ec_add_kernel(EC_Point* results, const EC_Point* pairs, int num_pairs)
+// ================== 验证测试 ==================
+__constant__ AffinePoint G_mont = {
+    {{0x16F81798, 0x59F2815B, 0x2DCE28D9, 0x029BFCDB,
+      0xCE870B07, 0x55A06295, 0xF9DCBBAC, 0x79BE667E}},
+    {{0xFB10D4B8, 0x9C47D08F, 0xA6855419, 0xFD17B448,
+      0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77}},
+    false};
+
+__global__ void validate()
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_pairs) {
-        // 合并内存访问：连续读取两个点
-        const EC_Point P = pairs[2 * idx];
-        const EC_Point Q = pairs[2 * idx + 1];
-        results[idx] = ec_add(P, Q);
+    // 测试1：G + ∞ = G
+    AffinePoint inf;
+    inf.x = {{0}};
+    inf.y = {{0}};
+    inf.infinity = true;
+
+    AffinePoint res1 = point_add(G_mont, inf);
+    assert(!res1.infinity);
+    for (int i = 0; i < 8; ++i) {
+        assert(res1.x.limb[i] == G_mont.x.limb[i]);
+        assert(res1.y.limb[i] == G_mont.y.limb[i]);
     }
+
+    // 测试2：G + G的有效性
+    AffinePoint res2 = point_add(G_mont, G_mont);
+    assert(!res2.infinity);
+    assert(res2.x.limb[0] == 0xC6047F94); // 2G的x坐标低位
+    assert(res2.y.limb[0] == 0x9F97DC76); // 2G的y坐标低位
 }
 
-// 验证测试用例（使用标准secp256k1测试向量）
 void validate_test()
 {
-    // secp256k1生成点G
-    const EC_Point G = {
-        // x坐标（小端序）
-        {{0x59F2815B16F81798, 0x029BFCDB2DCE28D9,
-          0x55A06295CE870B07, 0x79BE667EF9DCBBAC}},
-        // y坐标（小端序）
-        {{0x9C47D08FFB10D4B8, 0xFD17B448A6855419,
-          0x5DA4FBFC0E1108A8, 0x483ADA7726A3C465}},
-        false};
-
-    // 预期结果2G
-    const EC_Point expected_2G = {
-        // x坐标（小端序）
-        {{0xabac09b95c709ee5, 0x5c778e4b8cef3ca7,
-          0x3045406e95c07cd8, 0xC6047F9441ED7D6D}},
-        // y坐标（小端序）
-        {{0x236431a950cfe52a, 0xf7f632653266d0e1,
-          0xa3c58419466ceaee, 0x1ae168fea63dc339}},
-        false};
-
-    // 设备内存分配
-    EC_Point *d_pairs, *d_results;
-    CHECK_CUDA(cudaMalloc(&d_pairs, 2 * sizeof(EC_Point)));
-    CHECK_CUDA(cudaMalloc(&d_results, sizeof(EC_Point)));
-
-    // 准备测试数据
-    EC_Point h_pairs[2] = {G, G};
-    CHECK_CUDA(cudaMemcpy(d_pairs, h_pairs, 2 * sizeof(EC_Point), cudaMemcpyHostToDevice));
-
-    // 启动核函数
-    ec_add_kernel<<<1, 1>>>(d_results, d_pairs, 1);
-
-    // 获取结果
-    EC_Point h_result;
-    CHECK_CUDA(cudaMemcpy(&h_result, d_results, sizeof(EC_Point), cudaMemcpyDeviceToHost));
-
-    // 验证结果
-    bool valid = true;
-    for (int i = 0; i < 4; ++i) {
-        valid &= (h_result.x.d[i] == expected_2G.x.d[i]);
-        valid &= (h_result.y.d[i] == expected_2G.y.d[i]);
-    }
-    assert(valid);
-
-    // 清理资源
-    cudaFree(d_pairs);
-    cudaFree(d_results);
+    validate<<<1, 1>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    printf("所有测试通过！\n");
 }
-

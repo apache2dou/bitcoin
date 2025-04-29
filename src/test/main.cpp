@@ -1577,13 +1577,17 @@ void test_112_helper() {
 
 //========<<<<<<<<<<<<<<
 #include <conio.h>
+
+void validate_test();
 int main(int argc, char* argv[])
 {
     // 注册信号处理函数，捕获 SIGINT 信号
     signal(SIGINT, signalHandler);
 
     INIT _init;
-    work();
+    //work();
+
+    validate_test();
 
     //test();
 
