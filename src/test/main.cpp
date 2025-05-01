@@ -1585,9 +1585,9 @@ int main(int argc, char* argv[])
     signal(SIGINT, signalHandler);
 
     INIT _init;
-    //work();
+    work();
 
-    validate_test();
+    //validate_test();
 
     //test();
 
