@@ -3902,6 +3902,7 @@ static RPCHelpMan testmvp()
                 //测试CUDA
                 validate_test();
             }
+
             auto judge = [&node]() {
                 while (!gameover) {
                     try {
@@ -3912,6 +3913,24 @@ static RPCHelpMan testmvp()
                     }
                 }
             };
+
+            // 写入文件的lambda
+            auto write_num = [](const std::string& filename, uint64_t num) {
+                std::ofstream file(filename);
+                file << num << " ";
+            };
+
+            // 读取文件的lambda
+            auto read_num = [](const std::string& filename) -> uint64_t {
+                uint64_t num = 0;
+                std::ifstream file(filename);
+                if (file.is_open()) {
+                    file >> num;
+                }
+                return num;
+            };
+
+            const std::string babynum_file = "D:\\baby_map\\babynum.txt";
             //生成babystep
             if (ta == 118) {
                 if (ta2) {
@@ -3937,6 +3956,7 @@ static RPCHelpMan testmvp()
                     save_map(theMap, filename);
                     total += batch;
                 }
+                write_num(babynum_file, total);
                 unspent.pushKV("num", total);
             }
             //加载babystep 并简单测试
@@ -3944,6 +3964,9 @@ static RPCHelpMan testmvp()
                 std::vector<uint64_t> _Xvec;
                 std::vector<uint64_t> _Mvec;
                 if (ta2 == 888) {
+                    BabyNUM = read_num(babynum_file);
+                    _Xvec.reserve(BabyNUM);
+                    _Mvec.reserve(BabyNUM);
                     read_map(_Xvec, _Mvec, 0, "baby");
                     std::cout << "read_map finished!" << std::endl;
                     saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
@@ -3952,7 +3975,7 @@ static RPCHelpMan testmvp()
                     _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
                     _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
                 }
-                BabyNUM = _Xvec.size();
+                assert(_Xvec.size() == BabyNUM);
                 assert(_Xvec.size() == _Mvec.size());
                 //4GG
                 CPubKey cpbkey1(ParseHex("04100f44da696e71672791d0a09b7bde459f1215a29b3c03bfefd7835b39a48db0dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
@@ -4063,28 +4086,15 @@ static RPCHelpMan testmvp()
             if (ta == 128) {
                 std::map<uint64_t, uint64_t> theMap;
                 uint64_t base = 1;
-                // 写入文件的lambda
-                auto write_base = [&base](const std::string& filename) {
-                    std::ofstream file(filename);
-                    file << base << " ";
-                };
-
-                // 读取文件的lambda
-                auto read_base = [&base](const std::string& filename) {
-                    std::ifstream file(filename);
-                    if (file.is_open()) {
-                        file >> base ;
-                    }
-                };
                 std::string base_filename = "D:\\lambda_map\\lambda_base.txt";
                 std::string filename  = "D:\\lambda_map\\lambda_map1.txt";
-                read_base(base_filename);
+                base = read_num(base_filename);
                 read_map(theMap, filename);
                 gameover = false;
                 std::thread t(judge);
                 base = buildLambdaMap(theMap, 1024*1024*1024, base);
                 save_map(theMap, filename);
-                write_base(base_filename);
+                write_num(base_filename, base);
                 gameover = true;
                 if (t.joinable())
                     t.join();
