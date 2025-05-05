@@ -2770,7 +2770,7 @@ void read_map(Map& _map, const std::string& filename)
     // 反序列化从文件
     std::ifstream ifs(filename);
     while (ifs >> key >> value) {
-        _map[key] = value;
+        _map.insert({key, value});
     }
 }
 
@@ -2813,7 +2813,7 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
         uint64_t value;
         int index;
     } tp;
-    std::map<uint64_t, tp> tmp_map;
+    std::multimap<uint64_t, tp> tmp_map;
     int index = 0;
     try {
         for (const auto& entry : fs::directory_iterator(directory)) {
@@ -2826,7 +2826,7 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
                     if (num != 0 && base >= num) {
                         continue;
                     }
-                        
+
                     std::ifstream file(entry.path());
                     if (!file.is_open()) {
                         throw std::runtime_error("Failed to open file: " + fileName);
@@ -2838,12 +2838,12 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
                     tp _t;
                     _t.value = value;
                     _t.index = index++;
-                    tmp_map[key] = _t;
+                    tmp_map.insert({key, _t});
                     std::cout << "Successfully opened file: " << fileName << std::endl;
                 }
             }
         }
-        //先简单检测一下key冲突
+        //简单检测一下
         assert(tmp_map.size() == index);
         auto it = tmp_map.begin();
         while (it != tmp_map.end()) {
@@ -2855,9 +2855,7 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
                 tp _t;
                 _t.value = value;
                 _t.index = it->second.index;
-                auto f = tmp_map.find(key);
-                assert(f == tmp_map.end());
-                tmp_map[key] = _t;
+                tmp_map.insert({key, _t});
             }
             tmp_map.erase(it);
             it = tmp_map.begin();
@@ -3167,7 +3165,7 @@ static auto set_int = [](unsigned char* cn, int64_t n) {
     cn[24] = p[7];
 };
 
-int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
+int64_t buildLambdaMap(std::multimap<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
 {
     if (num <= 0)
         return 0;
@@ -3180,11 +3178,11 @@ int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t
     secp256k1_pubkey pk_step = {0};
     secp256k1_ec_pubkey_create(ctx, &pk_step, c_step);
 
-    auto pushKey = [&max](std::map<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t counter) {
+    auto pushKey = [&max](std::multimap<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t counter) {
         static RecursiveMutex _mutex;
         LOCK(_mutex);
         uint64_t t = *(uint64_t*)pk.data;
-        m[t] = counter;
+        m.insert({t, counter});
         if (counter > max) max = counter;
     };
     auto qualified = [](const secp256k1_pubkey& k) {
@@ -3228,18 +3226,18 @@ int64_t buildLambdaMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t
     return max + 1;
 }
 
-int64_t buildBabyMap(std::map<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
+int64_t buildBabyMap(std::multimap<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
 {
     if (num <= 0)
         return 0;
     unsigned char cone[33] = {0};
     cone[31] = 0x01;
     _map.clear();
-    auto pushKey = [](std::map<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t n) {
+    auto pushKey = [](std::multimap<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t n) {
         static RecursiveMutex _mutex;
         LOCK(_mutex);
         uint64_t t = *(uint64_t*)pk.data;
-        m[t] = n;
+        m.insert({t, n});
     };
     auto calc = [&](uint64_t _n, uint64_t _b) {
         secp256k1_pubkey pk_tmp = {0};
@@ -3308,18 +3306,20 @@ int64_t find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const
 {
     uint64_t t = *(uint64_t*)pk.data;
     auto i = std::lower_bound(_x.begin(), _x.end(), t);
-    if (i == _x.end()|| t !=*i)
-        return 0;
-    std::ptrdiff_t index = std::distance(_x.begin(), i);
-    auto n = _m[index];
+    while (i != _x.end() && t == *i) {
+        std::ptrdiff_t index = std::distance(_x.begin(), i);
+        auto n = _m[index];
 
-    unsigned char c0[33] = {0};
-    unsigned char cn[33] = {0};
+        unsigned char c0[33] = {0};
+        unsigned char cn[33] = {0};
 
-    if (n > 0) {        
-        set_int(cn, n);
-        int c = check(ctx, &pk, cn, c0);
-        return n * c;
+        if (n > 0) {
+            set_int(cn, n);
+            int c = check(ctx, &pk, cn, c0);
+            if (c != 0)
+                return n * c;
+        }
+        i++;
     }
     return 0;
 }
@@ -3587,8 +3587,8 @@ public:
     Rho() : _dplog("D:\\DistinguishablePoints.txt") {}
     void prepare()
     {
-        _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
-        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
+        _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
+        _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
         assert(_Xvec.size() == _Mvec.size());
     }
 
@@ -3947,7 +3947,7 @@ static RPCHelpMan testmvp()
                     if (i == times - 1) {
                         batch = ta2 - batch * i;
                     }
-                    std::map<uint64_t, uint64_t> theMap;
+                    std::multimap<uint64_t, uint64_t> theMap;
                     char filename[256] = {0};
                     sprintf(filename, "D:\\baby_map\\baby_map%llu.txt", base);
                     base = buildBabyMap(theMap, batch, base);
@@ -4084,7 +4084,7 @@ static RPCHelpMan testmvp()
             }
             // 生成lambdamap
             if (ta == 128) {
-                std::map<uint64_t, uint64_t> theMap;
+                std::multimap<uint64_t, uint64_t> theMap;
                 uint64_t base = 1;
                 std::string base_filename = "D:\\lambda_map\\lambda_base.txt";
                 std::string filename  = "D:\\lambda_map\\lambda_map1.txt";
