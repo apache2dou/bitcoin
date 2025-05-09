@@ -1576,13 +1576,13 @@ void test_112_helper() {
 }
 
 //========<<<<<<<<<<<<<<
-#include <conio.h>
+#include <csignal>
 
 void validate_test();
 int main(int argc, char* argv[])
 {
     // 注册信号处理函数，捕获 SIGINT 信号
-    signal(SIGINT, signalHandler);
+    std::signal(SIGINT, signalHandler);
 
     INIT _init;
     work();
@@ -1595,7 +1595,7 @@ int main(int argc, char* argv[])
     test_112_helper();
     Logger::cleanup();*/
 
-    std::cout << "Finish. Press any key..." << std::endl;
-    _getch(); // 等待用户按下任意键
+    std::cout << "Finish. Press Enter..." << std::endl;
+    std::cin.get(); // 等待用户按下任意键
     return 0;
 }
