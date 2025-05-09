@@ -3906,7 +3906,7 @@ static RPCHelpMan testmvp()
             auto judge = [&node]() {
                 while (!gameover) {
                     try {
-                        Sleep(1000);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                         node.rpc_interruption_point();
                     } catch (...) {
                         gameover = true;
