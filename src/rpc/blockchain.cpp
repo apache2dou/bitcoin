@@ -3900,7 +3900,7 @@ static RPCHelpMan testmvp()
                 std::remove("D:\\test.txt");*/
 
                 //测试CUDA
-                validate_test();
+                //validate_test();
             }
 
             auto judge = [&node]() {
@@ -3933,12 +3933,9 @@ static RPCHelpMan testmvp()
             const std::string babynum_file = "D:\\baby_map\\babynum.txt";
             //生成babystep
             if (ta == 118) {
-                if (ta2) {
-                    BabyNUM = ta2;
-                } else {
-                    ta2 = BabyNUM;
-                }
-
+                assert(ta2 > 0);
+                BabyNUM = ta2;
+                
                 int times = 6;
                 uint64_t batch = (ta2 + times - 1) / times;
                 int64_t total = 0;
@@ -3971,11 +3968,12 @@ static RPCHelpMan testmvp()
                     std::cout << "read_map finished!" << std::endl;
                     saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
                     saveVectorToFile<uint64_t>(_Mvec, _Mvec_name);
+                    assert(_Xvec.size() == BabyNUM); 
                 } else {
                     _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
                     _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
+                    BabyNUM = _Xvec.size();
                 }
-                assert(_Xvec.size() == BabyNUM);
                 assert(_Xvec.size() == _Mvec.size());
                 //4GG
                 CPubKey cpbkey1(ParseHex("04100f44da696e71672791d0a09b7bde459f1215a29b3c03bfefd7835b39a48db0dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
