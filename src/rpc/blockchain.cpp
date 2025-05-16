@@ -4004,6 +4004,22 @@ static RPCHelpMan testmvp()
                 //检查最大m
                 auto maxIt = std::max_element(_Mvec.begin(), _Mvec.end());
                 assert(*maxIt == BabyNUM);
+                //检查排序
+                assert(std::is_sorted(_Xvec.begin(), _Xvec.end()));
+                //测试重复的x元素
+                auto it = std::adjacent_find(_Xvec.begin(), _Xvec.end());
+                if (it != _Xvec.end()) {
+                    std::ptrdiff_t index = std::distance(_Xvec.begin(), it);
+                    auto m = _Mvec[index];
+                    unsigned char c_dup[33] = {0};
+                    set_int(c_dup, m);
+                    secp256k1_pubkey pk_dup = {0};
+                    secp256k1_ec_pubkey_create(ctx, &pk_dup, c_dup);
+                    assert(find_baby(ctx, _Xvec, _Mvec, pk_dup) == m);
+                } else {
+                    assert(BabyNUM < 0x2FFFFFFFF);
+                }
+
 
                 //测试 giantStep
                 unsigned char c_babynum_neg[33] = {0};
