@@ -3570,6 +3570,7 @@ public:
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
+            rs.rand();
             fun_mul(rs, 2);
         }
         return true;
