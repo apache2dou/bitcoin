@@ -103,8 +103,8 @@ void signalHandler(int signum)
 }
 void work() {
     std::cout << "game starting..." << std::endl;
-    //play<Rho>();
-    play<BabyGiant>();
+    play<Rho>();
+    //play<BabyGiant>();
 }
 
 

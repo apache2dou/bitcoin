@@ -3588,15 +3588,15 @@ public:
     Rho() : _dplog("D:\\DistinguishablePoints.txt") {}
     void prepare()
     {
-        _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
+        /* _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
         _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
-        assert(_Xvec.size() == _Mvec.size());
+        assert(_Xvec.size() == _Mvec.size());*/
     }
 
     bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
     {
         rho_F(ctx, rs);
-        auto b = find_baby(ctx, _Xvec, _Mvec, rs.x);
+        /* auto b = find_baby(ctx, _Xvec, _Mvec, rs.x);
         if (b != 0) {
             CKey k;
             if (bingo(ctx, k, rs, b)) {
@@ -3605,11 +3605,11 @@ public:
                 log += "!!!!short circulation!!!!\n";
             }
             return false;
-        }
+        }*/
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            if (i != 0 && count_dstg % 3 == 0) {
+            if (i != 0 && count_dstg % 13 == 0) {
                 rs.rand();
             }
         }
