@@ -99,7 +99,7 @@ void signalHandler(int signum)
     std::cout << "Interrupt signal (" << signum << ") received." << std::endl;
     // 在这里可以添加程序退出前的清理代码
     // 例如关闭文件、释放资源等
-    gameover = true;
+    stop_game();
 }
 void work() {
     std::cout << "game starting..." << std::endl;

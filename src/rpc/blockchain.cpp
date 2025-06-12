@@ -3021,47 +3021,31 @@ static RPCHelpMan luckytxout()
 #include <util/strencodings.h>
 #include "../../secp256k1/include/secp256k1.h"
 #include "steps.h"
+#include "common.h"
 
-static secp256k1_context* ctx = nullptr;
+secp256k1_context* ctx = nullptr;
 static iLog* g_log = nullptr;
-void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 
-class SecPair
+bool SecPair::rand()
 {
-public:
-    unsigned char m[32];
-    unsigned char n[32];
-    bool rand() {
-        CKey secret1, secret2;
-        secret1.MakeNewKey(false);
-        secret2.MakeNewKey(false);
-        memcpy(m, secret1.data(), sizeof(m));
-        memcpy(n, secret2.data(), sizeof(n));
-        return true;
-    }
-    bool operator==(const SecPair& other) const
-    {
-        return std::equal(this->m, m + 32, other.m) && std::equal(this->n, n + 32, other.n);
-    }
-};
-
-class RhoPoint : public SecPair
+    CKey secret1, secret2;
+    secret1.MakeNewKey(false);
+    secret2.MakeNewKey(false);
+    memcpy(m, secret1.data(), sizeof(m));
+    memcpy(n, secret2.data(), sizeof(n));
+    return true;
+}
+bool SecPair::operator==(const SecPair& other) const
 {
-public:
-    secp256k1_pubkey x;
-    bool rand() {
-        SecPair::rand();
-        create(ctx, &x, m, n);
-        return true;
-    }
-};
+    return std::equal(this->m, m + 32, other.m) && std::equal(this->n, n + 32, other.n);
+}
 
-class RhoState : public RhoPoint
+bool RhoPoint::rand()
 {
-public:
-    uint64_t times;
-};
-
+    SecPair::rand();
+    create(ctx, &x, m, n);
+    return true;
+}
 
 
 bool loadRhoState(RhoState* s, int num)
@@ -3109,15 +3093,22 @@ bool saveRhoState(const RhoState* s, int num)
     return true;
 }
 
-static bool gameover = false;
+bool gameover = false;
+void break_rho(bool f);
+
 static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 static secp256k1_pubkey pk_mvp;
 
-static RhoPoint adds_pub[2][256] = {0};
+RhoPoint adds_pub[2][256] = {0};
 
 int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs);
+
+void stop_game() {
+    gameover = true;
+    break_rho(true);
+}
 
 class INIT
 {
@@ -3153,7 +3144,7 @@ public:
     }
 };
 
-static auto set_int = [](unsigned char* cn, int64_t n) {
+void set_int(unsigned char* cn, int64_t n) {
     unsigned char* p = (unsigned char*)&n;
     cn[31] = p[0];
     cn[30] = p[1];
@@ -3388,6 +3379,7 @@ auto fun_mul = [](RhoPoint& s, unsigned char t) {
 };
 bool rho_F(secp256k1_context* ctx, RhoState& s)
 {
+    //printf("%d ", s.x.data[0]);
     fun_add(s, s.x.data[0]);
     s.times++;
     return true;
@@ -3519,13 +3511,6 @@ auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
         }
     }
 };
-auto saveDP = [](std::ofstream& fs, uint64_t index, SecPair& sp) {
-    static RecursiveMutex dplog_mutex;
-    LOCK(dplog_mutex);
-    fs << index << std::endl;
-    fs << HexStr(sp.m) << std::endl;
-    fs << HexStr(sp.n) << std::endl;
-};
 
 unsigned char randChar() {
     unsigned char rnd[8];
@@ -3537,6 +3522,22 @@ static const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
 static const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
 static const std::string _XvecL_name = "D:\\lambda_map\\Xvec.bin";
 static const std::string _MvecL_name = "D:\\lambda_map\\Mvec.bin";
+static const std::string _DPFile_name = "D:\\DistinguishablePoints.txt";
+
+auto saveDP = [](std::ofstream& fs, uint64_t index, const SecPair& sp) {
+    static RecursiveMutex dplog_mutex;
+    LOCK(dplog_mutex);
+    fs << index << std::endl;
+    fs << HexStr(sp.m) << std::endl;
+    fs << HexStr(sp.n) << std::endl;
+};
+
+void _saveDP(uint64_t index, const SecPair& sp)
+{
+    iLog _dplog(_DPFile_name);
+    saveDP(_dplog.ofs, index, sp);
+}
+
 class BabyGiant
 {
 private:
@@ -3545,7 +3546,7 @@ private:
     iLog _dplog;
 
 public:
-    BabyGiant() : _dplog("D:\\DistinguishablePoints.txt") {}
+    BabyGiant() : _dplog(_DPFile_name) {}
     void prepare()
     {
         //先load _Mvec, 好让它早点儿被swapout
@@ -3585,7 +3586,7 @@ private:
     iLog _dplog;
 
 public:
-    Rho() : _dplog("D:\\DistinguishablePoints.txt") {}
+    Rho() : _dplog(_DPFile_name) {}
     void prepare()
     {
         /* _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
@@ -3628,6 +3629,8 @@ auto get_time()
     return std::put_time(localTime, "%Y-%m-%d %H:%M:%S");
 }
 
+void rho_play();
+
 template <typename PLAYER>
 void play() {
     std::string _logvec[256];
@@ -3647,7 +3650,7 @@ void play() {
                 ++count_try;
                 _player.shoot(i, rs[i], count_dstg, _logvec[i]);
             } catch (...) {
-                gameover = true;
+                stop_game();
             }
         }
         std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -3667,10 +3670,11 @@ void play() {
     std::vector<std::thread> threads;
     int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
     assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
-    threads.reserve(n_tasks);
+    threads.reserve(n_tasks + 1);
     for (int i = 0; i < n_tasks; ++i) {
         threads.emplace_back(T, i);
     }
+    threads.emplace_back(rho_play);
     for (auto& t : threads) {
         t.join();
     }
@@ -3901,7 +3905,7 @@ static RPCHelpMan testmvp()
                 std::remove("D:\\test.txt");*/
 
                 //测试CUDA
-                //validate_test();
+                validate_test();
             }
 
             auto judge = [&node]() {
@@ -3910,7 +3914,7 @@ static RPCHelpMan testmvp()
                         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                         node.rpc_interruption_point();
                     } catch (...) {
-                        gameover = true;
+                        stop_game();
                     }
                 }
             };
@@ -4131,12 +4135,12 @@ static RPCHelpMan testmvp()
                 if (ta2 == 1) {
                     //检查DP文件中是否存在碰撞
                     std::map<uint64_t, SecPair> dpMap;
-                    iLog _dplog("D:\\DistinguishablePoints.txt");
+                    iLog _dplog(_DPFile_name);
                     loadDP(_dplog.ifs, dpMap);
                 } else if (ta2 == 2) {
                     // 检查DP文件中是否存在碰撞，若存在则计算bingo
                     std::map<uint64_t, SecPair> dpMap;
-                    iLog _dplog("D:\\DistinguishablePoints.txt");
+                    iLog _dplog(_DPFile_name);
                     std::string line;
                     if (_dplog.ifs.is_open()) {
                         while (std::getline(_dplog.ifs, line)) {
