@@ -3615,7 +3615,7 @@ public:
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            if (i != 0 && count_dstg % 13 == 0) {
+            if (i != 0 && count_dstg % 3 == 0) {
                 rs.rand();
             }
         }
@@ -3624,14 +3624,11 @@ public:
 };
 
 
-auto get_time()
+std::string get_time()
 {
     // 获取当前时间点
     auto now = std::chrono::system_clock::now();
-    // 将时间点转换为时间戳
-    std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
-    std::tm* localTime = std::localtime(&currentTime);
-    return std::put_time(localTime, "%Y-%m-%d %H:%M:%S");
+    return std::format("{:%Y-%m-%d %H:%M:%S}", now);
 }
 
 void rho_play();
