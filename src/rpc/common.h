@@ -25,6 +25,7 @@ public:
 };
 
 bool rho_F(secp256k1_context* ctx, RhoState& s);
+void set_int256(unsigned char* cn, const char* n);
 void set_int(unsigned char* cn, int64_t n);
 void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 #endif // BITCOIN_RPC_COMMON_H

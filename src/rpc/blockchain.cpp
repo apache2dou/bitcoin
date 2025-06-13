@@ -3144,6 +3144,11 @@ public:
     }
 };
 
+void set_int256(unsigned char* cn, const char* n)
+{
+    memcpy(cn, ParseHex(n).data(), 32);
+}
+
 void set_int(unsigned char* cn, int64_t n) {
     unsigned char* p = (unsigned char*)&n;
     cn[31] = p[0];

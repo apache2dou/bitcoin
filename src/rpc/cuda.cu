@@ -298,9 +298,9 @@ __constant__ RhoPoint_dev adds_pub_dev[256];
 // 可区分点判断 (设备端)
 __device__ uint64_t distinguishable(const AffinePoint& x)
 {
-    uint64_t t = *reinterpret_cast<const uint64_t*>(x.x.limb);
-    if ((t & 0xFFFFFFFF) == 0) {
-        return *reinterpret_cast<const uint64_t*>(x.x.limb + 1);
+    if (x.x.limb[0] == 0) {
+        uint64_t t2 = x.x.limb[1] + ((uint64_t)x.x.limb[2] << 32);
+        return t2;
     }
     return 0;
 }
@@ -419,8 +419,9 @@ __global__ void rho()
     // 设备共享内存存储 adds_pub
     __shared__ RhoPoint_dev adds_pub[256];
     // 从全局内存复制adds_pub到共享内存
-    if (threadIdx.x < 256) {
-        adds_pub[threadIdx.x] = adds_pub_dev[threadIdx.x];
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 256; i++)
+            adds_pub[i] = adds_pub_dev[i];
     }
     __syncthreads(); // 确保所有线程已完成加载
     while (break_flag_dev == false) {
@@ -444,13 +445,13 @@ void get_optimal_block_size(int& multiProcessorCount, int& block_size)
     // 根据GPU架构特性选择最佳线程数
     switch (prop.major) {
     case 7: // Volta/Turing
-        block_size = 1024;
+        block_size = 128;
         break;
     case 8: // Ampere
-        block_size = 1024;
+        block_size = 256;
         break;
     case 9: // Hopper
-        block_size = 1024;
+        block_size = 256;
         break;
     default: // 其他架构
         block_size = 256;
@@ -494,13 +495,18 @@ void init_RhoStates_test(int total_points)
     RhoState r;
     set_int(r.m, 1);
     set_int(r.n, 1);
+    RhoPoint_dev t;
     create(ctx, &r.x, r.m, r.n);
-    for (int i = 0; i < total_points; i++) {
-        RhoPoint_dev t;
+    for (int i = 0; i < total_points - 1; i++) {
         t.from(r);
-        rho_F(ctx, r);
         CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+        rho_F(ctx, r);
     }
+    set_int256(r.m, "4795cc3b02cfd7772a0f913b7cf18ed3cbff9c59b2c8899d0f719449c641e0a0");
+    set_int256(r.n, "38468e1ca1ab59348d856b441274666059c1fc7fabf1fb267a80b0ff83eca274");
+    create(ctx, &r.x, r.m, r.n);
+    t.from(r);
+    CHECK_CUDA(cudaMemcpy(RhoStates_host + total_points - 1, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
 }
 
 void rho_play() {
@@ -517,7 +523,7 @@ void rho_play() {
         break_rho(0);
         rho<<<multiProcessorCount, blockSize>>>();
         // 等待核函数完成
-        cudaDeviceSynchronize();
+        CHECK_CUDA(cudaDeviceSynchronize());
         dp_manager.save_dps();
     }
     // 清理资源
@@ -569,14 +575,25 @@ __global__ void validate()
         fun_add(*rs, adds_pub_dev[t]);
         assert(*rs == RhoStates_dev[i]);
     }
+
+    //测试 distinguishable
+    assert(distinguishable(RhoStates_dev[0].x) == 0);
+    auto t = distinguishable(RhoStates_dev[100].x);
+    assert(t == 867600860383096976);
+    add_dp_to_buffer(t, RhoStates_dev[100], dp_device_buffer, 1);
+    assert(break_flag_dev == true);
 }
 
 void validate_test()
 {
-    init_RhoStates_test(100);
+    init_RhoStates_test(101);
     init_adds_pub_dev();
+    DpManager dp_manager(11);
     validate<<<1, 1>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
+    dp_manager.save_dps();
+    //TODDO: 然后手动检查dp文件！！
+
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
