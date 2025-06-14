@@ -107,7 +107,7 @@ void work() {
     //play<BabyGiant>();
 }
 
-
+#if 0
 //=======>>>>>>>>>>>>>
 #pragma comment(lib, "..\\..\\..\\build\\vcpkg_installed\\x64-windows\\lib\\libcrypto.lib")
 #pragma comment(lib, "..\\..\\..\\build\\vcpkg_installed\\x64-windows\\lib\\libssl.lib")
@@ -1576,6 +1576,8 @@ void test_112_helper() {
 }
 
 //========<<<<<<<<<<<<<<
+#endif  //64位曲线
+
 #include <csignal>
 
 void validate_test();

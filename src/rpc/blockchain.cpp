@@ -4135,11 +4135,6 @@ static RPCHelpMan testmvp()
             }
             if (ta == 8) {
                 if (ta2 == 1) {
-                    //检查DP文件中是否存在碰撞
-                    std::map<uint64_t, SecPair> dpMap;
-                    iLog _dplog(_DPFile_name);
-                    loadDP(_dplog.ifs, dpMap);
-                } else if (ta2 == 2) {
                     // 检查DP文件中是否存在碰撞，若存在则计算bingo
                     std::map<uint64_t, SecPair> dpMap;
                     iLog _dplog(_DPFile_name);
@@ -4156,7 +4151,11 @@ static RPCHelpMan testmvp()
 
                             secp256k1_pubkey x_tmp;
                             create(ctx, &x_tmp, sp.m, sp.n);
-                            assert(dp_index == distinguishable(x_tmp));
+                            if (dp_index != distinguishable(x_tmp)) {
+                                unspent.pushKV("str", "!!!!Error!!!!");
+                                unspent.pushKV("str2", std::to_string(dp_index));
+                                break;
+                            }
                             auto iter = dpMap.find(dp_index);
                             if (iter != dpMap.end()) {
                                 CKey k;
@@ -4165,6 +4164,7 @@ static RPCHelpMan testmvp()
                                     unspent.pushKV("str", "!!!!bingo!!!!");
                                 } else {
                                     unspent.pushKV("str", "!!!!short circulation!!!!");
+                                    unspent.pushKV("str2", std::to_string(dp_index));
                                 }
                                 break;
                             } else {
