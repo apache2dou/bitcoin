@@ -479,9 +479,6 @@ __global__ void rho()
             // 保存可区分点
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
         }
-        /*if ((count_rho & 0xFFFFF) == 0) {
-            __threadfence();
-        }*/
     }
     RhoStates_dev[idx] = s;
     if (idx == 0) {
@@ -596,6 +593,7 @@ __constant__ AffinePoint G = {
     false
 };
 
+#define RHOSTATES_TEST_NUM  1024001
 __global__ void validate()
 {
     // 测试1：G + ∞ = G
@@ -624,29 +622,32 @@ __global__ void validate()
     assert(res3G.y.limb[7] == 0x388f7b0f); // 2G的y坐标高位
 
     //测试 rho_f_dev
-    RhoPoint_dev* rs = RhoStates_dev;
-    for (int i = 1; i < 100; i++) {
-        auto t = (unsigned char)rs->x.x.limb[0];
+    for (int i = 0; i < RHOSTATES_TEST_NUM / (blockDim.x * gridDim.x); i++) {
+        int index = i * blockDim.x * gridDim.x + blockDim.x * blockIdx.x + threadIdx.x;
+        RhoPoint_dev rs = RhoStates_dev[index];
+        auto t = (unsigned char)rs.x.x.limb[0];
         //printf("%d ", t);
-        fun_add(*rs, adds_pub_dev[t]);
-        assert(*rs == RhoStates_dev[i]);
+        fun_add(rs, adds_pub_dev[t]);
+        if (!(rs == RhoStates_dev[index + 1])) {
+            printf("%d ", index);
+        }
     }
 
     //测试 distinguishable
     assert(distinguishable(RhoStates_dev[0].x) == 0);
-    auto t = distinguishable(RhoStates_dev[100].x);
+    auto t = distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x);
     assert(t == 867600860383096976);
-    add_dp_to_buffer(t, RhoStates_dev[100], dp_device_buffer, 1);
+    add_dp_to_buffer(t, RhoStates_dev[RHOSTATES_TEST_NUM], dp_device_buffer, 1);
     assert(*break_flag_dev == true);
 }
 
 void validate_test()
 {
-    init_RhoStates_test(101);
+    init_RhoStates_test(RHOSTATES_TEST_NUM + 1);
     init_adds_pub_dev();
     init_zero_copy_memory();
     DpManager dp_manager(11);
-    validate<<<1, 1>>>();
+    validate<<<10, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
     //dp_manager.save_dps();
     //TODDO: 然后手动检查dp文件！！
