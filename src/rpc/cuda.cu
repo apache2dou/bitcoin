@@ -594,7 +594,9 @@ __constant__ AffinePoint G = {
 };
 
 #define RHOSTATES_TEST_NUM  1024001
-__global__ void validate()
+#define RHODP_TEST_NUM 102
+
+__global__ void validate_1()
 {
     // 测试1：G + ∞ = G
     AffinePoint inf;
@@ -621,6 +623,15 @@ __global__ void validate()
     assert(res3G.x.limb[7] == 0xf9308a01); // 2G的x坐标高位
     assert(res3G.y.limb[7] == 0x388f7b0f); // 2G的y坐标高位
 
+    //测试 distinguishable
+    assert(distinguishable(RhoStates_dev[0].x) == 0);
+    assert(distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x) == 867600860383096976);
+
+    assert(*break_flag_dev == true);
+}
+
+__global__ void validate_multi()
+{
     //测试 rho_f_dev
     for (int i = 0; i < RHOSTATES_TEST_NUM / (blockDim.x * gridDim.x); i++) {
         int index = i * blockDim.x * gridDim.x + blockDim.x * blockIdx.x + threadIdx.x;
@@ -628,17 +639,13 @@ __global__ void validate()
         auto t = (unsigned char)rs.x.x.limb[0];
         //printf("%d ", t);
         fun_add(rs, adds_pub_dev[t]);
-        if (!(rs == RhoStates_dev[index + 1])) {
-            printf("%d ", index);
-        }
+        assert((rs == RhoStates_dev[index + 1]));
     }
 
-    //测试 distinguishable
-    assert(distinguishable(RhoStates_dev[0].x) == 0);
-    auto t = distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x);
-    assert(t == 867600860383096976);
-    add_dp_to_buffer(t, RhoStates_dev[RHOSTATES_TEST_NUM], dp_device_buffer, 1);
-    assert(*break_flag_dev == true);
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < RHODP_TEST_NUM) {
+        add_dp_to_buffer(867600860383096976, RhoStates_dev[RHOSTATES_TEST_NUM], dp_device_buffer, RHODP_TEST_NUM);
+    }
 }
 
 void validate_test()
@@ -646,8 +653,10 @@ void validate_test()
     init_RhoStates_test(RHOSTATES_TEST_NUM + 1);
     init_adds_pub_dev();
     init_zero_copy_memory();
-    DpManager dp_manager(11);
-    validate<<<10, 256>>>();
+    DpManager dp_manager(RHODP_TEST_NUM + 10);
+    validate_multi<<<10, 256>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    validate_1<<<1, 1>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
     //dp_manager.save_dps();
     //TODDO: 然后手动检查dp文件！！
