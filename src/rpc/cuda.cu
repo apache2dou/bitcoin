@@ -661,6 +661,18 @@ void validate_test()
     //dp_manager.save_dps();
     //TODDO: 然后手动检查dp文件！！
 
+    //测试转换逻辑
+    for (int i = 0; i < 4096; i++) {
+        RhoState r;
+        r.rand();
+        RhoPoint_dev t;
+        t.from(r);
+        DpBuffer buffer;
+        transfer(buffer.sp.m, (const unsigned char*)&t.m);
+        transfer(buffer.sp.n, (const unsigned char*)&t.n);
+        assert(buffer.sp == r);
+    }
+
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
