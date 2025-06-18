@@ -4,46 +4,53 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <iostream>
+#include <cstdio>
 
 // 256-bit数值（小端序，32位肢体）
 typedef struct {
     uint32_t limb[8];
 } uint256_t;
 
+#ifdef __CUDA_ARCH__
+#define CONSTANT __constant__
+#else
+#define CONSTANT
+#endif
+
 // secp256k1曲线参数（设备常量）
-__constant__ uint256_t p = {
+CONSTANT uint256_t p = {
     0xFFFFFC2F, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
     0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 
-__constant__ uint256_t N = {
+CONSTANT uint256_t N = {
     0xd0364141, 0xbfd25e8c, 0xaf48a03b, 0xbaaedce6,
     0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 
 // 预计算的蒙哥马利参数
-__constant__ uint256_t R = {
+CONSTANT uint256_t R = {
     0x000003D1, 0x00000001, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
-__constant__ uint256_t R_squared = {
+CONSTANT uint256_t R_squared = {
     0x000e90a1, 0x000007a2, 0x00000001, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
-__constant__ uint32_t np = 0xD2253531;
+CONSTANT uint32_t np = 0xD2253531;
 
 // 预计算的蒙哥马利常量
-__constant__ uint256_t two_mont = {
+CONSTANT uint256_t two_mont = {
     0x000007A2, 0x00000002, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
-__constant__ uint256_t three_mont = {
+CONSTANT uint256_t three_mont = {
     0x00000B73, 0x00000003, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
 // 点结构（仿射坐标）
 typedef struct {
-    uint256_t x;
-    uint256_t y;
-    bool infinity;
+    uint256_t x = {0};
+    uint256_t y = {0};
+    bool infinity = true;
 } AffinePoint;
 
 // CUDA错误检查宏
@@ -58,7 +65,7 @@ typedef struct {
 
 // ================== 基础算术函数 ==================
 // 返回最终进位状态 (1表示溢出)
-__device__ uint32_t add256(uint256_t* a, const uint256_t* b)
+__host__ __device__ uint32_t add256(uint256_t* a, const uint256_t* b)
 {
     uint64_t carry = 0;
     for (int i = 0; i < 8; ++i) {
@@ -70,7 +77,7 @@ __device__ uint32_t add256(uint256_t* a, const uint256_t* b)
 }
 
 // 返回最终借位状态 (1表示结果为负)
-__device__ uint32_t sub256(uint256_t* a, const uint256_t* b)
+__host__ __device__ uint32_t sub256(uint256_t* a, const uint256_t* b)
 {
     uint64_t borrow = 0;
     for (int i = 0; i < 8; ++i) {
@@ -81,7 +88,7 @@ __device__ uint32_t sub256(uint256_t* a, const uint256_t* b)
     return (borrow != 0);
 }
 
-__device__ int is_ge(const uint256_t* a, const uint256_t* b)
+__host__ __device__ int is_ge(const uint256_t* a, const uint256_t* b)
 {
     for (int i = 7; i >= 0; --i) {
         if (a->limb[i] > b->limb[i]) return 1;
@@ -90,7 +97,7 @@ __device__ int is_ge(const uint256_t* a, const uint256_t* b)
     return 1;
 }
 
-__device__ int is_zero(const uint256_t* a)
+__host__ __device__ int is_zero(const uint256_t* a)
 {
     for (int i = 0; i < 8; ++i)
         if (a->limb[i] != 0) return 0;
@@ -98,7 +105,7 @@ __device__ int is_zero(const uint256_t* a)
 }
 
 // ================== 蒙哥马利运算 ==================
-__device__ uint256_t mont_mul(const uint256_t a, const uint256_t b)
+__host__ __device__ uint256_t mont_mul(const uint256_t a, const uint256_t b)
 {
     uint64_t t[9] = {0}; // 扩展存储到288位（9*32）
 
@@ -106,9 +113,10 @@ __device__ uint256_t mont_mul(const uint256_t a, const uint256_t b)
         // 步骤1：计算a[i] * b并累加到t
         uint64_t carry = 0;
         for (int j = 0; j < 8; ++j) {
-            uint64_t product = (uint64_t)a.limb[i] * b.limb[j] + t[j] + carry;
-            t[j] = product & 0xFFFFFFFF; // 保留低32位
-            carry = product >> 32;       // 记录进位
+            uint64_t product = (uint64_t)a.limb[i] * b.limb[j];
+            uint64_t sum = product + t[j] + carry;
+            t[j] = sum & 0xFFFFFFFF; // 保留低32位
+            carry = (sum >> 32) + (sum >= product? 0 : 0x100000000); // 记录进位
         }
         t[8] = carry; // 存储最高位进位
 
@@ -118,9 +126,10 @@ __device__ uint256_t mont_mul(const uint256_t a, const uint256_t b)
         // 步骤3：加m*p并处理进位
         carry = 0;
         for (int j = 0; j < 8; ++j) {
-            uint64_t product = (uint64_t)m * p.limb[j] + t[j] + carry;
-            t[j] = product & 0xFFFFFFFF; // 保留低32位
-            carry = product >> 32;       // 记录进位
+            uint64_t product = (uint64_t)m * p.limb[j];
+            uint64_t sum = product + t[j] + carry;
+            t[j] = sum & 0xFFFFFFFF; // 保留低32位
+            carry = (sum >> 32) + (sum >= product ? 0 : 0x100000000); // 记录进位
         }
         t[8] += carry; // 累加最终进位
 
@@ -144,21 +153,21 @@ __device__ uint256_t mont_mul(const uint256_t a, const uint256_t b)
     return result;
 }
 
-__device__ uint256_t mod_add(const uint256_t& a, const uint256_t& b, const uint256_t& p)
+__host__ __device__ uint256_t mod_add(const uint256_t& a, const uint256_t& b, const uint256_t& m)
 {
     uint256_t result = a;
 
     // 执行加法并检测进位
     uint32_t carry = add256(&result, &b);
 
-    // 处理溢出情况：进位发生或结果 >= p
-    if (carry || is_ge(&result, &p)) {
-        sub256(&result, &p); // 减去模数p
+    // 处理溢出情况：进位发生或结果 >= m
+    if (carry || is_ge(&result, &m)) {
+        sub256(&result, &m); // 减去模数m
     }
     return result;
 }
 
-__device__ uint256_t mod_sub(const uint256_t& a, const uint256_t& b, const uint256_t& p)
+__host__ __device__ uint256_t mod_sub(const uint256_t& a, const uint256_t& b, const uint256_t& m)
 {
     uint256_t result = a;
 
@@ -167,12 +176,12 @@ __device__ uint256_t mod_sub(const uint256_t& a, const uint256_t& b, const uint2
 
     // 处理负数结果
     if (borrow) {
-        add256(&result, &p); // 加上模数p
+        add256(&result, &m); // 加上模数m
     }
     return result;
 }
 
-__device__ uint256_t mont_inv(const uint256_t a)
+__host__ __device__ uint256_t mont_inv(const uint256_t a)
 {
     uint256_t result = R; // 1 in Montgomery form
     uint256_t exponent = p;
@@ -187,18 +196,22 @@ __device__ uint256_t mont_inv(const uint256_t a)
     return result;
 }
 // 转换到蒙哥马利域
-__device__ uint256_t to_mont(const uint256_t a)
+__host__ __device__ uint256_t to_mont(const uint256_t a)
 {
     return mont_mul(a, R_squared);
 }
-__device__ uint256_t from_mont(const uint256_t a)
+__host__ __device__ uint256_t from_mont(const uint256_t a)
 {
     uint256_t one = {1};
     return mont_mul(a, one);
 }
 // ================== 点运算 ==================
-__device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
+__host__ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
 {
+    // 处理无穷点情况
+    if (P.infinity) return Q;
+    if (Q.infinity) return P;
+
     // 转换为蒙哥马利域
     P.x = to_mont(P.x);
     P.y = to_mont(P.y);
@@ -210,27 +223,16 @@ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
     R.y = {{0}};
     R.infinity = true;
 
-    if (P.infinity) {
-        R = Q;
-        goto convert_back;
-    }
-    if (Q.infinity) {
-        R = P;
-        goto convert_back;
-    }
-
     uint256_t x_diff = mod_sub(Q.x, P.x, p);
     if (is_zero(&x_diff)) {
         uint256_t y_sum = mod_add(P.y, Q.y, p);
         if (is_zero(&y_sum)) {
-            R.infinity = true;
-            goto convert_back;
+            return R;
         }
 
         uint256_t x_sq = mont_mul(P.x, P.x);
         uint256_t numerator = mont_mul(x_sq, three_mont);
-        uint256_t denominator = mod_add(P.y, P.y, p);
-        uint256_t lambda = mont_mul(numerator, mont_inv(denominator));
+        uint256_t lambda = mont_mul(numerator, mont_inv(y_sum));
 
         uint256_t lambda_sq = mont_mul(lambda, lambda);
         R.x = mod_sub(lambda_sq, mod_add(P.x, P.x, p), p);
@@ -251,7 +253,6 @@ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
 
     R.infinity = false;
 
-convert_back:
     // 转换回普通形式
     R.x = from_mont(R.x);
     R.y = from_mont(R.y);
@@ -306,7 +307,7 @@ __device__ uint64_t distinguishable(const AffinePoint& x)
     return 0;
 }
 
-__device__ void fun_add(RhoPoint_dev& s, const RhoPoint_dev& a)
+__host__ __device__ void fun_add(RhoPoint_dev& s, const RhoPoint_dev& a)
 {
     RhoPoint_dev tmp = s;
     s.x = point_add(tmp.x, a.x);
@@ -453,6 +454,67 @@ private:
     size_t buffer_size;
 };
 
+// 设备端辅助函数：将32位整数转换为大端序十六进制字符串
+__host__ __device__ void uint32_to_hex_be(char* output, uint32_t value)
+{
+    const char hex_chars[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) {
+        // 从最高位字节开始处理 (大端序)
+        uint8_t byte = (value >> ((7 - i) * 4)) & 0xF;
+        output[i] = hex_chars[byte];
+    }
+}
+
+// 设备端辅助函数：将uint256_t转换为大端序十六进制字符串
+__host__ __device__ void uint256_to_hex_be(char* output, const uint256_t& value)
+{
+    // 大端序：从最高位limb开始 (limb[7])
+    for (int limb_idx = 7; limb_idx >= 0; limb_idx--) {
+        uint32_to_hex_be(output + (7 - limb_idx) * 8, value.limb[limb_idx]);
+    }
+    output[64] = '\0'; // 终止字符串
+}
+
+// 设备端函数：打印RhoPoint_dev的大端序十六进制表示
+__host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
+{
+    // 缓冲区大小：4个256位值 * 64字符 + 分隔符 + 终结符
+    constexpr int buf_size = 4 * 64 + 10;
+    char buf[buf_size];
+    char* ptr = buf;
+
+    // 打印 m
+    uint256_to_hex_be(ptr, point.m);
+    ptr += 64;
+    *ptr++ = '\n';
+
+    // 打印 n
+    uint256_to_hex_be(ptr, point.n);
+    ptr += 64;
+    *ptr++ = '\n';
+
+    // 打印 x 坐标
+    uint256_to_hex_be(ptr, point.x.x);
+    ptr += 64;
+    *ptr++ = '\n';
+
+    // 打印 y 坐标
+    uint256_to_hex_be(ptr, point.x.y);
+    ptr += 64;
+
+    // 添加无穷标志
+    if (point.x.infinity) {
+        *ptr++ = '\n';
+        *ptr++ = 'I';
+    }
+
+    *ptr = '\0'; // 终结字符串
+
+    // 打印结果
+    printf("\nRhoPoint_dev:\n%s\n", buf);
+}
+
+
 constexpr size_t dp_buffer_size = 40000; // DP 缓冲区大小
 __global__ void rho()
 {
@@ -543,8 +605,8 @@ void init_RhoStates_test(int total_points)
     CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_dev)));
     CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_dev*)));
     RhoState r;
-    set_int(r.m, 1);
-    set_int(r.n, 1);
+    set_int256(r.m, "569103012ff8d20291a62809f4ac5f6c8f88a13d4208a6a674cec68f1307254e");
+    set_int256(r.n, "92ce814fc881620c4461460d5144b54780edbae642905b0b847eb34ea5688bd3");
     RhoPoint_dev t;
     create(ctx, &r.x, r.m, r.n);
     for (int i = 0; i < total_points - 1; i++) {
@@ -593,7 +655,7 @@ __constant__ AffinePoint G = {
     false
 };
 
-#define RHOSTATES_TEST_NUM  1024001
+#define RHOSTATES_TEST_NUM  5120001
 #define RHODP_TEST_NUM 102
 
 __global__ void validate_1()
@@ -611,6 +673,15 @@ __global__ void validate_1()
         assert(res1G.y.limb[i] == G.y.limb[i]);
     }
 
+    // 测试1.1: G+(-G)
+    AffinePoint res_1G;
+    uint256_t _y = mod_sub({0}, G.y, p);
+    res_1G.x = G.x;
+    res_1G.y = _y;
+    res_1G.infinity = false;
+    AffinePoint res0G = point_add(G, res_1G);
+    assert(res0G.infinity);
+
     // 测试2：G + G的有效性
     AffinePoint res2G = point_add(G, G);
     assert(!res2G.infinity);
@@ -620,8 +691,8 @@ __global__ void validate_1()
     // 测试3：G + 2G的有效性
     AffinePoint res3G = point_add(G, res2G);
     assert(!res3G.infinity);
-    assert(res3G.x.limb[7] == 0xf9308a01); // 2G的x坐标高位
-    assert(res3G.y.limb[7] == 0x388f7b0f); // 2G的y坐标高位
+    assert(res3G.x.limb[7] == 0xf9308a01); // 3G的x坐标高位
+    assert(res3G.y.limb[7] == 0x388f7b0f); // 3G的y坐标高位
 
     //测试 distinguishable
     assert(distinguishable(RhoStates_dev[0].x) == 0);
@@ -637,7 +708,6 @@ __global__ void validate_multi()
         int index = i * blockDim.x * gridDim.x + blockDim.x * blockIdx.x + threadIdx.x;
         RhoPoint_dev rs = RhoStates_dev[index];
         auto t = (unsigned char)rs.x.x.limb[0];
-        //printf("%d ", t);
         fun_add(rs, adds_pub_dev[t]);
         assert((rs == RhoStates_dev[index + 1]));
     }
@@ -654,6 +724,7 @@ void validate_test()
     init_adds_pub_dev();
     init_zero_copy_memory();
     DpManager dp_manager(RHODP_TEST_NUM + 10);
+        
     validate_multi<<<10, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
     validate_1<<<1, 1>>>();
