@@ -3628,7 +3628,11 @@ std::string get_time()
 {
     // 获取当前时间点
     auto now = std::chrono::system_clock::now();
-    return std::format("{:%Y-%m-%d %H:%M:%S}", now);
+    // 直接获取本地时间（C++20 特性）
+    auto local_time = std::chrono::zoned_time{
+        std::chrono::current_zone(), // 自动获取当前时区
+        now};
+    return std::format("{:%Y-%m-%d %H:%M:%S}", local_time);
 }
 
 void rho_play();
@@ -4140,6 +4144,7 @@ static RPCHelpMan testmvp()
                     iLog _dplog(_DPFile_name);
                     std::string line;
                     if (_dplog.ifs.is_open()) {
+                        int count_error = 0;
                         while (std::getline(_dplog.ifs, line)) {
                             uint64_t dp_index;
                             SecPair sp;
@@ -4152,9 +4157,8 @@ static RPCHelpMan testmvp()
                             secp256k1_pubkey x_tmp;
                             create(ctx, &x_tmp, sp.m, sp.n);
                             if (dp_index != distinguishable(x_tmp)) {
-                                unspent.pushKV("str", "!!!!Error!!!!");
-                                unspent.pushKV("str2", std::to_string(dp_index));
-                                break;
+                                count_error++;
+                                continue;
                             }
                             auto iter = dpMap.find(dp_index);
                             if (iter != dpMap.end()) {
@@ -4171,6 +4175,11 @@ static RPCHelpMan testmvp()
                                 dpMap[dp_index] = sp;
                             }
                         }
+                        if (count_error > 0) {
+                            unspent.pushKV("str", "!!!!Error!!!!");
+                            unspent.pushKV("str2", "count_error: " + std::to_string(count_error));
+                        }
+                        unspent.pushKV("num", dpMap.size());
                     }
                 } else {
                     std::thread t(judge);
