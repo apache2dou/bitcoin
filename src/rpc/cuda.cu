@@ -195,6 +195,125 @@ __host__ __device__ uint256_t mont_inv(const uint256_t a)
     }
     return result;
 }
+
+// 扩展欧几里得算法求模逆 (普通域)
+__host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
+{
+    // 特殊情况处理：0 没有逆元
+    if (is_zero(&a)) {
+        return a; // 返回 0
+    }
+
+    // 初始化变量
+    uint256_t u = a;
+    uint256_t v = mod;
+    uint256_t x1 = {{1}}; // 初始系数: 1
+    uint256_t x2 = {{0}}; // 初始系数: 0
+    uint32_t carry;
+    int borrow;
+
+    // 迭代直到 v 为 0
+    while (!is_zero(&v)) {
+        // 检查提前退出条件：u == 1 或 v == 1
+        if (u.limb[0] == 1 && u.limb[1] == 0 && u.limb[2] == 0 && u.limb[3] == 0 &&
+            u.limb[4] == 0 && u.limb[5] == 0 && u.limb[6] == 0 && u.limb[7] == 0) {
+            break; // u == 1，x1 就是逆元
+        }
+
+        if (v.limb[0] == 1 && v.limb[1] == 0 && v.limb[2] == 0 && v.limb[3] == 0 &&
+            v.limb[4] == 0 && v.limb[5] == 0 && v.limb[6] == 0 && v.limb[7] == 0) {
+            // v == 1，x2 就是逆元
+            x1 = x2;
+            break;
+        }
+        // 当 u 为偶数时
+        if ((u.limb[0] & 1) == 0) {
+            // u /= 2 (右移)
+            for (int i = 0; i < 7; i++) {
+                u.limb[i] = (u.limb[i] >> 1) | (u.limb[i + 1] << 31);
+            }
+            u.limb[7] >>= 1;
+
+            // 处理 x1
+            if ((x1.limb[0] & 1) == 0) {
+                // x1 /= 2 (右移)
+                for (int i = 0; i < 7; i++) {
+                    x1.limb[i] = (x1.limb[i] >> 1) | (x1.limb[i + 1] << 31);
+                }
+                x1.limb[7] >>= 1;
+            } else {
+                // x1 = (x1 + mod) / 2
+                carry = add256(&x1, &mod);
+                for (int i = 0; i < 7; i++) {
+                    x1.limb[i] = (x1.limb[i] >> 1) | (x1.limb[i + 1] << 31);
+                }
+                x1.limb[7] = (x1.limb[7] >> 1) | (carry << 31);
+            }
+        }
+        // 当 v 为偶数时
+        else if ((v.limb[0] & 1) == 0) {
+            // v /= 2 (右移)
+            for (int i = 0; i < 7; i++) {
+                v.limb[i] = (v.limb[i] >> 1) | (v.limb[i + 1] << 31);
+            }
+            v.limb[7] >>= 1;
+
+            // 处理 x2
+            if ((x2.limb[0] & 1) == 0) {
+                // x2 /= 2 (右移)
+                for (int i = 0; i < 7; i++) {
+                    x2.limb[i] = (x2.limb[i] >> 1) | (x2.limb[i + 1] << 31);
+                }
+                x2.limb[7] >>= 1;
+            } else {
+                // x2 = (x2 + mod) / 2
+                carry = add256(&x2, &mod);
+                for (int i = 0; i < 7; i++) {
+                    x2.limb[i] = (x2.limb[i] >> 1) | (x2.limb[i + 1] << 31);
+                }
+                x2.limb[7] = (x2.limb[7] >> 1) | (carry << 31);
+            }
+        }
+        // 当 u 和 v 都为奇数时
+        else {
+            if (is_ge(&u, &v)) {
+                // u = u - v
+                borrow = sub256(&u, &v);
+                (void)borrow; // 忽略借位，因为 u >= v
+
+                // x1 = x1 - x2
+                if (is_ge(&x1, &x2)) {
+                    sub256(&x1, &x2);
+                } else {
+                    uint256_t temp = mod;
+                    sub256(&temp, &x2);
+                    add256(&x1, &temp);
+                }
+            } else {
+                // v = v - u
+                borrow = sub256(&v, &u);
+                (void)borrow; // 忽略借位，因为 v >= u
+
+                // x2 = x2 - x1
+                if (is_ge(&x2, &x1)) {
+                    sub256(&x2, &x1);
+                } else {
+                    uint256_t temp = mod;
+                    sub256(&temp, &x1);
+                    add256(&x2, &temp);
+                }
+            }
+        }
+    }
+
+    // 确保结果在 [0, mod-1] 范围内
+    if (is_ge(&x1, &mod)) {
+        sub256(&x1, &mod);
+    }
+
+    return x1;
+}
+
 // 转换到蒙哥马利域
 __host__ __device__ uint256_t to_mont(const uint256_t a)
 {
@@ -205,6 +324,19 @@ __host__ __device__ uint256_t from_mont(const uint256_t a)
     uint256_t one = {1};
     return mont_mul(a, one);
 }
+// 蒙哥马利域中的逆元计算
+__host__ __device__ uint256_t mont_inv2(const uint256_t a_mont)
+{
+    // 1. 从蒙哥马利域转换回普通域
+    uint256_t a_ordinary = from_mont(a_mont);
+
+    // 2. 在普通域中计算逆元
+    uint256_t inv_ordinary = mod_inv(a_ordinary, p);
+
+    // 3. 转换回蒙哥马利域
+    return to_mont(inv_ordinary);
+}
+
 // ================== 点运算 ==================
 __host__ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
 {
@@ -232,7 +364,7 @@ __host__ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
 
         uint256_t x_sq = mont_mul(P.x, P.x);
         uint256_t numerator = mont_mul(x_sq, three_mont);
-        uint256_t lambda = mont_mul(numerator, mont_inv(y_sum));
+        uint256_t lambda = mont_mul(numerator, mont_inv2(y_sum));
 
         uint256_t lambda_sq = mont_mul(lambda, lambda);
         R.x = mod_sub(lambda_sq, mod_add(P.x, P.x, p), p);
@@ -241,7 +373,7 @@ __host__ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
         R.y = mod_sub(temp, P.y, p);
     } else {
         uint256_t y_diff = mod_sub(Q.y, P.y, p);
-        uint256_t lambda = mont_mul(y_diff, mont_inv(x_diff));
+        uint256_t lambda = mont_mul(y_diff, mont_inv2(x_diff));
 
         uint256_t lambda_sq = mont_mul(lambda, lambda);
         R.x = mod_sub(lambda_sq, P.x, p);
