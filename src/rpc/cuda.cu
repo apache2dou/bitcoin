@@ -430,7 +430,7 @@ public:
 __constant__ RhoPoint_dev adds_pub_dev[256];
 
 // 可区分点判断 (设备端)
-__device__ uint64_t distinguishable(const AffinePoint& x)
+__host__ __device__ uint64_t distinguishable(const AffinePoint& x)
 {
     if (x.x.limb[0] == 0) {
         uint64_t t2 = x.x.limb[1] + ((uint64_t)x.x.limb[2] << 32);
@@ -856,7 +856,7 @@ void validate_test()
     init_adds_pub_dev();
     init_zero_copy_memory();
     DpManager dp_manager(RHODP_TEST_NUM + 10);
-        
+       
     validate_multi<<<10, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
     validate_1<<<1, 1>>>();
@@ -875,6 +875,26 @@ void validate_test()
         transfer(buffer.sp.n, (const unsigned char*)&t.n);
         assert(buffer.sp == r);
     }
+ 
+    //性能测试
+    uint64_t count_rho = 0;
+    uint32_t count_dp = 0;
+    RhoPoint_dev adds_pub_tmp[256];
+    for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_dev); i++) {
+        adds_pub_tmp[i].from(adds_pub[0][i]);
+    }
+    RhoPoint_dev s = adds_pub_tmp[0];
+    std::cout << get_time() << " :test start" << std::endl;
+    while (count_rho < 800000) {
+        fun_add(s, adds_pub_tmp[(unsigned char)s.x.x.limb[0]]);
+        count_rho++;
+        // 检查是否可区分
+        uint64_t d = distinguishable(s.x);
+        if (d != 0) {
+            count_dp++;
+        }
+    }
+    std::cout << get_time() << " :test end with " << count_rho << " dp." << std::endl;
 
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
