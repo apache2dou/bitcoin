@@ -35,12 +35,13 @@ CONSTANT uint256_t R_squared = {
     0x000e90a1, 0x000007a2, 0x00000001, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
+CONSTANT uint256_t R_cube = {
+    0x3795f671, 0x002bb1e3, 0x00000b73, 0x00000001,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000};
+
 CONSTANT uint32_t np = 0xD2253531;
 
 // 预计算的蒙哥马利常量
-CONSTANT uint256_t two_mont = {
-    0x000007A2, 0x00000002, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
 CONSTANT uint256_t three_mont = {
     0x00000B73, 0x00000003, 0x00000000, 0x00000000,
@@ -105,7 +106,7 @@ __host__ __device__ int is_zero(const uint256_t* a)
 }
 
 // ================== 蒙哥马利运算 ==================
-__host__ __device__ uint256_t mont_mul(const uint256_t a, const uint256_t b)
+__host__ __device__ uint256_t mont_mul(const uint256_t& a, const uint256_t& b)
 {
     uint64_t t[9] = {0}; // 扩展存储到288位（9*32）
 
@@ -210,7 +211,6 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
     uint256_t x1 = {{1}}; // 初始系数: 1
     uint256_t x2 = {{0}}; // 初始系数: 0
     uint32_t carry;
-    int borrow;
 
     // 迭代直到 v 为 0
     while (!is_zero(&v)) {
@@ -278,8 +278,7 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
         else {
             if (is_ge(&u, &v)) {
                 // u = u - v
-                borrow = sub256(&u, &v);
-                (void)borrow; // 忽略借位，因为 u >= v
+                sub256(&u, &v);
 
                 // x1 = x1 - x2
                 if (is_ge(&x1, &x2)) {
@@ -291,8 +290,7 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
                 }
             } else {
                 // v = v - u
-                borrow = sub256(&v, &u);
-                (void)borrow; // 忽略借位，因为 v >= u
+                sub256(&v, &u);
 
                 // x2 = x2 - x1
                 if (is_ge(&x2, &x1)) {
@@ -315,75 +313,74 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
 }
 
 // 转换到蒙哥马利域
-__host__ __device__ uint256_t to_mont(const uint256_t a)
+__host__ __device__ uint256_t to_mont(const uint256_t& a)
 {
     return mont_mul(a, R_squared);
 }
-__host__ __device__ uint256_t from_mont(const uint256_t a)
+__host__ __device__ uint256_t from_mont(const uint256_t& a)
 {
     uint256_t one = {1};
     return mont_mul(a, one);
 }
 // 蒙哥马利域中的逆元计算
-__host__ __device__ uint256_t mont_inv2(const uint256_t a_mont)
+__host__ __device__ uint256_t mont_inv2(const uint256_t& a_mont)
 {
-    // 1. 从蒙哥马利域转换回普通域
-    uint256_t a_ordinary = from_mont(a_mont);
+    uint256_t inv = mod_inv(a_mont, p);
 
-    // 2. 在普通域中计算逆元
-    uint256_t inv_ordinary = mod_inv(a_ordinary, p);
-
-    // 3. 转换回蒙哥马利域
-    return to_mont(inv_ordinary);
+    return mont_mul(inv, R_cube);
 }
 
 // ================== 点运算 ==================
-__host__ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
+__host__ __device__ AffinePoint mont_point_add(const AffinePoint& P_mont, const AffinePoint& Q_mont)
 {
     // 处理无穷点情况
-    if (P.infinity) return Q;
-    if (Q.infinity) return P;
+    if (P_mont.infinity) return Q_mont;
+    if (Q_mont.infinity) return P_mont;
+    AffinePoint R;
+    R.x = {{0}};
+    R.y = {{0}};
+    R.infinity = true;
 
+    uint256_t x_diff = mod_sub(Q_mont.x, P_mont.x, p);
+    if (is_zero(&x_diff)) {
+        uint256_t y_sum = mod_add(P_mont.y, Q_mont.y, p);
+        if (is_zero(&y_sum)) {
+            return R;
+        }
+
+        uint256_t x_sq = mont_mul(P_mont.x, P_mont.x);
+        uint256_t numerator = mont_mul(x_sq, three_mont);
+        uint256_t lambda = mont_mul(numerator, mont_inv2(y_sum));
+
+        uint256_t lambda_sq = mont_mul(lambda, lambda);
+        R.x = mod_sub(lambda_sq, mod_add(P_mont.x, P_mont.x, p), p);
+
+        uint256_t temp = mont_mul(lambda, mod_sub(P_mont.x, R.x, p));
+        R.y = mod_sub(temp, P_mont.y, p);
+    } else {
+        uint256_t y_diff = mod_sub(Q_mont.y, P_mont.y, p);
+        uint256_t lambda = mont_mul(y_diff, mont_inv2(x_diff));
+
+        uint256_t lambda_sq = mont_mul(lambda, lambda);
+        R.x = mod_sub(lambda_sq, P_mont.x, p);
+        R.x = mod_sub(R.x, Q_mont.x, p);
+
+        uint256_t temp = mont_mul(lambda, mod_sub(P_mont.x, R.x, p));
+        R.y = mod_sub(temp, P_mont.y, p);
+    }
+
+    R.infinity = false;
+    return R;
+}
+__host__ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
+{
     // 转换为蒙哥马利域
     P.x = to_mont(P.x);
     P.y = to_mont(P.y);
     Q.x = to_mont(Q.x);
     Q.y = to_mont(Q.y);
 
-    AffinePoint R;
-    R.x = {{0}};
-    R.y = {{0}};
-    R.infinity = true;
-
-    uint256_t x_diff = mod_sub(Q.x, P.x, p);
-    if (is_zero(&x_diff)) {
-        uint256_t y_sum = mod_add(P.y, Q.y, p);
-        if (is_zero(&y_sum)) {
-            return R;
-        }
-
-        uint256_t x_sq = mont_mul(P.x, P.x);
-        uint256_t numerator = mont_mul(x_sq, three_mont);
-        uint256_t lambda = mont_mul(numerator, mont_inv2(y_sum));
-
-        uint256_t lambda_sq = mont_mul(lambda, lambda);
-        R.x = mod_sub(lambda_sq, mod_add(P.x, P.x, p), p);
-
-        uint256_t temp = mont_mul(lambda, mod_sub(P.x, R.x, p));
-        R.y = mod_sub(temp, P.y, p);
-    } else {
-        uint256_t y_diff = mod_sub(Q.y, P.y, p);
-        uint256_t lambda = mont_mul(y_diff, mont_inv2(x_diff));
-
-        uint256_t lambda_sq = mont_mul(lambda, lambda);
-        R.x = mod_sub(lambda_sq, P.x, p);
-        R.x = mod_sub(R.x, Q.x, p);
-
-        uint256_t temp = mont_mul(lambda, mod_sub(P.x, R.x, p));
-        R.y = mod_sub(temp, P.y, p);
-    }
-
-    R.infinity = false;
+    AffinePoint R = mont_point_add(P, Q);
 
     // 转换回普通形式
     R.x = from_mont(R.x);
@@ -399,7 +396,7 @@ __host__ __device__ void transfer(unsigned char* mp, const unsigned char* mp2)
         mp[i] = mp2[31 - i];
     }
 }
-class RhoPoint_dev
+class RhoPoint_mont
 {
 public:
     uint256_t m = {0};
@@ -410,13 +407,15 @@ public:
         transfer((unsigned char*)&this->m, r.m);
         transfer((unsigned char*)&this->n, r.n);
         memcpy(&this->x, r.x.data, sizeof(r.x.data));
+        x.x = to_mont(x.x);
+        x.y = to_mont(x.y);
         x.infinity = false;
     }
-    __device__ bool operator==(const RhoPoint_dev& other) const
+    __device__ bool operator==(const RhoPoint_mont& other) const
     {
         const unsigned char* a = (const unsigned char*)&this->m;
         const unsigned char* b = (const unsigned char*)&other.m;
-        for (size_t i = 0; i < /*sizeof(RhoPoint_dev)*/ 129; i++) {
+        for (size_t i = 0; i < /*sizeof(RhoPoint_mont)*/ 129; i++) {
             if (a[i] != b[i]) {
                 //printf("%d ", i);
                 return false;
@@ -427,24 +426,23 @@ public:
 } ;
 
 // 设备常量内存存储 adds_pub_dev
-__constant__ RhoPoint_dev adds_pub_dev[256];
+__constant__ RhoPoint_mont adds_pub_dev[256];
 
 // 可区分点判断 (设备端)
-__host__ __device__ uint64_t distinguishable(const AffinePoint& x)
+__host__ __device__ uint64_t distinguishable(const uint256_t& x)
 {
-    if (x.x.limb[0] == 0) {
-        uint64_t t2 = x.x.limb[1] + ((uint64_t)x.x.limb[2] << 32);
+    if (x.limb[0] == 0) {
+        uint64_t t2 = x.limb[1] + ((uint64_t)x.limb[2] << 32);
         return t2;
     }
     return 0;
 }
 
-__host__ __device__ void fun_add(RhoPoint_dev& s, const RhoPoint_dev& a)
+__host__ __device__ void fun_add(RhoPoint_mont& s, const RhoPoint_mont& a)
 {
-    RhoPoint_dev tmp = s;
-    s.x = point_add(tmp.x, a.x);
-    s.m = mod_add(tmp.m, a.m, N);
-    s.n = mod_add(tmp.n, a.n, N);
+    s.x = mont_point_add(s.x, a.x);
+    s.m = mod_add(s.m, a.m, N);
+    s.n = mod_add(s.n, a.n, N);
 }
 
 // 可区分点缓冲区结构
@@ -470,11 +468,11 @@ __device__ volatile bool* break_flag_dev = nullptr;
 extern bool gameover;
 
 
-RhoPoint_dev* RhoStates_host = nullptr;
-__device__ RhoPoint_dev* RhoStates_dev = nullptr;
+RhoPoint_mont* RhoStates_host = nullptr;
+__device__ RhoPoint_mont* RhoStates_dev = nullptr;
 
 // 添加 DP 到缓冲区 (设备端)
-__device__ void add_dp_to_buffer(uint64_t d, const RhoPoint_dev& r,
+__device__ void add_dp_to_buffer(uint64_t d, const RhoPoint_mont& r,
                                  DpBuffer* buffer, unsigned int max_size)
 {
     // 原子递增获取缓冲区位置
@@ -566,20 +564,21 @@ public:
         unsigned int current_count;
         CHECK_CUDA(cudaMemcpyFromSymbol(&current_count, dp_buffer_count, sizeof(unsigned int)));
 
-        if (current_count == 0) return;
+        if (current_count != 0) {
+            // 复制数据到主机
+            std::vector<DpBuffer> host_buffer(current_count);
+            CHECK_CUDA(cudaMemcpy(host_buffer.data(), m_dp_device_buffer,
+                                  current_count * sizeof(DpBuffer), cudaMemcpyDeviceToHost));
 
-        // 复制数据到主机
-        std::vector<DpBuffer> host_buffer(current_count);
-        CHECK_CUDA(cudaMemcpy(host_buffer.data(), m_dp_device_buffer,
-                   current_count * sizeof(DpBuffer), cudaMemcpyDeviceToHost));
-
-        for (const auto& dp : host_buffer) {
-            // 调用原始 saveDP 函数
-            _saveDP(dp.d, dp.sp);
+            for (const auto& dp : host_buffer) {
+                // 调用原始 saveDP 函数
+                _saveDP(dp.d, dp.sp);
+            }
+            // 重置设备缓冲区计数
+            reset_counters();
         }
+
         std::cout << get_time() << " : saved " << current_count << " dp." << std::endl;
-        // 重置设备缓冲区计数
-        reset_counters();
     }
 private:
     DpBuffer* m_dp_device_buffer = nullptr;
@@ -608,7 +607,7 @@ __host__ __device__ void uint256_to_hex_be(char* output, const uint256_t& value)
 }
 
 // 设备端函数：打印RhoPoint_dev的大端序十六进制表示
-__host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
+__host__ __device__ void print_rho_point_dev(const RhoPoint_mont& point)
 {
     // 缓冲区大小：4个256位值 * 64字符 + 分隔符 + 终结符
     constexpr int buf_size = 4 * 64 + 10;
@@ -652,26 +651,32 @@ __global__ void rho()
 {
     // 获取全局线程索引
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    RhoPoint_dev s = RhoStates_dev[idx];
+    RhoPoint_mont s = RhoStates_dev[idx];
+    uint256_t x_ord = from_mont(s.x.x);
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
     // 设备共享内存存储 adds_pub
-    __shared__ RhoPoint_dev adds_pub[256];
+    __shared__ RhoPoint_mont adds_pub[256];
     // 从全局内存复制adds_pub到共享内存
     if (threadIdx.x == 0) {
         for (int i = 0; i < 256; i++)
             adds_pub[i] = adds_pub_dev[i];
     }
     __syncthreads(); // 确保所有线程已完成加载
-    while (*break_flag_dev == false) {
-        fun_add(s, adds_pub[(unsigned char) s.x.x.limb[0]]);
+    while (true) {
+        fun_add(s, adds_pub[(unsigned char)x_ord.limb[0]]);
         count_rho++;
         // 检查是否可区分
-        uint64_t d = distinguishable(s.x);
+        x_ord = from_mont(s.x.x);
+        uint64_t d = distinguishable(x_ord);
         if (d != 0) {
             count_dp++;
             // 保存可区分点
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
+        }
+        if ((count_rho & 0xFFF) == 0) {
+            if (*break_flag_dev)
+                break;
         }
     }
     RhoStates_dev[idx] = s;
@@ -687,21 +692,30 @@ void get_optimal_block_size(int& multiProcessorCount, int& block_size)
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
 
     // 根据GPU架构特性选择最佳线程数
+    int coresPerSM;
+    int multiple = 2;
     switch (prop.major) {
+    case 5: // Maxwell
+        coresPerSM = 128;
+        break;
+    case 6: // Pascal
+        coresPerSM = 128;
+        multiple = 2;
+        break;
     case 7: // Volta/Turing
-        block_size = 128;
+        coresPerSM = 64;
         break;
     case 8: // Ampere
-        block_size = 256;
+        coresPerSM = 128;
         break;
     case 9: // Hopper
-        block_size = 256;
+        coresPerSM = 128;
         break;
     default: // 其他架构
-        block_size = 256;
+        coresPerSM = 128;
     }
     // 确保不超过硬件限制
-    block_size = std::min(block_size, prop.maxThreadsPerBlock);
+    block_size = std::min(coresPerSM * multiple, prop.maxThreadsPerBlock);
     multiProcessorCount = prop.multiProcessorCount;
 }
 
@@ -709,24 +723,24 @@ extern RhoPoint adds_pub[2][256];
 
 void init_adds_pub_dev()
 {
-    for (int i = 0; i < sizeof(adds_pub_dev) / sizeof(RhoPoint_dev); i++) {
-        RhoPoint_dev t;
+    for (int i = 0; i < sizeof(adds_pub_dev) / sizeof(RhoPoint_mont); i++) {
+        RhoPoint_mont t;
         t.from(adds_pub[0][i]);
-        CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_dev, &t, sizeof(RhoPoint_dev), sizeof(RhoPoint_dev) * i, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_dev, &t, sizeof(RhoPoint_mont), sizeof(RhoPoint_mont) * i, cudaMemcpyHostToDevice));
     }
 }
 
 void init_RhoStates_dev(int total_points)
 {
     //分配设备内存并复制初始状态
-    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_dev)));
-    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_dev*)));
+    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_mont)));
+    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_mont*)));
     for (int i = 0; i < total_points; i++) {
         RhoPoint r;
         r.rand();
-        RhoPoint_dev t;
+        RhoPoint_mont t;
         t.from(r);
-        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_mont), cudaMemcpyHostToDevice));
     }
 }
 
@@ -734,23 +748,23 @@ extern secp256k1_context* ctx;
 void init_RhoStates_test(int total_points)
 {
     // 分配设备内存并复制初始状态
-    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_dev)));
-    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_dev*)));
+    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_mont)));
+    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_mont*)));
     RhoState r;
     set_int256(r.m, "569103012ff8d20291a62809f4ac5f6c8f88a13d4208a6a674cec68f1307254e");
     set_int256(r.n, "92ce814fc881620c4461460d5144b54780edbae642905b0b847eb34ea5688bd3");
-    RhoPoint_dev t;
     create(ctx, &r.x, r.m, r.n);
+    RhoPoint_mont t;
     for (int i = 0; i < total_points - 1; i++) {
         t.from(r);
-        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_mont), cudaMemcpyHostToDevice));
         rho_F(ctx, r);
     }
     set_int256(r.m, "4795cc3b02cfd7772a0f913b7cf18ed3cbff9c59b2c8899d0f719449c641e0a0");
     set_int256(r.n, "38468e1ca1ab59348d856b441274666059c1fc7fabf1fb267a80b0ff83eca274");
     create(ctx, &r.x, r.m, r.n);
     t.from(r);
-    CHECK_CUDA(cudaMemcpy(RhoStates_host + total_points - 1, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(RhoStates_host + total_points - 1, &t, sizeof(RhoPoint_mont), cudaMemcpyHostToDevice));
 }
 
 void rho_play() {
@@ -827,8 +841,8 @@ __global__ void validate_1()
     assert(res3G.y.limb[7] == 0x388f7b0f); // 3G的y坐标高位
 
     //测试 distinguishable
-    assert(distinguishable(RhoStates_dev[0].x) == 0);
-    assert(distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x) == 867600860383096976);
+    assert(distinguishable(from_mont(RhoStates_dev[0].x.x)) == 0);
+    assert(distinguishable(from_mont(RhoStates_dev[RHOSTATES_TEST_NUM].x.x)) == 867600860383096976);
 
     assert(*break_flag_dev == true);
 }
@@ -838,8 +852,8 @@ __global__ void validate_multi()
     //测试 rho_f_dev
     for (int i = 0; i < RHOSTATES_TEST_NUM / (blockDim.x * gridDim.x); i++) {
         int index = i * blockDim.x * gridDim.x + blockDim.x * blockIdx.x + threadIdx.x;
-        RhoPoint_dev rs = RhoStates_dev[index];
-        auto t = (unsigned char)rs.x.x.limb[0];
+        RhoPoint_mont rs = RhoStates_dev[index];
+        auto t = (unsigned char)from_mont(rs.x.x).limb[0];
         fun_add(rs, adds_pub_dev[t]);
         assert((rs == RhoStates_dev[index + 1]));
     }
@@ -868,7 +882,7 @@ void validate_test()
     for (int i = 0; i < 4096; i++) {
         RhoState r;
         r.rand();
-        RhoPoint_dev t;
+        RhoPoint_mont t;
         t.from(r);
         DpBuffer buffer;
         transfer(buffer.sp.m, (const unsigned char*)&t.m);
@@ -879,22 +893,24 @@ void validate_test()
     //性能测试
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
-    RhoPoint_dev adds_pub_tmp[256];
-    for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_dev); i++) {
+    RhoPoint_mont adds_pub_tmp[256];
+    for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_mont); i++) {
         adds_pub_tmp[i].from(adds_pub[0][i]);
     }
-    RhoPoint_dev s = adds_pub_tmp[0];
+    RhoPoint_mont s = adds_pub_tmp[0];
+    uint256_t x_ord = from_mont(s.x.x);
     std::cout << get_time() << " :test start" << std::endl;
     while (count_rho < 800000) {
-        fun_add(s, adds_pub_tmp[(unsigned char)s.x.x.limb[0]]);
+        fun_add(s, adds_pub_tmp[(unsigned char)x_ord.limb[0]]);
         count_rho++;
         // 检查是否可区分
-        uint64_t d = distinguishable(s.x);
+        x_ord = from_mont(s.x.x);
+        uint64_t d = distinguishable(x_ord);
         if (d != 0) {
             count_dp++;
         }
     }
-    std::cout << get_time() << " :test end with " << count_rho << " dp." << std::endl;
+    std::cout << get_time() << " :test end with " << count_rho << " RhoPoint." << std::endl;
 
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
