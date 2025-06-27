@@ -3615,9 +3615,9 @@ public:
         if (auto d = distinguishable(rs.x)) {
             ++count_dstg;
             saveDP(_dplog.ofs, d, rs);
-            if (i != 0 && count_dstg % 3 == 0) {
+            /*if (i != 0 && count_dstg % 3 == 0) {
                 rs.rand();
-            }
+            }*/
         }
         return true;
     }
