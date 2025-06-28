@@ -68,25 +68,25 @@ typedef struct {
 // 返回最终进位状态 (1表示溢出)
 __host__ __device__ uint32_t add256(uint256_t* a, const uint256_t* b)
 {
-    uint64_t carry = 0;
+    uint32_t carry = 0;
     for (int i = 0; i < 8; ++i) {
         uint64_t sum = (uint64_t)a->limb[i] + b->limb[i] + carry;
         a->limb[i] = (uint32_t)sum;
-        carry = sum >> 32;
+        carry = (uint32_t)(sum >> 32);
     }
-    return (carry != 0);
+    return carry;
 }
 
 // 返回最终借位状态 (1表示结果为负)
 __host__ __device__ uint32_t sub256(uint256_t* a, const uint256_t* b)
 {
-    uint64_t borrow = 0;
+    uint32_t borrow = 0;
     for (int i = 0; i < 8; ++i) {
         uint64_t sub = (uint64_t)a->limb[i] - b->limb[i] - borrow;
         a->limb[i] = (uint32_t)sub;
-        borrow = (sub >> 32) & 1;
+        borrow = (uint32_t)((sub >> 32) & 1);
     }
-    return (borrow != 0);
+    return borrow;
 }
 
 __host__ __device__ int is_ge(const uint256_t* a, const uint256_t* b)
