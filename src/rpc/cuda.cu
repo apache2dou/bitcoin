@@ -864,6 +864,53 @@ __global__ void validate_multi()
     }
 }
 
+__host__ __device__ uint64_t perf_fun(RhoPoint_mont& s, const RhoPoint_mont* adds)
+{
+    uint64_t count_rho = 0;
+    uint32_t count_dp = 0;
+    uint256_t x_ord = from_mont(s.x.x);
+    while (count_rho < 800000) {
+        fun_add(s, adds[(unsigned char)x_ord.limb[0]]);
+        count_rho++;
+        // 检查是否可区分
+        x_ord = from_mont(s.x.x);
+        uint64_t d = distinguishable(x_ord);
+        if (d != 0) {
+            count_dp++;
+        }
+    }
+    return count_rho;
+}
+
+void perf_test_cpu() {
+    RhoPoint_mont adds_pub_tmp[256];
+    for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_mont); i++) {
+        adds_pub_tmp[i].from(adds_pub[0][i]);
+    }
+    RhoPoint_mont s = adds_pub_tmp[0];
+    std::cout << get_time() << " :cpu test start" << std::endl;
+    uint64_t count_rho = perf_fun(s, adds_pub_tmp);
+    std::cout << get_time() << " :cpu test end with " << count_rho << " RhoPoint." << std::endl;
+}
+
+__global__ void perf_test_gpu_kernel()
+{
+    RhoPoint_mont s = adds_pub_dev[0];
+    __shared__ RhoPoint_mont adds_pub[256];
+    // 从全局内存复制adds_pub到共享内存
+    for (int i = 0; i < 256; i++)
+        adds_pub[i] = adds_pub_dev[i];
+    perf_fun(s, adds_pub);
+}
+
+void perf_test_gpu()
+{
+    std::cout << get_time() << " :gpu test start" << std::endl;
+    perf_test_gpu_kernel<<<1, 1>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::cout << get_time() << " :gpu test end with  800000 RhoPoint." << std::endl;
+}
+
 void validate_test()
 {
     init_RhoStates_test(RHOSTATES_TEST_NUM + 1);
@@ -891,26 +938,8 @@ void validate_test()
     }
  
     //性能测试
-    uint64_t count_rho = 0;
-    uint32_t count_dp = 0;
-    RhoPoint_mont adds_pub_tmp[256];
-    for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_mont); i++) {
-        adds_pub_tmp[i].from(adds_pub[0][i]);
-    }
-    RhoPoint_mont s = adds_pub_tmp[0];
-    uint256_t x_ord = from_mont(s.x.x);
-    std::cout << get_time() << " :test start" << std::endl;
-    while (count_rho < 800000) {
-        fun_add(s, adds_pub_tmp[(unsigned char)x_ord.limb[0]]);
-        count_rho++;
-        // 检查是否可区分
-        x_ord = from_mont(s.x.x);
-        uint64_t d = distinguishable(x_ord);
-        if (d != 0) {
-            count_dp++;
-        }
-    }
-    std::cout << get_time() << " :test end with " << count_rho << " RhoPoint." << std::endl;
+    perf_test_cpu();
+    perf_test_gpu();
 
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
