@@ -236,19 +236,16 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
 
             // 处理 x1
             if ((x1.limb[0] & 1) == 0) {
-                // x1 /= 2 (右移)
-                for (int i = 0; i < 7; i++) {
-                    x1.limb[i] = (x1.limb[i] >> 1) | (x1.limb[i + 1] << 31);
-                }
-                x1.limb[7] >>= 1;
+                carry = 0;
             } else {
-                // x1 = (x1 + mod) / 2
+                // x1 = (x1 + mod)
                 carry = add256(&x1, &mod);
-                for (int i = 0; i < 7; i++) {
-                    x1.limb[i] = (x1.limb[i] >> 1) | (x1.limb[i + 1] << 31);
-                }
-                x1.limb[7] = (x1.limb[7] >> 1) | (carry << 31);
             }
+            // x1 /= 2 (右移)
+            for (int i = 0; i < 7; i++) {
+                x1.limb[i] = (x1.limb[i] >> 1) | (x1.limb[i + 1] << 31);
+            }
+            x1.limb[7] = (x1.limb[7] >> 1) | (carry << 31);
         }
         // 当 v 为偶数时
         else if ((v.limb[0] & 1) == 0) {
@@ -260,19 +257,16 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
 
             // 处理 x2
             if ((x2.limb[0] & 1) == 0) {
-                // x2 /= 2 (右移)
-                for (int i = 0; i < 7; i++) {
-                    x2.limb[i] = (x2.limb[i] >> 1) | (x2.limb[i + 1] << 31);
-                }
-                x2.limb[7] >>= 1;
+                carry = 0;
             } else {
-                // x2 = (x2 + mod) / 2
+                // x2 = (x2 + mod)
                 carry = add256(&x2, &mod);
-                for (int i = 0; i < 7; i++) {
-                    x2.limb[i] = (x2.limb[i] >> 1) | (x2.limb[i + 1] << 31);
-                }
-                x2.limb[7] = (x2.limb[7] >> 1) | (carry << 31);
             }
+            // x2 /= 2 (右移)
+            for (int i = 0; i < 7; i++) {
+                x2.limb[i] = (x2.limb[i] >> 1) | (x2.limb[i + 1] << 31);
+            }
+            x2.limb[7] = (x2.limb[7] >> 1) | (carry << 31);
         }
         // 当 u 和 v 都为奇数时
         else {
