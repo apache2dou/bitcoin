@@ -682,6 +682,7 @@ __global__ void rho()
 // 获取最佳线程块大小
 void get_optimal_block_size(int& multiProcessorCount, int& block_size)
 {
+    /*
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
 
@@ -710,7 +711,16 @@ void get_optimal_block_size(int& multiProcessorCount, int& block_size)
     }
     // 确保不超过硬件限制
     block_size = std::min(coresPerSM * multiple, prop.maxThreadsPerBlock);
-    multiProcessorCount = prop.multiProcessorCount;
+    multiProcessorCount = prop.multiProcessorCount;*/
+
+    CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(
+        &multiProcessorCount,
+        &block_size,
+        rho,
+        0, // 无动态共享内存
+        0 // 线程块大小上限
+    ));
+
 }
 
 extern RhoPoint adds_pub[2][256];
