@@ -1581,6 +1581,7 @@ void test_112_helper() {
 #include <csignal>
 
 void validate_test();
+void perf_test();
 int main(int argc, char* argv[])
 {
     // 注册信号处理函数，捕获 SIGINT 信号
@@ -1590,6 +1591,7 @@ int main(int argc, char* argv[])
     work();
 
     //validate_test();
+    //perf_test();
 
     //test();
 

@@ -915,6 +915,13 @@ void perf_test_gpu()
     std::cout << get_time() << " :gpu test end with  800000 RhoPoint." << std::endl;
 }
 
+void perf_test() {
+    // 性能测试
+    init_adds_pub_dev();
+    perf_test_cpu();
+    perf_test_gpu();
+}
+
 void validate_test()
 {
     init_RhoStates_test(RHOSTATES_TEST_NUM + 1);
@@ -941,10 +948,6 @@ void validate_test()
         assert(buffer.sp == r);
     }
  
-    //性能测试
-    perf_test_cpu();
-    perf_test_gpu();
-
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
