@@ -39,8 +39,6 @@ CONSTANT uint256_t R_cube = {
     0x3795f671, 0x002bb1e3, 0x00000b73, 0x00000001,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
-CONSTANT uint32_t np = 0xD2253531;
-
 // 预计算的蒙哥马利常量
 
 CONSTANT uint256_t three_mont = {
@@ -122,7 +120,8 @@ __host__ __device__ uint256_t mont_mul(const uint256_t& a, const uint256_t& b)
         t[8] = carry; // 存储最高位进位
 
         // 步骤2：计算m = (t[0] * np) mod 2^32
-        uint32_t m = (uint32_t)((t[0] * np) & 0xFFFFFFFF);
+        // uint32_t np = 0xD2253531;
+        uint32_t m = (uint32_t)((t[0] * 0xD2253531) & 0xFFFFFFFF);
 
         // 步骤3：加m*p并处理进位
         carry = 0;
@@ -899,7 +898,7 @@ void perf_test_cpu() {
 
 __global__ void perf_test_gpu_kernel()
 {
-    RhoPoint_mont s = adds_pub_dev[0];
+    RhoPoint_mont s = adds_pub_dev[threadIdx.x % 256];
     __shared__ RhoPoint_mont adds_pub[256];
     // 从全局内存复制adds_pub到共享内存
     for (int i = 0; i < 256; i++)
