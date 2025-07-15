@@ -64,42 +64,42 @@ typedef struct {
 
 // ================== 基础算术函数 ==================
 // 返回最终进位状态 (1表示溢出)
-__host__ __device__ uint32_t add256(uint256_t* a, const uint256_t* b)
+__host__ __device__ uint32_t add256(uint256_t& a, const uint256_t& b)
 {
     uint32_t carry = 0;
     for (int i = 0; i < 8; ++i) {
-        uint64_t sum = (uint64_t)a->limb[i] + b->limb[i] + carry;
-        a->limb[i] = (uint32_t)sum;
+        uint64_t sum = (uint64_t)a.limb[i] + b.limb[i] + carry;
+        a.limb[i] = (uint32_t)sum;
         carry = (uint32_t)(sum >> 32);
     }
     return carry;
 }
 
 // 返回最终借位状态 (1表示结果为负)
-__host__ __device__ uint32_t sub256(uint256_t* a, const uint256_t* b)
+__host__ __device__ uint32_t sub256(uint256_t& a, const uint256_t& b)
 {
     uint32_t borrow = 0;
     for (int i = 0; i < 8; ++i) {
-        uint64_t sub = (uint64_t)a->limb[i] - b->limb[i] - borrow;
-        a->limb[i] = (uint32_t)sub;
+        uint64_t sub = (uint64_t)a.limb[i] - b.limb[i] - borrow;
+        a.limb[i] = (uint32_t)sub;
         borrow = (uint32_t)((sub >> 32) & 1);
     }
     return borrow;
 }
 
-__host__ __device__ int is_ge(const uint256_t* a, const uint256_t* b)
+__host__ __device__ int is_ge(const uint256_t& a, const uint256_t& b)
 {
     for (int i = 7; i >= 0; --i) {
-        if (a->limb[i] > b->limb[i]) return 1;
-        if (a->limb[i] < b->limb[i]) return 0;
+        if (a.limb[i] > b.limb[i]) return 1;
+        if (a.limb[i] < b.limb[i]) return 0;
     }
     return 1;
 }
 
-__host__ __device__ int is_zero(const uint256_t* a)
+__host__ __device__ int is_zero(const uint256_t& a)
 {
     for (int i = 0; i < 8; ++i)
-        if (a->limb[i] != 0) return 0;
+        if (a.limb[i] != 0) return 0;
     return 1;
 }
 
@@ -147,8 +147,8 @@ __host__ __device__ uint256_t mont_mul(const uint256_t& a, const uint256_t& b)
     }
 
     // 最终模约简
-    if ((t[7]&0xF00000000) || is_ge(&result, &p)) {
-        sub256(&result, &p);
+    if ((t[7]&0xF00000000) || is_ge(result, p)) {
+        sub256(result, p);
     }
     return result;
 }
@@ -158,25 +158,25 @@ __host__ __device__ uint256_t mod_add(const uint256_t& a, const uint256_t& b, co
     uint256_t result = a;
 
     // 执行加法并检测进位
-    uint32_t carry = add256(&result, &b);
+    uint32_t carry = add256(result, b);
 
     // 处理溢出情况：进位发生或结果 >= m
-    if (carry || is_ge(&result, &m)) {
-        sub256(&result, &m); // 减去模数m
+    if (carry || is_ge(result, m)) {
+        sub256(result, m); // 减去模数m
     }
     return result;
 }
 
-__host__ __device__ uint256_t mod_sub(const uint256_t& a, const uint256_t& b, const uint256_t& m)
+__host__ __device__ uint256_t mont_sub(const uint256_t& a, const uint256_t& b)
 {
     uint256_t result = a;
 
     // 执行减法并检测借位
-    uint32_t borrow = sub256(&result, &b);
+    uint32_t borrow = sub256(result, b);
 
     // 处理负数结果
     if (borrow) {
-        add256(&result, &m); // 加上模数m
+        add256(result, p); // 加上模数p
     }
     return result;
 }
@@ -186,7 +186,7 @@ __host__ __device__ uint256_t mont_inv(const uint256_t a)
     uint256_t result = R; // 1 in Montgomery form
     uint256_t exponent = p;
     uint256_t two = {{2}};
-    sub256(&exponent, &two); // p-2
+    sub256(exponent, two); // p-2
 
     for (int i = 255; i >= 0; --i) {
         result = mont_mul(result, result);
@@ -200,7 +200,7 @@ __host__ __device__ uint256_t mont_inv(const uint256_t a)
 __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
 {
     // 特殊情况处理：0 没有逆元
-    if (is_zero(&a)) {
+    if (is_zero(a)) {
         return a; // 返回 0
     }
 
@@ -212,7 +212,7 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
     uint32_t carry;
 
     // 迭代直到 v 为 0
-    while (!is_zero(&v)) {
+    while (!is_zero(v)) {
         // 检查提前退出条件：u == 1 或 v == 1
         if (u.limb[0] == 1 && u.limb[1] == 0 && u.limb[2] == 0 && u.limb[3] == 0 &&
             u.limb[4] == 0 && u.limb[5] == 0 && u.limb[6] == 0 && u.limb[7] == 0) {
@@ -238,7 +238,7 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
                 carry = 0;
             } else {
                 // x1 = (x1 + mod)
-                carry = add256(&x1, &mod);
+                carry = add256(x1, mod);
             }
             // x1 /= 2 (右移)
             for (int i = 0; i < 7; i++) {
@@ -259,7 +259,7 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
                 carry = 0;
             } else {
                 // x2 = (x2 + mod)
-                carry = add256(&x2, &mod);
+                carry = add256(x2, mod);
             }
             // x2 /= 2 (右移)
             for (int i = 0; i < 7; i++) {
@@ -269,37 +269,37 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
         }
         // 当 u 和 v 都为奇数时
         else {
-            if (is_ge(&u, &v)) {
+            if (is_ge(u, v)) {
                 // u = u - v
-                sub256(&u, &v);
+                sub256(u, v);
 
                 // x1 = x1 - x2
-                if (is_ge(&x1, &x2)) {
-                    sub256(&x1, &x2);
+                if (is_ge(x1, x2)) {
+                    sub256(x1, x2);
                 } else {
                     uint256_t temp = mod;
-                    sub256(&temp, &x2);
-                    add256(&x1, &temp);
+                    sub256(temp, x2);
+                    add256(x1, temp);
                 }
             } else {
                 // v = v - u
-                sub256(&v, &u);
+                sub256(v, u);
 
                 // x2 = x2 - x1
-                if (is_ge(&x2, &x1)) {
-                    sub256(&x2, &x1);
+                if (is_ge(x2, x1)) {
+                    sub256(x2, x1);
                 } else {
                     uint256_t temp = mod;
-                    sub256(&temp, &x1);
-                    add256(&x2, &temp);
+                    sub256(temp, x1);
+                    add256(x2, temp);
                 }
             }
         }
     }
 
     // 确保结果在 [0, mod-1] 范围内
-    if (is_ge(&x1, &mod)) {
-        sub256(&x1, &mod);
+    if (is_ge(x1, mod)) {
+        sub256(x1, mod);
     }
 
     return x1;
@@ -334,10 +334,10 @@ __host__ __device__ AffinePoint mont_point_add(const AffinePoint& P_mont, const 
     R.y = {{0}};
     R.infinity = true;
 
-    uint256_t x_diff = mod_sub(Q_mont.x, P_mont.x, p);
-    if (is_zero(&x_diff)) {
+    uint256_t x_diff = mont_sub(Q_mont.x, P_mont.x);
+    if (is_zero(x_diff)) {
         uint256_t y_sum = mod_add(P_mont.y, Q_mont.y, p);
-        if (is_zero(&y_sum)) {
+        if (is_zero(y_sum)) {
             return R;
         }
 
@@ -346,20 +346,20 @@ __host__ __device__ AffinePoint mont_point_add(const AffinePoint& P_mont, const 
         uint256_t lambda = mont_mul(numerator, mont_inv2(y_sum));
 
         uint256_t lambda_sq = mont_mul(lambda, lambda);
-        R.x = mod_sub(lambda_sq, mod_add(P_mont.x, P_mont.x, p), p);
+        R.x = mont_sub(lambda_sq, mod_add(P_mont.x, P_mont.x, p));
 
-        uint256_t temp = mont_mul(lambda, mod_sub(P_mont.x, R.x, p));
-        R.y = mod_sub(temp, P_mont.y, p);
+        uint256_t temp = mont_mul(lambda, mont_sub(P_mont.x, R.x));
+        R.y = mont_sub(temp, P_mont.y);
     } else {
-        uint256_t y_diff = mod_sub(Q_mont.y, P_mont.y, p);
+        uint256_t y_diff = mont_sub(Q_mont.y, P_mont.y);
         uint256_t lambda = mont_mul(y_diff, mont_inv2(x_diff));
 
         uint256_t lambda_sq = mont_mul(lambda, lambda);
-        R.x = mod_sub(lambda_sq, P_mont.x, p);
-        R.x = mod_sub(R.x, Q_mont.x, p);
+        R.x = mont_sub(lambda_sq, P_mont.x);
+        R.x = mont_sub(R.x, Q_mont.x);
 
-        uint256_t temp = mont_mul(lambda, mod_sub(P_mont.x, R.x, p));
-        R.y = mod_sub(temp, P_mont.y, p);
+        uint256_t temp = mont_mul(lambda, mont_sub(P_mont.x, R.x));
+        R.y = mont_sub(temp, P_mont.y);
     }
 
     R.infinity = false;
@@ -667,7 +667,7 @@ __global__ void rho()
             // 保存可区分点
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
         }
-        if ((count_rho & 0xFFF) == 0) {
+        if ((count_rho & 0xFFFF) == 0) {
             if (*break_flag_dev)
                 break;
         }
@@ -824,7 +824,7 @@ __global__ void validate_1()
 
     // 测试1.1: G+(-G)
     AffinePoint res_1G;
-    uint256_t _y = mod_sub({0}, G.y, p);
+    uint256_t _y = mont_sub({0}, G.y);
     res_1G.x = G.x;
     res_1G.y = _y;
     res_1G.infinity = false;
