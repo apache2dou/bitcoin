@@ -342,7 +342,7 @@ __host__ __device__ AffinePoint mont_point_add(const AffinePoint& P_mont, const 
         }
 
         uint256_t x_sq = mont_mul(P_mont.x, P_mont.x);
-        uint256_t numerator = mont_mul(x_sq, three_mont);
+        uint256_t numerator = mont_mul(x_sq, three_mont); //改为加法的话，会产生负优化。
         uint256_t lambda = mont_mul(numerator, mont_inv2(y_sum));
 
         uint256_t lambda_sq = mont_mul(lambda, lambda);
@@ -650,6 +650,7 @@ __global__ void rho()
     uint32_t count_dp = 0;
     // 设备共享内存存储 adds_pub
     __shared__ RhoPoint_mont adds_pub[256];
+    // 共享内存产生的优化微乎其微， 2% 左右，但会多占用10个寄存器。
     // 从全局内存复制adds_pub到共享内存
     if (threadIdx.x == 0) {
         for (int i = 0; i < 256; i++)
