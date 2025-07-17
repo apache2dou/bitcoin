@@ -404,6 +404,15 @@ public:
         x.y = to_mont(x.y);
         x.infinity = false;
     }
+    void to(RhoPoint& r)
+    {
+        AffinePoint x_ = {{0}};
+        x_.x = from_mont(x.x);
+        x_.y = from_mont(x.y);
+        memcpy(r.x.data, &x_.x, sizeof(r.x.data));
+        transfer(r.m, (unsigned char*)&this->m);
+        transfer(r.n, (unsigned char*)&this->n);
+    }
     __device__ bool operator==(const RhoPoint_mont& other) const
     {
         const unsigned char* a = (const unsigned char*)&this->m;
@@ -734,18 +743,42 @@ void init_adds_pub_dev()
     }
 }
 
-void init_RhoStates_dev(int total_points)
+static const std::string _RSFile2_name = "D:\\RhoState2.txt";
+bool loadRhoState(RhoState* s, int num, const std::string& name);
+bool saveRhoState(const RhoState* s, int num, const std::string& name);
+
+void init_RhoStates_dev(int total_points, const std::string& name)
 {
     //分配设备内存并复制初始状态
     CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_mont)));
     CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_mont*)));
+    std::vector<RhoState> rsv;
+    rsv.resize(total_points);
+    bool b = loadRhoState(rsv.data(), total_points, name);
     for (int i = 0; i < total_points; i++) {
-        RhoPoint r;
-        r.rand();
         RhoPoint_mont t;
-        t.from(r);
+        if (b) {
+            t.from(rsv[i]);
+        } else {
+            RhoPoint r;
+            r.rand();
+            t.from(r);
+        }
         CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_mont), cudaMemcpyHostToDevice));
     }
+}
+
+void save_RhoStates_dev(int total_points, const std::string& name)
+{
+    std::vector<RhoState> rsv;
+    rsv.resize(total_points);
+    for (int i = 0; i < total_points; i++) {
+        RhoPoint_mont t;
+        CHECK_CUDA(cudaMemcpy(&t, RhoStates_host + i, sizeof(RhoPoint_mont), cudaMemcpyDeviceToHost));
+        t.to(rsv[i]);
+        rsv[i].times = 0;
+    }
+    saveRhoState(rsv.data(), total_points, name);
 }
 
 extern secp256k1_context* ctx;
@@ -779,7 +812,7 @@ void rho_play() {
     get_optimal_block_size(multiProcessorCount, blockSize);
     std::cout << get_time() << " : multiProcessorCount: " << multiProcessorCount << ", blockSize : " << blockSize << std::endl;
     int total_points = multiProcessorCount * blockSize;
-    init_RhoStates_dev(total_points);
+    init_RhoStates_dev(total_points, _RSFile2_name);
     init_adds_pub_dev();
     // 初始化零拷贝内存
     init_zero_copy_memory();
@@ -790,6 +823,7 @@ void rho_play() {
         CHECK_CUDA(cudaDeviceSynchronize());
         dp_manager.save_dps();
     }
+    save_RhoStates_dev(total_points, _RSFile2_name);
     // 清理资源
     free_zero_copy_memory();
     CHECK_CUDA(cudaFree(RhoStates_host));
@@ -938,7 +972,7 @@ void validate_test()
 
     //测试转换逻辑
     for (int i = 0; i < 4096; i++) {
-        RhoState r;
+        RhoPoint r, r2;
         r.rand();
         RhoPoint_mont t;
         t.from(r);
@@ -946,8 +980,37 @@ void validate_test()
         transfer(buffer.sp.m, (const unsigned char*)&t.m);
         transfer(buffer.sp.n, (const unsigned char*)&t.n);
         assert(buffer.sp == r);
+        t.to(r2);
+        assert(memcmp(&r, &r2, sizeof(r2)) == 0);
     }
- 
+
+    // 清理资源
+    CHECK_CUDA(cudaFree(RhoStates_host));
+    RhoStates_host = nullptr;
+
+    //测试init_RhoStates_dev 和 save_RhoStates_dev
+    int points = 100 * 960;
+    const std::string fn_ = "D:\\test_rs.txt";
+    const std::string fn2_ = "D:\\test_rs2.txt";
+    init_RhoStates_dev(points, fn_);
+    save_RhoStates_dev(points, fn_);
+    std::vector<RhoState> rsv, rsv2;
+    rsv.resize(points);
+    rsv2.resize(points);
+    bool b = loadRhoState(rsv.data(), points, fn_);
+    // 清理资源
+    CHECK_CUDA(cudaFree(RhoStates_host));
+    RhoStates_host = nullptr;
+    init_RhoStates_dev(points, fn_);
+    save_RhoStates_dev(points, fn2_);
+    loadRhoState(rsv2.data(), points, fn2_);
+    for (int i = 0; i < points; i++) {
+        assert(check(ctx, &rsv[i].x, rsv[i].m, rsv[i].n));
+        assert(memcmp(&rsv[i], &rsv2[i], sizeof(rsv[i])) == 0);
+    }
+    std::remove(fn_.c_str());
+    std::remove(fn2_.c_str());
+
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;

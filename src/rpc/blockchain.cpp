@@ -3048,7 +3048,9 @@ bool RhoPoint::rand()
 }
 
 
-bool loadRhoState(RhoState* s, int num)
+static const std::string _RSFile1_name = "D:\\RhoState.txt";
+
+bool loadRhoState(RhoState* s, int num, const std::string& name)
 {
     auto loadrs = [](std::ifstream& file, RhoState& s) {
         std::string line;
@@ -3061,15 +3063,18 @@ bool loadRhoState(RhoState* s, int num)
             memcpy(s.n, ParseHex(line).data(), sizeof(s.n));
             std::getline(file, line); // 读取一行到字符串line
             sscanf(line.c_str(), "%llu", &s.times);
+            return true;
 
         } else {
             std::cerr << "Unable to open file" << std::endl;
+            return false;
         }
     };
 
-    std::ifstream file("D:\\RhoState.txt"); // 打开文件
+    std::ifstream file(name); // 打开文件
     for (int i = 0; i < num; i++) {
-        loadrs(file, s[i]);
+        if(!loadrs(file, s[i]))
+            return false;
     }
     file.close(); // 关闭文件
 
@@ -3077,7 +3082,7 @@ bool loadRhoState(RhoState* s, int num)
 }
 
 
-bool saveRhoState(const RhoState* s, int num)
+bool saveRhoState(const RhoState* s, int num, const std::string& name)
 {
     auto savers = [](std::ofstream& file, const RhoState& s) {
         file << HexStr(s.x.data) << std::endl;
@@ -3085,7 +3090,7 @@ bool saveRhoState(const RhoState* s, int num)
         file << HexStr(s.n) << std::endl;
         file << s.times << std::endl;
     };
-    std::ofstream file("D:\\RhoState.txt"); // 打开文件
+    std::ofstream file(name); // 打开文件
     for (int i = 0; i < num; i++) {
         savers(file, s[i]);
     }
@@ -3102,7 +3107,6 @@ static secp256k1_pubkey pk_mvp;
 
 RhoPoint adds_pub[2][256] = {0};
 
-int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs);
 
 void stop_game() {
@@ -3641,7 +3645,7 @@ template <typename PLAYER>
 void play() {
     std::string _logvec[256];
     RhoState rs[256] = {0};
-    loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
+    loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
     for (RhoState& r : rs) {
         assert(check(ctx, &r.x, r.m, r.n));
     }
@@ -3684,7 +3688,7 @@ void play() {
     for (auto& t : threads) {
         t.join();
     }
-    saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
+    saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
     g_log->ofs << get_time() << " : ";
     for (int i = 0; i < n_tasks; i++) {
         g_log->ofs << _logvec[i];
@@ -4060,13 +4064,13 @@ static RPCHelpMan testmvp()
                 }
             }
 
-            auto initRhoState = [&]() {
+            auto initRhoState = []() {
                 RhoState rs[256] = {0};
                 for (RhoState& r : rs) {
                     r.rand();                    
                     r.times = 0;
                 }
-                saveRhoState(rs, sizeof(rs) / sizeof(RhoState));
+                saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
 
 
                 g_log->ofs << "====RhoState refreshed at " << get_time() << std::endl;
@@ -4076,7 +4080,7 @@ static RPCHelpMan testmvp()
                 initRhoState();
 
                 RhoState rs2[256] = {0};
-                loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState));
+                loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState), _RSFile1_name);
                 for (RhoState& r : rs2) {
                     assert(check(ctx, &r.x, r.m, r.n));
                 }
@@ -4084,7 +4088,7 @@ static RPCHelpMan testmvp()
             //测试 rho_F 与 rho_Fi 或者 giantStep 与 giantStepi
             if (ta == 121) {
                 RhoState rs[256] = {0};
-                loadRhoState(rs, sizeof(rs) / sizeof(RhoState));
+                loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
                 auto f = rho_F;
                 auto fi = rho_Fi;
                 if (ta2 == 1) {
