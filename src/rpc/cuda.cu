@@ -676,6 +676,7 @@ __global__ void rho()
             count_dp++;
             // 保存可区分点
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
+            x_ord.limb[0] = 1;
         }
         if ((count_rho & 0xFFFF) == 0) {
             if (*break_flag_dev)
