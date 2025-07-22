@@ -648,7 +648,7 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_mont& point)
 }
 
 
-constexpr size_t dp_buffer_size = 40000; // DP 缓冲区大小
+constexpr size_t dp_buffer_size = 210; // DP 缓冲区大小
 __global__ void rho()
 {
     // 获取全局线程索引
@@ -780,6 +780,7 @@ void save_RhoStates_dev(int total_points, const std::string& name)
         rsv[i].times = 0;
     }
     saveRhoState(rsv.data(), total_points, name);
+    std::cout << get_time() << " : save_RhoStates_dev. " << std::endl;
 }
 
 extern secp256k1_context* ctx;
@@ -823,8 +824,8 @@ void rho_play() {
         // 等待核函数完成
         CHECK_CUDA(cudaDeviceSynchronize());
         dp_manager.save_dps();
+        save_RhoStates_dev(total_points, _RSFile2_name);
     }
-    save_RhoStates_dev(total_points, _RSFile2_name);
     // 清理资源
     free_zero_copy_memory();
     CHECK_CUDA(cudaFree(RhoStates_host));

@@ -58,6 +58,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <barrier>
 
 using kernel::CCoinsStats;
 using kernel::CoinStatsHashType;
@@ -3645,12 +3646,19 @@ template <typename PLAYER>
 void play() {
     std::string _logvec[256];
     RhoState rs[256] = {0};
+    bool pause = false;
     loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
     for (RhoState& r : rs) {
         assert(check(ctx, &r.x, r.m, r.n));
     }
     PLAYER _player;
     _player.prepare();
+    int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
+    assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
+    auto saveStates = [&]() noexcept {
+        saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
+    };
+    std::barrier barrier(n_tasks, saveStates);
     auto T = [&](int i) {
         uint64_t count_try{0};
         unsigned int count_dstg{0};
@@ -3661,6 +3669,17 @@ void play() {
                 _player.shoot(i, rs[i], count_dstg, _logvec[i]);
             } catch (...) {
                 stop_game();
+            }
+            if (i == 0 && (count_try & 0x7FFFFFFF) == 0) {
+                pause = true;
+                g_log->ofs << get_time() << " : game pause!" << std::endl;
+            }
+            if (pause) {
+                barrier.arrive_and_wait();
+                if (i == 0)
+                {
+                    pause = false;
+                }
             }
         }
         std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -3678,8 +3697,6 @@ void play() {
     };
 
     std::vector<std::thread> threads;
-    int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
-    assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
     threads.reserve(n_tasks + 1);
     for (int i = 0; i < n_tasks; ++i) {
         threads.emplace_back(T, i);
@@ -3688,7 +3705,7 @@ void play() {
     for (auto& t : threads) {
         t.join();
     }
-    saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
+    saveStates();
     g_log->ofs << get_time() << " : ";
     for (int i = 0; i < n_tasks; i++) {
         g_log->ofs << _logvec[i];
