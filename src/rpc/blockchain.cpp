@@ -3655,10 +3655,14 @@ void play() {
     _player.prepare();
     int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
     assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
-    auto saveStates = [&]() noexcept {
+    auto saveStates = [&]() {
         saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
     };
-    std::barrier barrier(n_tasks, saveStates);
+    auto on_barrier = [&]() noexcept {
+        saveStates();
+        pause = false;
+    };
+    std::barrier barrier(n_tasks, on_barrier);
     auto T = [&](int i) {
         uint64_t count_try{0};
         unsigned int count_dstg{0};
@@ -3672,14 +3676,10 @@ void play() {
             }
             if (i == 0 && (count_try & 0x7FFFFFFF) == 0) {
                 pause = true;
-                g_log->ofs << get_time() << " : game pause!" << std::endl;
+                std::cout << get_time() << " : game pause!" << std::endl;
             }
             if (pause) {
                 barrier.arrive_and_wait();
-                if (i == 0)
-                {
-                    pause = false;
-                }
             }
         }
         std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -3694,6 +3694,7 @@ void play() {
 
             _logvec[i] += ss.str();
         }
+        std::cout << "thread " << i << " exit." << std::endl;
     };
 
     std::vector<std::thread> threads;

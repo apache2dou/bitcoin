@@ -830,6 +830,7 @@ void rho_play() {
     free_zero_copy_memory();
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
+    std::cout << "rho_play exit." << std::endl;
 }
 
 // ================== 验证测试 ==================
