@@ -648,7 +648,7 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_mont& point)
 }
 
 
-constexpr size_t dp_buffer_size = 210; // DP 缓冲区大小
+constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
 __global__ void rho()
 {
     // 获取全局线程索引

@@ -3504,7 +3504,7 @@ void play() {
             } catch (...) {
                 stop_game();
             }
-            if (i == 0 && (count_try & 0x7FFFFFFF) == 0) {
+            if (i == 0 && (count_try & 0x3FFFFFFF) == 0) {
                 pause = true;
                 std::cout << get_time() << " : game pause!" << std::endl;
             }
