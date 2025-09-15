@@ -3489,6 +3489,7 @@ void play() {
         saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
     };
     auto on_barrier = [&]() noexcept {
+        iLog _dplog(_DPFile_name);
         saveStates();
         pause = false;
     };
