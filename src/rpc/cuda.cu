@@ -430,6 +430,10 @@ public:
 // 设备常量内存存储 adds_pub_dev
 __constant__ RhoPoint_mont adds_pub_dev[256];
 
+
+constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
+__constant__ RhoPoint_mont RhoStates_rand[dp_buffer_size];
+
 // 可区分点判断 (设备端)
 __host__ __device__ uint64_t distinguishable(const uint256_t& x)
 {
@@ -453,20 +457,11 @@ struct DpBuffer {
     SecPair sp;
 };
 
-// 零拷贝内存管理
-struct ZeroCopyMemory {
-    volatile bool* break_flag; // 主机和设备共享的指针
-    bool* host_ptr;            // 主机端指针
-    bool* device_ptr;          // 设备端指针
-};
-
-ZeroCopyMemory zero_copy_mem;
-
 // 设备端 DP 缓冲区管理
 __device__ DpBuffer* dp_device_buffer = nullptr; // 设备缓冲区指针
 __device__ unsigned int dp_buffer_count = 0;     // 缓冲区当前计数
 __device__ volatile bool* break_flag_dev = nullptr;
-
+bool* break_flag_host = nullptr;                // 主机端指针
 extern bool gameover;
 
 
@@ -474,7 +469,7 @@ RhoPoint_mont* RhoStates_host = nullptr;
 __device__ RhoPoint_mont* RhoStates_dev = nullptr;
 
 // 添加 DP 到缓冲区 (设备端)
-__device__ void add_dp_to_buffer(uint64_t d, const RhoPoint_mont& r,
+__device__ void add_dp_to_buffer(uint64_t d, RhoPoint_mont& r,
                                  DpBuffer* buffer, unsigned int max_size)
 {
     // 原子递增获取缓冲区位置
@@ -485,46 +480,49 @@ __device__ void add_dp_to_buffer(uint64_t d, const RhoPoint_mont& r,
         transfer(buffer[index].sp.m , (const unsigned char*)&r.m);
         transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
     }
+
+    r = RhoStates_rand[index];
+
     if (dp_buffer_count >= max_size)
         *break_flag_dev = true;
 }
 
-// 初始化零拷贝内存
-void init_zero_copy_memory()
+// 初始化break_flag内存
+void init_break_flag()
 {
     // 分配页锁定内存（主机可访问）
-    CHECK_CUDA(cudaHostAlloc((void**)&zero_copy_mem.host_ptr,
+    CHECK_CUDA(cudaHostAlloc((void**)&break_flag_host,
                              sizeof(bool),
                              cudaHostAllocMapped));
 
     // 获取设备可访问的指针
-    CHECK_CUDA(cudaHostGetDevicePointer((void**)&zero_copy_mem.device_ptr,
-                                        zero_copy_mem.host_ptr,
+    bool* device_ptr = nullptr;
+    CHECK_CUDA(cudaHostGetDevicePointer((void**)&device_ptr,
+                                        break_flag_host,
                                         0));
 
     // 设置初始值
-    *zero_copy_mem.host_ptr = false;
+    *break_flag_host = false;
 
     // 将设备指针复制到设备全局变量
     CHECK_CUDA(cudaMemcpyToSymbol(break_flag_dev,
-                                  &zero_copy_mem.device_ptr,
+                                  &device_ptr,
                                   sizeof(volatile bool*)));
 }
 
-// 释放零拷贝内存
-void free_zero_copy_memory()
+// 释放break_flag内存
+void free_break_flag()
 {
-    if (zero_copy_mem.host_ptr) {
-        CHECK_CUDA(cudaFreeHost(zero_copy_mem.host_ptr));
-        zero_copy_mem.host_ptr = nullptr;
-        zero_copy_mem.device_ptr = nullptr;
+    if (break_flag_host) {
+        CHECK_CUDA(cudaFreeHost(break_flag_host));
+        break_flag_host = nullptr;
     }
 }
 
 void break_rho(bool value)
 {
-    if (zero_copy_mem.host_ptr) {
-        *zero_copy_mem.host_ptr = value;
+    if (break_flag_host) {
+        *break_flag_host = value;
     }
 }
 
@@ -648,7 +646,6 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_mont& point)
 }
 
 
-constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
 __global__ void rho()
 {
     // 获取全局线程索引
@@ -657,6 +654,7 @@ __global__ void rho()
     uint256_t x_ord = from_mont(s.x.x);
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
+    /*
     // 设备共享内存存储 adds_pub
     __shared__ RhoPoint_mont adds_pub[256];
     // 共享内存产生的优化微乎其微， 2% 左右，但会多占用10个寄存器。
@@ -666,8 +664,9 @@ __global__ void rho()
             adds_pub[i] = adds_pub_dev[i];
     }
     __syncthreads(); // 确保所有线程已完成加载
+    */
     while (true) {
-        fun_add(s, adds_pub[(unsigned char)x_ord.limb[0]]);
+        fun_add(s, adds_pub_dev[(unsigned char)x_ord.limb[0]]);
         count_rho++;
         // 检查是否可区分
         x_ord = from_mont(s.x.x);
@@ -676,7 +675,7 @@ __global__ void rho()
             count_dp++;
             // 保存可区分点
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
-            x_ord.limb[0] = (uint32_t)count_rho;
+            x_ord = from_mont(s.x.x);
         }
         if ((count_rho & 0xFFFF) == 0) {
             if (*break_flag_dev)
@@ -741,6 +740,16 @@ void init_adds_pub_dev()
         RhoPoint_mont t;
         t.from(adds_pub[0][i]);
         CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_dev, &t, sizeof(RhoPoint_mont), sizeof(RhoPoint_mont) * i, cudaMemcpyHostToDevice));
+    }
+}
+
+void init_RhoStates_rand() {
+    for (int i = 0; i < sizeof(RhoStates_rand) / sizeof(RhoPoint_mont); i++) {
+        RhoPoint_mont t;
+        RhoPoint r;
+        r.rand();
+        t.from(r);
+        CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_rand, &t, sizeof(RhoPoint_mont), sizeof(RhoPoint_mont) * i, cudaMemcpyHostToDevice));
     }
 }
 
@@ -816,10 +825,11 @@ void rho_play() {
     int total_points = multiProcessorCount * blockSize;
     init_RhoStates_dev(total_points, _RSFile2_name);
     init_adds_pub_dev();
-    // 初始化零拷贝内存
-    init_zero_copy_memory();
+    // 初始化break_flag
+    init_break_flag();
     while (!gameover) {
         break_rho(false);
+        init_RhoStates_rand();
         rho<<<multiProcessorCount, blockSize>>>();
         // 等待核函数完成
         CHECK_CUDA(cudaDeviceSynchronize());
@@ -827,7 +837,7 @@ void rho_play() {
         save_RhoStates_dev(total_points, _RSFile2_name);
     }
     // 清理资源
-    free_zero_copy_memory();
+    free_break_flag();
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
     std::cout << "rho_play exit." << std::endl;
@@ -963,7 +973,7 @@ void validate_test()
 {
     init_RhoStates_test(RHOSTATES_TEST_NUM + 1);
     init_adds_pub_dev();
-    init_zero_copy_memory();
+    init_break_flag();
     DpManager dp_manager(RHODP_TEST_NUM + 10);
        
     validate_multi<<<10, 256>>>();
