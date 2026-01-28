@@ -3477,7 +3477,12 @@ void play() {
     std::string _logvec[256];
     RhoState rs[256] = {0};
     bool pause = false;
-    loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
+    if (!loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name)) {
+        for (RhoState& r : rs) {
+            r.rand();
+            r.times = 0;
+        }
+    }
     for (RhoState& r : rs) {
         assert(check(ctx, &r.x, r.m, r.n));
     }
