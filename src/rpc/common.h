@@ -2,6 +2,8 @@
 #define BITCOIN_RPC_COMMON_H
 #include "../../secp256k1/include/secp256k1.h"
 
+#include <string>
+
 class SecPair
 {
 public:
@@ -30,4 +32,8 @@ void set_int(unsigned char* cn, int64_t n);
 void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
 std::string get_time();
+void break_rho(bool value);
+void rho_play();
+void validate_test();
+void perf_test();
 #endif // BITCOIN_RPC_COMMON_H

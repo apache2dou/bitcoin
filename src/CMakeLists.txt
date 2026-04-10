@@ -299,6 +299,21 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
 )
 
+if(BUILD_BITCOIN_CUDA)
+  target_sources(bitcoin_node PRIVATE rpc/cuda.cu)
+  target_link_libraries(bitcoin_node PRIVATE CUDA::cudart)
+  target_compile_options(bitcoin_node PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--forward-unknown-to-host-compiler>
+    $<$<COMPILE_LANGUAGE:CUDA>:--forward-slash-prefix-opts>
+  )
+  set_target_properties(bitcoin_node PROPERTIES
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+  )
+else()
+  target_sources(bitcoin_node PRIVATE rpc/cuda_stub.cpp)
+endif()
+
 
 # Bitcoin Core bitcoind.
 if(BUILD_DAEMON)

@@ -7,9 +7,9 @@
 #include <cstdio>
 
 // 256-bit数值（小端序，32位肢体）
-typedef struct {
+struct uint256_t {
     uint32_t limb[8];
-} uint256_t;
+};
 
 #ifdef __CUDA_ARCH__
 #define CONSTANT __constant__
@@ -46,11 +46,11 @@ CONSTANT uint256_t three_mont = {
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
 // 点结构（仿射坐标）
-typedef struct {
-    uint256_t x = {0};
-    uint256_t y = {0};
-    bool infinity = true;
-} AffinePoint;
+struct AffinePoint {
+    uint256_t x;
+    uint256_t y;
+    bool infinity;
+};
 
 // CUDA错误检查宏
 #define CHECK_CUDA(call)                                                                                \
