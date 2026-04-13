@@ -1,4 +1,5 @@
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -939,9 +940,11 @@ void perf_test_cpu() {
         adds_pub_tmp[i].from(adds_pub[0][i]);
     }
     RhoPoint_mont s = adds_pub_tmp[0];
-    std::cout << get_time() << " :cpu test start" << std::endl;
+    const auto start = std::chrono::steady_clock::now();
     uint64_t count_rho = perf_fun(s, adds_pub_tmp);
-    std::cout << get_time() << " :cpu test end with " << count_rho << " RhoPoint." << std::endl;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    std::cout << "cpu test elapsed: " << elapsed.count() << " ms, with " << count_rho << " RhoPoint." << std::endl;
 }
 
 __global__ void perf_test_gpu_kernel()
@@ -956,10 +959,20 @@ __global__ void perf_test_gpu_kernel()
 
 void perf_test_gpu()
 {
-    std::cout << get_time() << " :gpu test start" << std::endl;
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+    CHECK_CUDA(cudaEventRecord(start));
     perf_test_gpu_kernel<<<1, 1>>>();
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
     CHECK_CUDA(cudaDeviceSynchronize());
-    std::cout << get_time() << " :gpu test end with  800000 RhoPoint." << std::endl;
+    float elapsed_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    std::cout << "gpu test elapsed: " << elapsed_ms << " ms, with 800000 RhoPoint." << std::endl;
 }
 
 void perf_test() {
