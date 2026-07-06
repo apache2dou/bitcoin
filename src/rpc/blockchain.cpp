@@ -4013,24 +4013,26 @@ static RPCHelpMan testmvp()
                 if (ta2 == 1) {
                     // 检查DP文件中是否存在碰撞，若存在则计算bingo
                     std::map<uint64_t, SecPair> dpMap;
-                    iLog _dplog(_DPFile_name);
-                    std::string line;
-                    if (_dplog.ifs.is_open()) {
-                        int count_error = 0;
-                        while (std::getline(_dplog.ifs, line)) {
+
+                    // 处理单个DP文件流：解析每条记录(三行一组)并入dpMap，检测碰撞
+                    // 返回值: 0=正常读完(EOF); 非0=遇到错误或碰撞(应停止后续处理)
+                    auto processDPStream = [&](std::istream& ifs) -> int {
+                        std::string line;
+                        while (std::getline(ifs, line)) {
                             uint64_t dp_index;
                             SecPair sp;
                             sscanf(line.c_str(), "%llu", &dp_index);
-                            std::getline(_dplog.ifs, line);
+                            if (!std::getline(ifs, line)) break;
                             memcpy(sp.m, ParseHex(line).data(), sizeof(sp.m));
-                            std::getline(_dplog.ifs, line);
+                            if (!std::getline(ifs, line)) break;
                             memcpy(sp.n, ParseHex(line).data(), sizeof(sp.n));
 
                             secp256k1_pubkey x_tmp;
                             create(ctx, &x_tmp, sp.m, sp.n);
                             if (dp_index != distinguishable(x_tmp)) {
-                                count_error++;
-                                continue;
+                                unspent.pushKV("str", "!!!!Error!!!! dp_index: " + std::to_string(dp_index));
+                                unspent.pushKV("str2", HexStr(x_tmp.data) + " : " + HexStr(sp.m) + " : " + HexStr(sp.n));
+                                return 1;
                             }
                             auto iter = dpMap.find(dp_index);
                             if (iter != dpMap.end()) {
@@ -4038,21 +4040,78 @@ static RPCHelpMan testmvp()
                                 if (bingo(ctx, k, sp, iter->second)) {
                                     save_key(k);
                                     unspent.pushKV("str", "!!!!bingo!!!!");
+                                    return 2;
                                 } else {
                                     unspent.pushKV("str", "!!!!short circulation!!!!");
                                     unspent.pushKV("str2", std::to_string(dp_index));
+                                    return 3;
                                 }
-                                break;
                             } else {
                                 dpMap[dp_index] = sp;
                             }
                         }
-                        if (count_error > 0) {
-                            unspent.pushKV("str", "!!!!Error!!!!");
-                            unspent.pushKV("str2", "count_error: " + std::to_string(count_error));
+                        return 0;
+                    };
+
+                    bool stop = false;
+
+                    // 1) 处理主DP文件 D:\DistinguishablePoints.txt
+                    {
+                        iLog _dplog(_DPFile_name);
+                        if (_dplog.ifs.is_open()) {
+                            if (processDPStream(_dplog.ifs) != 0) {
+                                stop = true;
+                            }
                         }
-                        unspent.pushKV("num", dpMap.size());
                     }
+
+                    // 2) 继续读取 ../../../../data 下的额外DP文件
+                    //    - DistinguishablePoints_rho.txt
+                    //    - DistinguishablePoints_rhoN.txt (N为数字)
+                    const std::string dataDir = "../../../../data/";
+                    const fs::path dataDirPath = fs::u8path(dataDir);
+                    if (!stop && fs::exists(dataDirPath)) {
+                        const std::string prefix = "DistinguishablePoints_rho";
+                        const std::string suffix = ".txt";
+
+                        // 统一枚举 ../../../../data 下所有 DistinguishablePoints_rho*.txt 文件
+                        //   * 为空   → DistinguishablePoints_rho.txt
+                        //   * 为数字 → DistinguishablePoints_rhoN.txt
+                        // 每个文件只处理一次，避免重复读取导致的短循环误判
+                        {
+                            std::vector<fs::path> rho_files;
+                            for (const auto& entry : fs::directory_iterator(dataDirPath)) {
+                                if (!entry.is_regular_file()) continue;
+                                std::string fname = entry.path().filename().string();
+                                if (!fname.starts_with(prefix) || !fname.ends_with(suffix)) continue;
+                                std::string mid = fname.substr(prefix.size(),
+                                                               fname.size() - prefix.size() - suffix.size());
+                                // mid 为空(rho.txt) 或纯数字(rhoN.txt) 才是目标文件
+                                bool valid = mid.empty();
+                                if (!valid) {
+                                    valid = true;
+                                    for (char c : mid) {
+                                        if (c < '0' || c > '9') { valid = false; break; }
+                                    }
+                                }
+                                if (valid) {
+                                    rho_files.push_back(entry.path());
+                                }
+                            }
+                            std::sort(rho_files.begin(), rho_files.end());
+                            for (const auto& f : rho_files) {
+                                std::ifstream ifs(f);
+                                if (ifs.is_open()) {
+                                    if (processDPStream(ifs) != 0) {
+                                        stop = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    unspent.pushKV("num", dpMap.size());
                 } else {
                     std::thread t(judge);
                     play<Rho>();
