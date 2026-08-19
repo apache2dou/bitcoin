@@ -830,7 +830,7 @@ void rho_play() {
     init_break_flag();
     while (!gameover) {
         break_rho(false);
-        init_RhoStates_rand();
+        //init_RhoStates_rand();
         rho<<<multiProcessorCount, blockSize>>>();
         // 等待核函数完成
         CHECK_CUDA(cudaDeviceSynchronize());
