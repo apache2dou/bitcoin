@@ -2881,12 +2881,15 @@ bool RhoPoint::rand()
 
 static const std::string _RSFile1_name = "D:\\RhoState.txt";
 
-bool loadRhoState(RhoState* s, int num, const std::string& name)
+int loadRhoState(RhoState* s, int num, const std::string& name)
 {
     auto loadrs = [](std::ifstream& file, RhoState& s) {
         std::string line;
         if (file.is_open()) {
             std::getline(file, line); // 读取一行到字符串line
+            if (line.empty()) {
+                return false;
+            }
             memcpy(s.x.data, ParseHex(line).data(), sizeof(s.x.data));
             std::getline(file, line); // 读取一行到字符串line
             memcpy(s.m, ParseHex(line).data(), sizeof(s.m));
@@ -2905,11 +2908,11 @@ bool loadRhoState(RhoState* s, int num, const std::string& name)
     std::ifstream file(name); // 打开文件
     for (int i = 0; i < num; i++) {
         if(!loadrs(file, s[i]))
-            return false;
+            return i;
     }
     file.close(); // 关闭文件
 
-    return true;
+    return num;
 }
 
 
@@ -3477,7 +3480,7 @@ void play() {
     std::string _logvec[256];
     RhoState rs[256] = {0};
     bool pause = false;
-    if (!loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name)) {
+    if (loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name) < sizeof(rs) / sizeof(RhoState)) {
         for (RhoState& r : rs) {
             r.rand();
             r.times = 0;

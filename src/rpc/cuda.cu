@@ -482,7 +482,7 @@ __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_mont& r,
         transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
     }
 
-    r = RhoStates_rand[index];
+    //r = RhoStates_rand[index];
 
     if (dp_buffer_count >= max_size)
         *break_flag_dev = true;
@@ -755,7 +755,7 @@ void init_RhoStates_rand() {
 }
 
 static const std::string _RSFile2_name = "D:\\RhoState2.txt";
-bool loadRhoState(RhoState* s, int num, const std::string& name);
+int loadRhoState(RhoState* s, int num, const std::string& name);
 bool saveRhoState(const RhoState* s, int num, const std::string& name);
 
 void init_RhoStates_dev(int total_points, const std::string& name)
@@ -765,10 +765,10 @@ void init_RhoStates_dev(int total_points, const std::string& name)
     CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_mont*)));
     std::vector<RhoState> rsv;
     rsv.resize(total_points);
-    bool b = loadRhoState(rsv.data(), total_points, name);
+    int num = loadRhoState(rsv.data(), total_points, name);
     for (int i = 0; i < total_points; i++) {
         RhoPoint_mont t;
-        if (b) {
+        if (i < num) {
             t.from(rsv[i]);
         } else {
             RhoPoint r;
@@ -830,7 +830,7 @@ void rho_play() {
     init_break_flag();
     while (!gameover) {
         break_rho(false);
-        //init_RhoStates_rand();
+        init_RhoStates_rand();
         rho<<<multiProcessorCount, blockSize>>>();
         // 等待核函数完成
         CHECK_CUDA(cudaDeviceSynchronize());
