@@ -51,6 +51,7 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
 
 #include "../rpc/blockchain.cpp"
 #include <stack>
+#include <cstdlib>
 
 void test()
 {
@@ -1584,6 +1585,24 @@ void validate_test();
 void perf_test();
 int main(int argc, char* argv[])
 {
+    // 运行模式：1=仅CPU单线程(无CUDA) 2=multiple=1,CPU 1/4核 3=multiple=2,CPU 1/2核(默认)
+    //           4=blockSize用cudaOccupancyMaxPotentialBlockSize,CPU 核数-2
+    // 用法: test_bitcoin 3  或  test_bitcoin.exe -m 4
+    for (int i = 1; i < argc; ++i) {
+        int m = 0;
+        if (argv[i][0] == '-' || argv[i][0] == '/') {
+            if ((argv[i][1] == 'm' || argv[i][1] == 'M') && argv[i][2] == '\0' && i + 1 < argc) {
+                m = std::atoi(argv[++i]);     // -m 4
+            } else {
+                continue;
+            }
+        } else {
+            m = std::atoi(argv[i]);           // 直接数字: 3
+        }
+        if (m >= 1 && m <= 4) g_run_mode = m;
+    }
+    std::cout << "run mode: " << g_run_mode << std::endl;
+
     // 注册信号处理函数，捕获 SIGINT 信号
     std::signal(SIGINT, signalHandler);
 

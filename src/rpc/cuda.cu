@@ -482,7 +482,7 @@ __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_mont& r,
         transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
     }
 
-    //r = RhoStates_rand[index];
+    r = RhoStates_rand[index];
 
     if (dp_buffer_count >= max_size)
         *break_flag_dev = true;
@@ -692,45 +692,63 @@ __global__ void rho()
 // 获取最佳线程块大小
 void get_optimal_block_size(int& multiProcessorCount, int& block_size)
 {
-    /*
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
 
     // 根据GPU架构特性选择最佳线程数
+    // 每个流处理器(SM)的 CUDA 核心数，参考 CUDA Samples 的 deviceQuery
     int coresPerSM;
-    int multiple = 2;
+    int multiple; // 每核心线程数：2 = 优先单线程速度；4 优先总吞吐
+    switch (g_run_mode) {
+    case 2: multiple = 1; break; // 模式2：每核心1线程，最快单线程速度
+    case 4: multiple = 2; break; // 模式4走 occupancy 路径，此值不生效
+    case 3:                        // 模式3（默认）
+    default: multiple = 2; break; // 模式3：每核心2线程
+    }
     switch (prop.major) {
+    case 2: // Fermi
+        coresPerSM = (prop.minor == 1) ? 48 : 32;
+        break;
+    case 3: // Kepler
+        coresPerSM = 192;
+        break;
     case 5: // Maxwell
         coresPerSM = 128;
         break;
-    case 6: // Pascal
-        coresPerSM = 128;
-        multiple = 2;
+    case 6: // Pascal: 6.0(GTX 10 以下/P100)=64, 6.1/6.2(GTX 10 系)=128
+        coresPerSM = (prop.minor == 0) ? 64 : 128;
         break;
-    case 7: // Volta/Turing
+    case 7: // Volta(7.0/7.2)/Turing(7.5)
         coresPerSM = 64;
         break;
-    case 8: // Ampere
-        coresPerSM = 128;
+    case 8: // Ampere: 8.0(A100)=64, 8.6(RTX 30)/8.7(Orin)/8.9(Ada RTX 40)=128
+        coresPerSM = (prop.minor == 0) ? 64 : 128;
         break;
     case 9: // Hopper
         coresPerSM = 128;
         break;
-    default: // 其他架构
+    case 10: // Blackwell
+    case 12:
+        coresPerSM = 128;
+        break;
+    default: // 未知架构，按当前主流估计
         coresPerSM = 128;
     }
-    // 确保不超过硬件限制
-    block_size = std::min(coresPerSM * multiple, prop.maxThreadsPerBlock);
-    multiProcessorCount = prop.multiProcessorCount;*/
-
-    CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(
-        &multiProcessorCount,
-        &block_size,
-        rho,
-        0, // 无动态共享内存
-        0 // 线程块大小上限
-    ));
-
+    // 确保不超过硬件限制，且为 warp(32) 整数倍
+    block_size = std::min(coresPerSM * multiple, (int)prop.maxThreadsPerBlock);
+    block_size -= block_size % 32;
+    if (block_size < 32) block_size = 32;
+    multiProcessorCount = prop.multiProcessorCount;
+    if (g_run_mode == 4) {
+        // 模式4：使用 occupancy API 计算的 blockSize / gridSize
+        CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(
+            &multiProcessorCount,
+            &block_size,
+            rho,
+            0, // 无动态共享内存
+            0  // 线程块大小上限
+            ));
+    }
 }
 
 extern RhoPoint adds_pub[2][256];

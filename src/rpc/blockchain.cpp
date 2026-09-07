@@ -52,6 +52,13 @@
 #include <validationinterface.h>
 #include <versionbits.h>
 
+#ifdef WIN32
+#include <compat/compat.h> // 必须先于 windows.h 引入 winsock2.h
+#include <windows.h>
+#else
+#include <sched.h>
+#endif
+
 #include <stdint.h>
 
 #include <condition_variable>
@@ -2924,15 +2931,40 @@ bool saveRhoState(const RhoState* s, int num, const std::string& name)
         file << HexStr(s.n) << std::endl;
         file << s.times << std::endl;
     };
+
+    // 若文件中已有记录数多于本次保存的 num，先把第 num 个之后的完整记录
+    // （每条 4 行：x / m / n / times）读出来，重写后再追加，避免截断丢失
+    std::vector<std::string> tail;
+    {
+        std::ifstream in(name);
+        if (in.is_open()) {
+            std::vector<std::string> lines;
+            std::string line;
+            while (std::getline(in, line)) {
+                lines.push_back(line);
+            }
+            size_t keep_from = (size_t)num * 4;
+            if (lines.size() > keep_from) {
+                // 保留完整记录，即使是残缺的尾部
+                size_t keep_count = (lines.size() - keep_from);
+                tail.assign(lines.begin() + keep_from, lines.begin() + keep_from + keep_count);
+            }
+        }
+    }
+
     std::ofstream file(name); // 打开文件
     for (int i = 0; i < num; i++) {
         savers(file, s[i]);
+    }
+    for (const std::string& line : tail) {
+        file << line << std::endl;
     }
     file.close();
     return true;
 }
 
 bool gameover = false;
+int g_run_mode = 3; // 默认模式3：multiple=2，CPU半核
 void break_rho(bool f);
 
 static int64_t BabyNUM = 0x3fffffff;
@@ -3475,6 +3507,81 @@ std::string get_time()
 
 void rho_play();
 
+// 将当前线程绑定到第 index 个物理核（每核只绑首个 SMT 线程，避免超线程争抢）。
+// 成功返回 true。仅模式2/3 调用。
+static bool pin_to_physical_core(unsigned index)
+{
+#ifdef WIN32
+    // 两阶段查询：第一次调用只取所需长度（返回值忽略），第二次才取数据
+    DWORD len = 0;
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len) &&
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        return false;
+    }
+    std::vector<BYTE> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
+        return false;
+    }
+    // 收集每个物理核的首个 SMT 线程亲和性
+    std::vector<GROUP_AFFINITY> cores;
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX it =
+        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
+    DWORD used = 0;
+    while (used < len) {
+        if (it->Relationship == RelationProcessorCore) {
+            const PROCESSOR_RELATIONSHIP* pr = &it->Processor;
+            for (WORD g = 0; g < pr->GroupCount; ++g) {
+                KAFFINITY mask = pr->GroupMask[g].Mask;
+                if (mask == 0) continue;
+                // 只取掩码中最低位的 SMT 线程（一个物理核）
+                GROUP_AFFINITY ga = pr->GroupMask[g];
+                unsigned long b;
+                _BitScanForward64(&b, mask);
+                ga.Mask = ((KAFFINITY)1) << b;
+                cores.push_back(ga);
+            }
+        }
+        used += it->Size;
+        it = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+            reinterpret_cast<BYTE*>(it) + it->Size);
+    }
+    if (index >= cores.size()) return false;
+    GROUP_AFFINITY old;
+    return SetThreadGroupAffinity(GetCurrentThread(), &cores[index], &old) != FALSE;
+#else
+    // Linux：读取每个 cpu 的 thread_siblings_list，取每个物理核首个线程
+    std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(index) + "/topology/thread_siblings_list";
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    std::getline(f, line);
+    // 解析 "0" / "0,2" / "0-3" 形式，取第一个 CPU 号
+    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    int first = -1;
+    size_t p = 0;
+    while (p < line.size()) {
+        if (is_digit(line[p])) {
+            size_t start = p;
+            while (p < line.size() && is_digit(line[p])) ++p;
+            int v = std::stoi(line.substr(start, p - start));
+            if (first < 0) first = v;
+            // 处理范围 "a-b"：只需首核，遇到 '-' 后的数字跳过
+            if (p < line.size() && line[p] == '-') {
+                ++p;
+                while (p < line.size() && is_digit(line[p])) ++p;
+            }
+        } else {
+            ++p;
+        }
+    }
+    if (first < 0) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(first, &set);
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
+#endif
+}
+
 template <typename PLAYER>
 void play() {
     std::string _logvec[256];
@@ -3491,7 +3598,16 @@ void play() {
     }
     PLAYER _player;
     _player.prepare();
-    int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
+    unsigned hw = std::thread::hardware_concurrency();
+    int n_tasks;
+    switch (g_run_mode) {
+    case 1: n_tasks = 1; break;              // 模式1：仅CPU单线程，不启动CUDA
+    case 2: n_tasks = std::max(1u, hw / 4); break; // 模式2：multiple=1，CPU 1/4核
+    case 4: n_tasks = (hw > 2) ? hw - 2 : 1; break; // 模式4：occupancy blockSize，CPU 核数-2
+    case 3:                                // 模式3：multiple=2，CPU 1/2核
+    default: n_tasks = std::max(1u, hw / 2); break;
+    }
+    std::cout << "run mode " << g_run_mode << ", cpu threads " << n_tasks << std::endl;
     assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
     auto saveStates = [&]() {
         saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
@@ -3505,6 +3621,9 @@ void play() {
     };
     std::barrier barrier(n_tasks, on_barrier);
     auto T = [&](int i) {
+        if ((g_run_mode == 2 || g_run_mode == 3) && !pin_to_physical_core(i)) {
+            std::cout << "thread " << i << " pin core failed." << std::endl;
+        }
         uint64_t count_try{0};
         unsigned int count_dstg{0};
         auto start = std::chrono::high_resolution_clock::now();
@@ -3528,7 +3647,8 @@ void play() {
             std::stringstream ss;
             if (i == 0) {
                 ss << count_try << " points, " << count_dstg
-                   << " distinguishable. in " << elapsed.count() << " s" << std::endl;
+                   << " distinguishable. in " << elapsed.count() << " s, avg "
+                   << (uint64_t)(count_try / elapsed.count()) << " points/s" << std::endl;
             } else {
                 ss << count_dstg << " ";
             }
@@ -3543,7 +3663,9 @@ void play() {
     for (int i = 0; i < n_tasks; ++i) {
         threads.emplace_back(T, i);
     }
-    threads.emplace_back(rho_play);
+    if (g_run_mode != 1) {
+        threads.emplace_back(rho_play); // 模式1不启动CUDA线程
+    }
     for (auto& t : threads) {
         t.join();
     }
