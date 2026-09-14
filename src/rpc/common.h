@@ -44,4 +44,15 @@ void break_rho(bool value);
 void rho_play();
 void validate_test();
 void perf_test();
+// 定义在 rpc/rho.cpp: libsecp256k1 版本的点加性能测试, 由 perf_test() 调用
+void perf_test_libsecp256k1();
+// 定义在 rpc/rho.cpp: 直接用 libsecp256k1 内部 5x52 域实现的仿射点加性能测试
+void perf_test_rho_affine();
+// 定义在 rpc/rho.cpp: 仿射点加的正确性验证 (与库公开 API 逐步对拍), 由 validate_test() 调用
+void validate_rho_affine();
+// 定义在 rpc/rho.cpp: 仿射点加 (libsecp256k1 内部 5x52 域) 的初始化,
+// 必须在启动 worker 线程之前调用一次
+void rho_affine_prepare();
+// 定义在 rpc/rho.cpp: 仿射点加版 rho_F (语义与 rho_F 一致), 供 class Rho 使用
+void rho_affine_F(RhoState& rs);
 #endif // BITCOIN_RPC_COMMON_H

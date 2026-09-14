@@ -306,6 +306,399 @@ __host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
     return x1;
 }
 
+// ================== safegcd 模逆 (移植自 libsecp256k1 的 modinv32_impl.h) ==================
+// Bernstein-Yang divsteps 算法: 纯 int32/int64 整数运算, 无 CPU 专有指令, 天然适配 CUDA。
+// - 设备端: 常量时间版本 divsteps30 (30 步循环完全无分支, 避免 warp 发散)
+// - 主机端: 变量时间版本 divsteps30_var (平均提前退出, 更快)
+#if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
+#include <intrin.h>
+#endif
+
+struct signed30 {
+    int32_t v[9];
+};
+
+struct trans2x2 {
+    int32_t u, v, q, r;
+};
+
+struct modinv32_modinfo_s {
+    signed30 modulus;
+    uint32_t modulus_inv30; // -modulus^-1 mod 2^30
+};
+
+// secp256k1 域参数 p = 2^256 - 0x1000003D1 的 signed30 表示 (与库中 secp256k1_const_modinfo_fe 一致)
+CONSTANT modinv32_modinfo_s modinfo_p = {
+    {{-0x3D1, -4, 0, 0, 0, 0, 0, 0, 65536}},
+    0x2DDACACF};
+
+__host__ __device__ static inline uint32_t ctz32(uint32_t x)
+{
+#if defined(__CUDA_ARCH__)
+    /* __ctz 仅 CUDA 12.2+ 提供; __ffs 返回最低置位位(1-based), 所有版本均可用。
+       调用处保证 x != 0 (divsteps30_var 的哨兵位使 g|mask 恒非零)。 */
+    return (uint32_t)__ffs((int)x) - 1;
+#elif defined(_MSC_VER)
+    unsigned long i;
+    _BitScanForward(&i, x);
+    return (uint32_t)i;
+#else
+    return (uint32_t)__builtin_ctz(x);
+#endif
+}
+
+// 常量时间版本: 计算 30 个 divsteps 的转移矩阵 (完全无分支, warp 友好)
+__host__ __device__ static int32_t divsteps30(int32_t zeta, uint32_t f0, uint32_t g0, trans2x2* t)
+{
+    uint32_t u = 1, v = 0, q = 0, r = 1;
+    uint32_t mask1, mask2, f = f0, g = g0, x, y, z;
+    for (int i = 0; i < 30; ++i) {
+        mask1 = (uint32_t)(zeta >> 31);
+        mask2 = 0u - (g & 1); /* 无符号取负等价写法, 避免 MSVC C4146 */
+        x = (f ^ mask1) - mask1;
+        y = (u ^ mask1) - mask1;
+        z = (v ^ mask1) - mask1;
+        g += x & mask2;
+        q += y & mask2;
+        r += z & mask2;
+        mask1 &= mask2;
+        zeta = (zeta ^ (int32_t)mask1) - 1;
+        f += g & mask1;
+        u += q & mask1;
+        v += r & mask1;
+        g >>= 1;
+        u <<= 1;
+        v <<= 1;
+    }
+    t->u = (int32_t)u;
+    t->v = (int32_t)v;
+    t->q = (int32_t)q;
+    t->r = (int32_t)r;
+    return zeta;
+}
+
+// modinv32_inv256[i] = -(2*i+1)^-1 (mod 256)
+static const uint8_t modinv32_inv256[128] = {
+    0xFF, 0x55, 0x33, 0x49, 0xC7, 0x5D, 0x3B, 0x11, 0x0F, 0xE5, 0xC3, 0x59,
+    0xD7, 0xED, 0xCB, 0x21, 0x1F, 0x75, 0x53, 0x69, 0xE7, 0x7D, 0x5B, 0x31,
+    0x2F, 0x05, 0xE3, 0x79, 0xF7, 0x0D, 0xEB, 0x41, 0x3F, 0x95, 0x73, 0x89,
+    0x07, 0x9D, 0x7B, 0x51, 0x4F, 0x25, 0x03, 0x99, 0x17, 0x2D, 0x0B, 0x61,
+    0x5F, 0xB5, 0x93, 0xA9, 0x27, 0xBD, 0x9B, 0x71, 0x6F, 0x45, 0x23, 0xB9,
+    0x37, 0x4D, 0x2B, 0x81, 0x7F, 0xD5, 0xB3, 0xC9, 0x47, 0xDD, 0xBB, 0x91,
+    0x8F, 0x65, 0x43, 0xD9, 0x57, 0x6D, 0x4B, 0xA1, 0x9F, 0xF5, 0xD3, 0xE9,
+    0x67, 0xFD, 0xDB, 0xB1, 0xAF, 0x85, 0x63, 0xF9, 0x77, 0x8D, 0x6B, 0xC1,
+    0xBF, 0x15, 0xF3, 0x09, 0x87, 0x1D, 0xFB, 0xD1, 0xCF, 0xA5, 0x83, 0x19,
+    0x97, 0xAD, 0x8B, 0xE1, 0xDF, 0x35, 0x13, 0x29, 0xA7, 0x3D, 0x1B, 0xF1,
+    0xEF, 0xC5, 0xA3, 0x39, 0xB7, 0xCD, 0xAB, 0x01
+};
+
+// 变量时间版本: 计算 30 个 divsteps 的转移矩阵 (利用 ctz 批量处理除 2 步骤)
+__host__ __device__ static int32_t divsteps30_var(int32_t eta, uint32_t f0, uint32_t g0, trans2x2* t)
+{
+    uint32_t u = 1, v = 0, q = 0, r = 1;
+    uint32_t f = f0, g = g0, m;
+    uint16_t w;
+    int i = 30, limit, zeros;
+    for (;;) {
+        /* 借助哨兵位, 最多统计到第 i 位 */
+        zeros = (int)ctz32(g | (UINT32_MAX << i));
+        /* 连续 zeros 个 divsteps 都只是 g 除以 2, 一并完成 */
+        g >>= zeros;
+        u <<= zeros;
+        v <<= zeros;
+        eta -= zeros;
+        i -= zeros;
+        if (i == 0) break;
+        /* eta 为负时, 交换 (f,g) 并取相反数 */
+        if (eta < 0) {
+            uint32_t tmp;
+            eta = -eta;
+            tmp = f; f = g; g = 0u - tmp; /* 无符号取负等价写法, 避免 MSVC C4146 */
+            tmp = u; u = q; q = 0u - tmp;
+            tmp = v; v = r; r = 0u - tmp;
+        }
+        /* 消去 g 的低端比特, 上限为 min(i, eta+1, 8) 位 (查表仅支持 8 位) */
+        limit = ((int)eta + 1) > i ? i : ((int)eta + 1);
+        m = (UINT32_MAX >> (32 - limit)) & 255U;
+        w = (uint16_t)((g * modinv32_inv256[(f >> 1) & 127]) & m);
+        g += f * w;
+        q += u * w;
+        r += v * w;
+    }
+    t->u = (int32_t)u;
+    t->v = (int32_t)v;
+    t->q = (int32_t)q;
+    t->r = (int32_t)r;
+    return eta;
+}
+
+// 计算 (t/2^30) * [d, e] mod modulus
+__host__ __device__ static void update_de_30(signed30* d, signed30* e, const trans2x2* t, const modinv32_modinfo_s* modinfo)
+{
+    const int32_t M30 = (int32_t)0x3FFFFFFF;
+    const int32_t u = t->u, v = t->v, q = t->q, r = t->r;
+    int32_t di, ei, md, me, sd, se;
+    int64_t cd, ce;
+
+    /* [md,me] 初始为 0; d 为负时加 [u,q]; e 为负时加 [v,r] */
+    sd = d->v[8] >> 31;
+    se = e->v[8] >> 31;
+    md = (u & sd) + (v & se);
+    me = (q & sd) + (r & se);
+    /* 开始计算 t*[d,e] */
+    di = d->v[0];
+    ei = e->v[0];
+    cd = (int64_t)u * di + (int64_t)v * ei;
+    ce = (int64_t)q * di + (int64_t)r * ei;
+    /* 修正 md,me 使 t*[d,e]+modulus*[md,me] 低 30 位为 0 */
+    md -= (int32_t)((modinfo->modulus_inv30 * (uint32_t)cd + (uint32_t)md) & (uint32_t)M30);
+    me -= (int32_t)((modinfo->modulus_inv30 * (uint32_t)ce + (uint32_t)me) & (uint32_t)M30);
+    cd += (int64_t)modinfo->modulus.v[0] * md;
+    ce += (int64_t)modinfo->modulus.v[0] * me;
+    cd >>= 30;
+    ce >>= 30;
+    /* 迭代计算 limb i=1..8, 右移 30 位存入输出 limb i-1 */
+    for (int i = 1; i < 9; ++i) {
+        di = d->v[i];
+        ei = e->v[i];
+        cd += (int64_t)u * di + (int64_t)v * ei;
+        ce += (int64_t)q * di + (int64_t)r * ei;
+        cd += (int64_t)modinfo->modulus.v[i] * md;
+        ce += (int64_t)modinfo->modulus.v[i] * me;
+        d->v[i - 1] = (int32_t)cd & M30; cd >>= 30;
+        e->v[i - 1] = (int32_t)ce & M30; ce >>= 30;
+    }
+    d->v[8] = (int32_t)cd;
+    e->v[8] = (int32_t)ce;
+}
+
+// 计算 (t/2^30) * [f, g] (固定 9 limbs, 配合常量时间版本)
+__host__ __device__ static void update_fg_30(signed30* f, signed30* g, const trans2x2* t)
+{
+    const int32_t M30 = (int32_t)0x3FFFFFFF;
+    const int32_t u = t->u, v = t->v, q = t->q, r = t->r;
+    int32_t fi, gi;
+    int64_t cf, cg;
+
+    fi = f->v[0];
+    gi = g->v[0];
+    cf = (int64_t)u * fi + (int64_t)v * gi;
+    cg = (int64_t)q * fi + (int64_t)r * gi;
+    cf >>= 30;
+    cg >>= 30;
+    for (int i = 1; i < 9; ++i) {
+        fi = f->v[i];
+        gi = g->v[i];
+        cf += (int64_t)u * fi + (int64_t)v * gi;
+        cg += (int64_t)q * fi + (int64_t)r * gi;
+        f->v[i - 1] = (int32_t)cf & M30; cf >>= 30;
+        g->v[i - 1] = (int32_t)cg & M30; cg >>= 30;
+    }
+    f->v[8] = (int32_t)cf;
+    g->v[8] = (int32_t)cg;
+}
+
+// 计算 (t/2^30) * [f, g] (变长 limbs, 配合变量时间版本)
+__host__ __device__ static void update_fg_30_var(int len, signed30* f, signed30* g, const trans2x2* t)
+{
+    const int32_t M30 = (int32_t)0x3FFFFFFF;
+    const int32_t u = t->u, v = t->v, q = t->q, r = t->r;
+    int32_t fi, gi;
+    int64_t cf, cg;
+
+    fi = f->v[0];
+    gi = g->v[0];
+    cf = (int64_t)u * fi + (int64_t)v * gi;
+    cg = (int64_t)q * fi + (int64_t)r * gi;
+    cf >>= 30;
+    cg >>= 30;
+    for (int i = 1; i < len; ++i) {
+        fi = f->v[i];
+        gi = g->v[i];
+        cf += (int64_t)u * fi + (int64_t)v * gi;
+        cg += (int64_t)q * fi + (int64_t)r * gi;
+        f->v[i - 1] = (int32_t)cf & M30; cf >>= 30;
+        g->v[i - 1] = (int32_t)cg & M30; cg >>= 30;
+    }
+    f->v[len - 1] = (int32_t)cf;
+    g->v[len - 1] = (int32_t)cg;
+}
+
+// 将 (-2*modulus, modulus) 范围的输入规格化到 [0, modulus), sign<0 时先取反
+__host__ __device__ static void normalize_30(signed30* r, int32_t sign, const modinv32_modinfo_s* modinfo)
+{
+    const int32_t M30 = (int32_t)0x3FFFFFFF;
+    int32_t r0 = r->v[0], r1 = r->v[1], r2 = r->v[2], r3 = r->v[3], r4 = r->v[4],
+            r5 = r->v[5], r6 = r->v[6], r7 = r->v[7], r8 = r->v[8];
+    int32_t cond_add, cond_negate;
+
+    /* 负数时先加 modulus, 再按需取反 */
+    cond_add = r8 >> 31;
+    r0 += modinfo->modulus.v[0] & cond_add;
+    r1 += modinfo->modulus.v[1] & cond_add;
+    r2 += modinfo->modulus.v[2] & cond_add;
+    r3 += modinfo->modulus.v[3] & cond_add;
+    r4 += modinfo->modulus.v[4] & cond_add;
+    r5 += modinfo->modulus.v[5] & cond_add;
+    r6 += modinfo->modulus.v[6] & cond_add;
+    r7 += modinfo->modulus.v[7] & cond_add;
+    r8 += modinfo->modulus.v[8] & cond_add;
+    cond_negate = sign >> 31;
+    r0 = (r0 ^ cond_negate) - cond_negate;
+    r1 = (r1 ^ cond_negate) - cond_negate;
+    r2 = (r2 ^ cond_negate) - cond_negate;
+    r3 = (r3 ^ cond_negate) - cond_negate;
+    r4 = (r4 ^ cond_negate) - cond_negate;
+    r5 = (r5 ^ cond_negate) - cond_negate;
+    r6 = (r6 ^ cond_negate) - cond_negate;
+    r7 = (r7 ^ cond_negate) - cond_negate;
+    r8 = (r8 ^ cond_negate) - cond_negate;
+    /* 进位传播, 使各 limb 回到 (-2^30, 2^30) */
+    r1 += r0 >> 30; r0 &= M30;
+    r2 += r1 >> 30; r1 &= M30;
+    r3 += r2 >> 30; r2 &= M30;
+    r4 += r3 >> 30; r3 &= M30;
+    r5 += r4 >> 30; r4 &= M30;
+    r6 += r5 >> 30; r5 &= M30;
+    r7 += r6 >> 30; r6 &= M30;
+    r8 += r7 >> 30; r7 &= M30;
+
+    /* 仍为负则再加一次 modulus */
+    cond_add = r8 >> 31;
+    r0 += modinfo->modulus.v[0] & cond_add;
+    r1 += modinfo->modulus.v[1] & cond_add;
+    r2 += modinfo->modulus.v[2] & cond_add;
+    r3 += modinfo->modulus.v[3] & cond_add;
+    r4 += modinfo->modulus.v[4] & cond_add;
+    r5 += modinfo->modulus.v[5] & cond_add;
+    r6 += modinfo->modulus.v[6] & cond_add;
+    r7 += modinfo->modulus.v[7] & cond_add;
+    r8 += modinfo->modulus.v[8] & cond_add;
+    r1 += r0 >> 30; r0 &= M30;
+    r2 += r1 >> 30; r1 &= M30;
+    r3 += r2 >> 30; r2 &= M30;
+    r4 += r3 >> 30; r3 &= M30;
+    r5 += r4 >> 30; r4 &= M30;
+    r6 += r5 >> 30; r5 &= M30;
+    r7 += r6 >> 30; r6 &= M30;
+    r8 += r7 >> 30; r7 &= M30;
+
+    r->v[0] = r0;
+    r->v[1] = r1;
+    r->v[2] = r2;
+    r->v[3] = r3;
+    r->v[4] = r4;
+    r->v[5] = r5;
+    r->v[6] = r6;
+    r->v[7] = r7;
+    r->v[8] = r8;
+}
+
+// 常量时间版本: 固定 20 轮 x 30 divsteps (590 步对 256 位输入已足够)
+__host__ __device__ static void modinv32(signed30* x, const modinv32_modinfo_s* modinfo)
+{
+    signed30 d = {{0, 0, 0, 0, 0, 0, 0, 0, 0}};
+    signed30 e = {{1, 0, 0, 0, 0, 0, 0, 0, 0}};
+    signed30 f = modinfo->modulus;
+    signed30 g = *x;
+    int32_t zeta = -1;
+
+    for (int i = 0; i < 20; ++i) {
+        trans2x2 t;
+        zeta = divsteps30(zeta, (uint32_t)f.v[0], (uint32_t)g.v[0], &t);
+        update_de_30(&d, &e, &t, modinfo);
+        update_fg_30(&f, &g, &t);
+    }
+    normalize_30(&d, f.v[8], modinfo);
+    *x = d;
+}
+
+// 变量时间版本: 平均约 11 轮即可收敛
+__host__ __device__ static void modinv32_var(signed30* x, const modinv32_modinfo_s* modinfo)
+{
+    signed30 d = {{0, 0, 0, 0, 0, 0, 0, 0, 0}};
+    signed30 e = {{1, 0, 0, 0, 0, 0, 0, 0, 0}};
+    signed30 f = modinfo->modulus;
+    signed30 g = *x;
+    int j, len = 9;
+    int32_t eta = -1;
+    int32_t cond, fn, gn;
+
+    for (;;) {
+        trans2x2 t;
+        eta = divsteps30_var(eta, (uint32_t)f.v[0], (uint32_t)g.v[0], &t);
+        update_de_30(&d, &e, &t, modinfo);
+        update_fg_30_var(len, &f, &g, &t);
+        /* g 最低 limb 为 0 时, 检查是否整个 g 为 0 (收敛) */
+        if (g.v[0] == 0) {
+            cond = 0;
+            for (j = 1; j < len; ++j) {
+                cond |= g.v[j];
+            }
+            if (cond == 0) break;
+        }
+        /* 最高 limb 为 0 或 -1 时缩短长度, 符号位并入下一 limb */
+        fn = f.v[len - 1];
+        gn = g.v[len - 1];
+        cond = ((int32_t)len - 2) >> 31;
+        cond |= fn ^ (fn >> 31);
+        cond |= gn ^ (gn >> 31);
+        if (cond == 0) {
+            f.v[len - 2] |= (uint32_t)fn << 30;
+            g.v[len - 2] |= (uint32_t)gn << 30;
+            --len;
+        }
+    }
+    normalize_30(&d, f.v[len - 1], modinfo);
+    *x = d;
+}
+
+// 设备端走常量时间版本(无分支、warp 友好), 主机端走变量时间版本(平均更快)
+__host__ __device__ static void modinv32_auto(signed30* x, const modinv32_modinfo_s* modinfo)
+{
+#ifdef __CUDA_ARCH__
+    modinv32(x, modinfo);
+#else
+    modinv32_var(x, modinfo);
+#endif
+}
+
+// uint256 (8x32 limbs) -> signed30 (9x30 limbs), 输入须为非负且 < 2^256
+__host__ __device__ static void u256_to_s30(signed30* r, const uint256_t& a)
+{
+    uint32_t w[9];
+    for (int i = 0; i < 8; ++i)
+        w[i] = a.limb[i];
+    w[8] = 0;
+    int bit = 0;
+    for (int i = 0; i < 9; ++i) {
+        int wi = bit >> 5, off = bit & 31;
+        uint32_t lo = w[wi] >> off;
+        uint32_t hi = off ? (w[wi + 1] << (32 - off)) : 0;
+        r->v[i] = (int32_t)((lo | hi) & 0x3FFFFFFF);
+        bit += 30;
+    }
+}
+
+// signed30 -> uint256, 输入须为非负规格化值 (< p)
+__host__ __device__ static void s30_to_u256(uint256_t* r, const signed30* a)
+{
+    uint64_t acc = 0;
+    int bits = 0, oi = 0;
+    for (int i = 0; i < 9; ++i) {
+        acc |= (uint64_t)(uint32_t)a->v[i] << bits;
+        bits += 30;
+        while (bits >= 32) {
+            r->limb[oi++] = (uint32_t)acc;
+            acc >>= 32;
+            bits -= 32;
+        }
+    }
+    if (oi < 8) {
+        r->limb[oi++] = (uint32_t)acc;
+    }
+}
+
 // 转换到蒙哥马利域
 __host__ __device__ uint256_t to_mont(const uint256_t& a)
 {
@@ -316,8 +709,23 @@ __host__ __device__ uint256_t from_mont(const uint256_t& a)
     uint256_t one = {1};
     return mont_mul(a, one);
 }
-// 蒙哥马利域中的逆元计算
+// 蒙哥马利域中的逆元计算 (safegcd/divsteps 版本, 移植自 libsecp256k1)
+// modinv32 与 mod_inv 一样, 只把输入当作普通整数求逆, 不感知蒙哥马利域:
+//   inv = (a*R)^-1 = a^-1 * R^-1
+//   mont_mul(inv, R^3) = a^-1 * R^-1 * R^3 * R^-1 = a^-1 * R  (即 a^-1 的蒙哥马利形式)
+// 故无需先转回普通域, 与 mont_inv2_euclid 保持同一形式。
 __host__ __device__ uint256_t mont_inv2(const uint256_t& a_mont)
+{
+    signed30 s;
+    u256_to_s30(&s, a_mont);
+    modinv32_auto(&s, &modinfo_p);
+    uint256_t inv;
+    s30_to_u256(&inv, &s);
+    return mont_mul(inv, R_cube);
+}
+
+// 旧版: 扩展欧几里得模逆 (保留用于 A/B 对比)
+__host__ __device__ uint256_t mont_inv2_euclid(const uint256_t& a_mont)
 {
     uint256_t inv = mod_inv(a_mont, p);
 
@@ -678,7 +1086,7 @@ __global__ void rho()
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
             x_ord = from_mont(s.x.x);
         }
-        if ((count_rho & 0xFFFF) == 0) {
+        if ((count_rho & 0x3FFFF) == 0) {
             if (*break_flag_dev)
                 break;
         }
@@ -874,6 +1282,29 @@ __constant__ AffinePoint G = {
 #define RHOSTATES_TEST_NUM  5120001
 #define RHODP_TEST_NUM 102
 
+__global__ void validate_safegcd()
+{
+    // 测试 safegcd 模逆与旧欧几里得实现一致性
+    uint256_t probe[4] = {
+        {{0x5F8E52C7, 0xD3A21B04, 0x9C56B9AF, 0x6E1F3D82, 0x2A8C77D1, 0xB4E09F63, 0x1D5AC7E8, 0x7F3B29A0}},
+        {{0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000}},
+        {{0xFFFFFC2E, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF}}, // p-1
+        {{0x12345678, 0x9ABCDEF0, 0x0FEDCBA9, 0x87765432, 0x1A2B3C4D, 0x5E6F7081, 0x92A3B4C5, 0xD6E7F809}},
+    };
+    for (int i = 0; i < 4; ++i) {
+        uint256_t m1 = mont_inv2(probe[i]);
+        uint256_t m2 = mont_inv2_euclid(probe[i]);
+        assert(memcmp(&m1, &m2, sizeof(uint256_t)) == 0); // 与旧实现结果一致
+
+        // 直接验证: mont_mul(m1, to_mont(a)) 应等于 to_mont(1), 即 a * a^-1 == 1 (mod p)
+        uint256_t one = {1};
+        uint256_t a_ord = mont_mul(probe[i], one); // 转普通域
+        uint256_t expect_one_mont = to_mont(one);
+        uint256_t got = mont_mul(m1, to_mont(a_ord));
+        assert(memcmp(&got, &expect_one_mont, sizeof(uint256_t)) == 0);
+    }
+}
+
 __global__ void validate_1()
 {
     // 测试1：G + ∞ = G
@@ -962,7 +1393,9 @@ void perf_test_cpu() {
     uint64_t count_rho = perf_fun(s, adds_pub_tmp);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
-    std::cout << "cpu test elapsed: " << elapsed.count() << " ms, with " << count_rho << " RhoPoint." << std::endl;
+    double sec = elapsed.count() / 1000.0;
+    std::cout << "cpu test elapsed: " << elapsed.count() << " ms, with " << count_rho
+              << " RhoPoint, avg " << (uint64_t)(count_rho / sec) << " points/s." << std::endl;
 }
 
 __global__ void perf_test_gpu_kernel()
@@ -990,13 +1423,17 @@ void perf_test_gpu()
     CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
-    std::cout << "gpu test elapsed: " << elapsed_ms << " ms, with 800000 RhoPoint." << std::endl;
+    double sec = elapsed_ms / 1000.0;
+    std::cout << "gpu test elapsed: " << elapsed_ms << " ms, with 800000 RhoPoint, avg "
+              << (uint64_t)(800000 / sec) << " points/s." << std::endl;
 }
 
 void perf_test() {
     // 性能测试
     init_adds_pub_dev();
     perf_test_cpu();
+    perf_test_libsecp256k1();
+    perf_test_rho_affine();
     perf_test_gpu();
 }
 
@@ -1009,8 +1446,14 @@ void validate_test()
        
     validate_multi<<<10, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
+    validate_safegcd<<<1, 1>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
     validate_1<<<1, 1>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
+
+    // 仿射点加 (libsecp256k1 内部 5x52 域实现) 的正确性验证
+    validate_rho_affine();
+
     //dp_manager.save_dps();
     //TODDO: 然后手动检查dp文件！！
 

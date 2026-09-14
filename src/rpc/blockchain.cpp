@@ -3467,11 +3467,24 @@ public:
         /* _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
         _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
         assert(_Xvec.size() == _Mvec.size());*/
+
+        // 仿射点加: 预展开 adds_pub[0][*] 到内部 fe 表示。
+        // 必须在这里 (worker 线程启动前) 做一次。
+        rho_affine_prepare();
     }
 
     bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
     {
-        rho_F(ctx, rs);
+        // ------------------------------------------------------------------
+        // 旧实现: libsecp256k1 公开 API 的点加 (ge 解析 + 完整群运算)。
+        // 保留备查 / 需要对照时启用。注意: 它与下面的 rho_affine_F 共用线程局部的
+        // 状态缓存, 二者不要在同一个线程里交替调用。
+        // ------------------------------------------------------------------
+        // rho_F(ctx, rs);
+
+        // 仿射点加 (libsecp256k1 内部 5x52 域实现), 语义与 rho_F 完全一致
+        rho_affine_F(rs);
+
         /* auto b = find_baby(ctx, _Xvec, _Mvec, rs.x);
         if (b != 0) {
             CKey k;
@@ -3643,7 +3656,7 @@ void play() {
             }
         }
         std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
-        if (elapsed.count() > 1800) {
+        if (elapsed.count() > 300) {
             std::stringstream ss;
             if (i == 0) {
                 ss << count_try << " points, " << count_dstg
@@ -3664,7 +3677,7 @@ void play() {
         threads.emplace_back(T, i);
     }
     if (g_run_mode != 1) {
-        threads.emplace_back(rho_play); // 模式1不启动CUDA线程
+        //threads.emplace_back(rho_play); // 模式1不启动CUDA线程
     }
     for (auto& t : threads) {
         t.join();
@@ -3674,7 +3687,9 @@ void play() {
     for (int i = 0; i < n_tasks; i++) {
         g_log->ofs << _logvec[i];
     }
-    g_log->ofs << " distinguishable aside." << std::endl;
+    if (g_run_mode != 1) {
+        g_log->ofs << " distinguishable aside." << std::endl;
+    }
 }
 
 void validate_test();
