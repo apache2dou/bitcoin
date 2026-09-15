@@ -3677,7 +3677,7 @@ void play() {
         threads.emplace_back(T, i);
     }
     if (g_run_mode != 1) {
-        //threads.emplace_back(rho_play); // 模式1不启动CUDA线程
+        threads.emplace_back(rho_play); // 模式1不启动CUDA线程
     }
     for (auto& t : threads) {
         t.join();

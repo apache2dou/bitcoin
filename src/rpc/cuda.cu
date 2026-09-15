@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <vector>
 #include <iostream>
@@ -27,23 +29,15 @@ CONSTANT uint256_t N = {
     0xd0364141, 0xbfd25e8c, 0xaf48a03b, 0xbaaedce6,
     0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 
-// 预计算的蒙哥马利参数
-CONSTANT uint256_t R = {
-    0x000003D1, 0x00000001, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000};
+// 域实现:
+// p = 2^256 - 0x1000003D1 是伪梅森素数, 于是 2^256 ≡ M = 0x1000003D1 (mod p)。
+// 模乘只需要做 512 位乘积再按这个关系折叠即可。
+// M = 0x1000003D1 = 2^32 + 977, 低 32 位为 PSEUDO_MERSENNE_M0, 高 32 位为 1。
+#define PSEUDO_MERSENNE_M0 0x000003D1u
 
-CONSTANT uint256_t R_squared = {
-    0x000e90a1, 0x000007a2, 0x00000001, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000};
-
-CONSTANT uint256_t R_cube = {
-    0x3795f671, 0x002bb1e3, 0x00000b73, 0x00000001,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000};
-
-// 预计算的蒙哥马利常量
-
-CONSTANT uint256_t three_mont = {
-    0x00000B73, 0x00000003, 0x00000000, 0x00000000,
+// 域中的常量 3
+CONSTANT uint256_t three_mod = {
+    0x00000003, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
 // 点结构（仿射坐标）
@@ -62,6 +56,23 @@ struct AffinePoint {
             exit(EXIT_FAILURE);                                                                         \
         }                                                                                               \
     } while (0)
+
+// 默认策略下 cudaDeviceSynchronize() 是自旋忙等（spin），会让调用线程 100% 占满一个 CPU 核。
+// 改为阻塞式等待（Windows 上走 WaitForSingleObject），把该核让给 CPU 工作线程。
+// 注意：必须在任何会创建 CUDA context 的调用之前执行，否则返回 cudaErrorSetOnActiveProcess 且不生效。
+static void enable_blocking_sync()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    cudaError_t err = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    // context 已存在说明本进程更早的地方碰过 CUDA，此处无力回天，静默忽略即可
+    if (err != cudaSuccess && err != cudaErrorSetOnActiveProcess) {
+        fprintf(stderr, "cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) failed: %s\n",
+                cudaGetErrorString(err));
+    }
+    (void)cudaGetLastError(); // 清除残留的错误状态，避免污染后续 CHECK_CUDA
+}
 
 // ================== 基础算术函数 ==================
 // 返回最终进位状态 (1表示溢出)
@@ -104,54 +115,74 @@ __host__ __device__ int is_zero(const uint256_t& a)
     return 1;
 }
 
-// ================== 蒙哥马利运算 ==================
-__host__ __device__ uint256_t mont_mul(const uint256_t& a, const uint256_t& b)
+// 设备端可用的 256 位相等判断 (device 代码里不能调用 memcmp)
+__host__ __device__ int u256_equal(const uint256_t& a, const uint256_t& b)
 {
-    uint64_t t[9] = {0}; // 扩展存储到288位（9*32）
+    for (int i = 0; i < 8; ++i)
+        if (a.limb[i] != b.limb[i]) return 0;
+    return 1;
+}
 
+// ================== 域模运算 ==================
+// 一次 2^256 折叠, 利用 2^256 ≡ M = 2^32 + 0x3D1 (mod p):
+//     dst[0..7]  =  src[0..7] + (src[8 .. 8+hn-1]) * M
+// 输入 src 的低 8+hn 个肢体必须是归一化的 (每个 < 2^32); src 与 dst 不得重叠。
+// dst 需至少 12 个肢体 (折叠后最高只会到下标 9)。
+__host__ __device__ static void fold256(const uint32_t* src, int hn, uint32_t* dst)
+{
+    for (int k = 0; k < 8; ++k) dst[k] = src[k];
+    for (int k = 8; k < 12; ++k) dst[k] = 0;
+
+    uint64_t c = 0;
+    // hi[i]*M = hi[i]*0x3D1 + hi[i]*2^32 , 分别落在位置 i 与 i+1
+    for (int i = 0; i <= hn; ++i) {
+        if (i < hn) c += (uint64_t)src[8 + i] * PSEUDO_MERSENNE_M0;
+        if (i >= 1) c += (uint64_t)src[7 + i];
+        uint64_t cur = c + (uint64_t)dst[i];
+        dst[i] = (uint32_t)cur;
+        c = cur >> 32;
+    }
+    for (int i = hn + 1; c != 0; ++i) {
+        uint64_t cur = c + (uint64_t)dst[i];
+        dst[i] = (uint32_t)cur;
+        c = cur >> 32;
+    }
+}
+
+// 512 位归一化乘积 prod[0..15] 归约到 [0, p)
+// 折叠链 16 肢体 -> 10 有效 -> 9 有效 -> 9 有效 -> < 2^256
+__host__ __device__ static uint256_t reduce_product(const uint32_t* prod)
+{
+    uint32_t a[12], b[12];
+    fold256(prod, 8, a); // a < 2^289 + 2^256, 有效下标 0..9
+    fold256(a, 2, b);    // b < 2^256 + 2^66,  有效下标 0..8
+    fold256(b, 1, a);    // a < 2^256 + 2^33,  有效下标 0..8
+    fold256(a, 1, b);    // b < 2^256,         有效下标 0..7
+
+    uint256_t r;
+    for (int i = 0; i < 8; ++i) r.limb[i] = b[i];
+    // b < 2^256 且 p = 2^256 - M, 故至多需要减一次 p
+    if (is_ge(r, p)) sub256(r, p);
+    return r;
+}
+
+// 域模乘: r = a*b mod p (a, b 均视为 < p 的普通整数)
+__host__ __device__ uint256_t mul_mod(const uint256_t& a, const uint256_t& b)
+{
+    uint32_t t[16];
+    for (int i = 0; i < 16; ++i) t[i] = 0;
+
+    // 256x256 -> 512 位学校乘法
     for (int i = 0; i < 8; ++i) {
-        // 步骤1：计算a[i] * b并累加到t
         uint64_t carry = 0;
         for (int j = 0; j < 8; ++j) {
-            uint64_t product = (uint64_t)a.limb[i] * b.limb[j];
-            uint64_t sum = product + t[j] + carry;
-            t[j] = sum & 0xFFFFFFFF; // 保留低32位
-            carry = (sum >> 32) + (sum >= product? 0 : 0x100000000); // 记录进位
+            uint64_t cur = (uint64_t)a.limb[i] * b.limb[j] + t[i + j] + carry;
+            t[i + j] = (uint32_t)cur;
+            carry = cur >> 32;
         }
-        t[8] = carry; // 存储最高位进位
-
-        // 步骤2：计算m = (t[0] * np) mod 2^32
-        // uint32_t np = 0xD2253531;
-        uint32_t m = (uint32_t)((t[0] * 0xD2253531) & 0xFFFFFFFF);
-
-        // 步骤3：加m*p并处理进位
-        carry = 0;
-        for (int j = 0; j < 8; ++j) {
-            uint64_t product = (uint64_t)m * p.limb[j];
-            uint64_t sum = product + t[j] + carry;
-            t[j] = sum & 0xFFFFFFFF; // 保留低32位
-            carry = (sum >> 32) + (sum >= product ? 0 : 0x100000000); // 记录进位
-        }
-        t[8] += carry; // 累加最终进位
-
-        // 步骤4：右移32位
-        for (int j = 0; j < 8; ++j) {
-            t[j] = t[j + 1];
-        }
-        t[8] = 0; // 高位清零
+        t[i + 8] = (uint32_t)carry; // 位置 i+8 之前未被写过, 可直接赋值
     }
-
-    // 将结果从uint64_t数组转换回uint256_t
-    uint256_t result;
-    for (int i = 0; i < 8; ++i) {
-        result.limb[i] = (uint32_t)t[i];
-    }
-
-    // 最终模约简
-    if ((t[7]&0xF00000000) || is_ge(result, p)) {
-        sub256(result, p);
-    }
-    return result;
+    return reduce_product(t);
 }
 
 __host__ __device__ uint256_t mod_add(const uint256_t& a, const uint256_t& b, const uint256_t& m)
@@ -168,7 +199,7 @@ __host__ __device__ uint256_t mod_add(const uint256_t& a, const uint256_t& b, co
     return result;
 }
 
-__host__ __device__ uint256_t mont_sub(const uint256_t& a, const uint256_t& b)
+__host__ __device__ uint256_t mod_sub(const uint256_t& a, const uint256_t& b)
 {
     uint256_t result = a;
 
@@ -182,134 +213,18 @@ __host__ __device__ uint256_t mont_sub(const uint256_t& a, const uint256_t& b)
     return result;
 }
 
-__host__ __device__ uint256_t mont_inv(const uint256_t a)
-{
-    uint256_t result = R; // 1 in Montgomery form
-    uint256_t exponent = p;
-    uint256_t two = {{2}};
-    sub256(exponent, two); // p-2
-
-    for (int i = 255; i >= 0; --i) {
-        result = mont_mul(result, result);
-        if ((exponent.limb[i / 32] >> (i % 32)) & 1)
-            result = mont_mul(result, a);
-    }
-    return result;
-}
-
-// 扩展欧几里得算法求模逆 (普通域)
-__host__ __device__ uint256_t mod_inv(const uint256_t& a, const uint256_t& mod)
-{
-    // 特殊情况处理：0 没有逆元
-    if (is_zero(a)) {
-        return a; // 返回 0
-    }
-
-    // 初始化变量
-    uint256_t u = a;
-    uint256_t v = mod;
-    uint256_t x1 = {{1}}; // 初始系数: 1
-    uint256_t x2 = {{0}}; // 初始系数: 0
-    uint32_t carry;
-
-    // 迭代直到 v 为 0
-    while (!is_zero(v)) {
-        // 检查提前退出条件：u == 1 或 v == 1
-        if (u.limb[0] == 1 && u.limb[1] == 0 && u.limb[2] == 0 && u.limb[3] == 0 &&
-            u.limb[4] == 0 && u.limb[5] == 0 && u.limb[6] == 0 && u.limb[7] == 0) {
-            break; // u == 1，x1 就是逆元
-        }
-
-        if (v.limb[0] == 1 && v.limb[1] == 0 && v.limb[2] == 0 && v.limb[3] == 0 &&
-            v.limb[4] == 0 && v.limb[5] == 0 && v.limb[6] == 0 && v.limb[7] == 0) {
-            // v == 1，x2 就是逆元
-            x1 = x2;
-            break;
-        }
-        // 当 u 为偶数时
-        if ((u.limb[0] & 1) == 0) {
-            // u /= 2 (右移)
-            for (int i = 0; i < 7; i++) {
-                u.limb[i] = (u.limb[i] >> 1) | (u.limb[i + 1] << 31);
-            }
-            u.limb[7] >>= 1;
-
-            // 处理 x1
-            if ((x1.limb[0] & 1) == 0) {
-                carry = 0;
-            } else {
-                // x1 = (x1 + mod)
-                carry = add256(x1, mod);
-            }
-            // x1 /= 2 (右移)
-            for (int i = 0; i < 7; i++) {
-                x1.limb[i] = (x1.limb[i] >> 1) | (x1.limb[i + 1] << 31);
-            }
-            x1.limb[7] = (x1.limb[7] >> 1) | (carry << 31);
-        }
-        // 当 v 为偶数时
-        else if ((v.limb[0] & 1) == 0) {
-            // v /= 2 (右移)
-            for (int i = 0; i < 7; i++) {
-                v.limb[i] = (v.limb[i] >> 1) | (v.limb[i + 1] << 31);
-            }
-            v.limb[7] >>= 1;
-
-            // 处理 x2
-            if ((x2.limb[0] & 1) == 0) {
-                carry = 0;
-            } else {
-                // x2 = (x2 + mod)
-                carry = add256(x2, mod);
-            }
-            // x2 /= 2 (右移)
-            for (int i = 0; i < 7; i++) {
-                x2.limb[i] = (x2.limb[i] >> 1) | (x2.limb[i + 1] << 31);
-            }
-            x2.limb[7] = (x2.limb[7] >> 1) | (carry << 31);
-        }
-        // 当 u 和 v 都为奇数时
-        else {
-            if (is_ge(u, v)) {
-                // u = u - v
-                sub256(u, v);
-
-                // x1 = x1 - x2
-                if (is_ge(x1, x2)) {
-                    sub256(x1, x2);
-                } else {
-                    uint256_t temp = mod;
-                    sub256(temp, x2);
-                    add256(x1, temp);
-                }
-            } else {
-                // v = v - u
-                sub256(v, u);
-
-                // x2 = x2 - x1
-                if (is_ge(x2, x1)) {
-                    sub256(x2, x1);
-                } else {
-                    uint256_t temp = mod;
-                    sub256(temp, x1);
-                    add256(x2, temp);
-                }
-            }
-        }
-    }
-
-    // 确保结果在 [0, mod-1] 范围内
-    if (is_ge(x1, mod)) {
-        sub256(x1, mod);
-    }
-
-    return x1;
-}
-
 // ================== safegcd 模逆 (移植自 libsecp256k1 的 modinv32_impl.h) ==================
 // Bernstein-Yang divsteps 算法: 纯 int32/int64 整数运算, 无 CPU 专有指令, 天然适配 CUDA。
-// - 设备端: 常量时间版本 divsteps30 (30 步循环完全无分支, 避免 warp 发散)
-// - 主机端: 变量时间版本 divsteps30_var (平均提前退出, 更快)
+// - 设备端与主机端默认都走变量时间版本 divsteps30_var: 平均 ~11 轮收敛,
+//   并用 ctz 把连续的除 2 步骤批量处理, 纯算术开销约为常量时间版本的 1/4。
+//   rho 每一步点加都要做一次模逆, 模逆是热路径上最大的单项成本, 故优先选变量时间版本。
+//   代价: 同一 warp 内各线程轮数略有差异会有一定发散, 但轮数集中在 11 附近,
+//         远小于常量时间版本固定多出来的那 9 轮开销。
+// - 定义 USE_CONSTTIME_MODINV=1 可切回常量时间版本 (30 步完全无分支, warp 绝对无发散),
+//   用于在真实多线程场景下做 A/B 对比。
+#ifndef USE_CONSTTIME_MODINV
+#define USE_CONSTTIME_MODINV 0
+#endif
 #if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
 #include <intrin.h>
 #endif
@@ -347,6 +262,7 @@ __host__ __device__ static inline uint32_t ctz32(uint32_t x)
 #endif
 }
 
+#if USE_CONSTTIME_MODINV
 // 常量时间版本: 计算 30 个 divsteps 的转移矩阵 (完全无分支, warp 友好)
 __host__ __device__ static int32_t divsteps30(int32_t zeta, uint32_t f0, uint32_t g0, trans2x2* t)
 {
@@ -376,9 +292,11 @@ __host__ __device__ static int32_t divsteps30(int32_t zeta, uint32_t f0, uint32_
     t->r = (int32_t)r;
     return zeta;
 }
+#endif // USE_CONSTTIME_MODINV
 
 // modinv32_inv256[i] = -(2*i+1)^-1 (mod 256)
-static const uint8_t modinv32_inv256[128] = {
+// 设备端需要放在常量内存里 (与 modinfo_p 同样的做法), 主机端退化为普通常量数组
+CONSTANT uint8_t modinv32_inv256[128] = {
     0xFF, 0x55, 0x33, 0x49, 0xC7, 0x5D, 0x3B, 0x11, 0x0F, 0xE5, 0xC3, 0x59,
     0xD7, 0xED, 0xCB, 0x21, 0x1F, 0x75, 0x53, 0x69, 0xE7, 0x7D, 0x5B, 0x31,
     0x2F, 0x05, 0xE3, 0x79, 0xF7, 0x0D, 0xEB, 0x41, 0x3F, 0x95, 0x73, 0x89,
@@ -472,6 +390,7 @@ __host__ __device__ static void update_de_30(signed30* d, signed30* e, const tra
     e->v[8] = (int32_t)ce;
 }
 
+#if USE_CONSTTIME_MODINV
 // 计算 (t/2^30) * [f, g] (固定 9 limbs, 配合常量时间版本)
 __host__ __device__ static void update_fg_30(signed30* f, signed30* g, const trans2x2* t)
 {
@@ -497,6 +416,7 @@ __host__ __device__ static void update_fg_30(signed30* f, signed30* g, const tra
     f->v[8] = (int32_t)cf;
     g->v[8] = (int32_t)cg;
 }
+#endif // USE_CONSTTIME_MODINV
 
 // 计算 (t/2^30) * [f, g] (变长 limbs, 配合变量时间版本)
 __host__ __device__ static void update_fg_30_var(int len, signed30* f, signed30* g, const trans2x2* t)
@@ -594,6 +514,7 @@ __host__ __device__ static void normalize_30(signed30* r, int32_t sign, const mo
     r->v[8] = r8;
 }
 
+#if USE_CONSTTIME_MODINV
 // 常量时间版本: 固定 20 轮 x 30 divsteps (590 步对 256 位输入已足够)
 __host__ __device__ static void modinv32(signed30* x, const modinv32_modinfo_s* modinfo)
 {
@@ -612,6 +533,7 @@ __host__ __device__ static void modinv32(signed30* x, const modinv32_modinfo_s* 
     normalize_30(&d, f.v[8], modinfo);
     *x = d;
 }
+#endif // USE_CONSTTIME_MODINV
 
 // 变量时间版本: 平均约 11 轮即可收敛
 __host__ __device__ static void modinv32_var(signed30* x, const modinv32_modinfo_s* modinfo)
@@ -653,10 +575,10 @@ __host__ __device__ static void modinv32_var(signed30* x, const modinv32_modinfo
     *x = d;
 }
 
-// 设备端走常量时间版本(无分支、warp 友好), 主机端走变量时间版本(平均更快)
+// 设备端与主机端统一走变量时间版本 (见文件上方 USE_CONSTTIME_MODINV 的说明)
 __host__ __device__ static void modinv32_auto(signed30* x, const modinv32_modinfo_s* modinfo)
 {
-#ifdef __CUDA_ARCH__
+#if USE_CONSTTIME_MODINV
     modinv32(x, modinfo);
 #else
     modinv32_var(x, modinfo);
@@ -699,94 +621,58 @@ __host__ __device__ static void s30_to_u256(uint256_t* r, const signed30* a)
     }
 }
 
-// 转换到蒙哥马利域
-__host__ __device__ uint256_t to_mont(const uint256_t& a)
-{
-    return mont_mul(a, R_squared);
-}
-__host__ __device__ uint256_t from_mont(const uint256_t& a)
-{
-    uint256_t one = {1};
-    return mont_mul(a, one);
-}
-// 蒙哥马利域中的逆元计算 (safegcd/divsteps 版本, 移植自 libsecp256k1)
-// modinv32 与 mod_inv 一样, 只把输入当作普通整数求逆, 不感知蒙哥马利域:
-//   inv = (a*R)^-1 = a^-1 * R^-1
-//   mont_mul(inv, R^3) = a^-1 * R^-1 * R^3 * R^-1 = a^-1 * R  (即 a^-1 的蒙哥马利形式)
-// 故无需先转回普通域, 与 mont_inv2_euclid 保持同一形式。
-__host__ __device__ uint256_t mont_inv2(const uint256_t& a_mont)
+// 域中的逆元计算 (safegcd/divsteps 版本, 移植自 libsecp256k1)
+// modinv32 只把输入当作普通整数求逆, 输入输出都在同一域, 不需要任何域转换。
+__host__ __device__ uint256_t mod_inv_p(const uint256_t& a)
 {
     signed30 s;
-    u256_to_s30(&s, a_mont);
+    u256_to_s30(&s, a);
     modinv32_auto(&s, &modinfo_p);
     uint256_t inv;
     s30_to_u256(&inv, &s);
-    return mont_mul(inv, R_cube);
+    return inv;
 }
 
-// 旧版: 扩展欧几里得模逆 (保留用于 A/B 对比)
-__host__ __device__ uint256_t mont_inv2_euclid(const uint256_t& a_mont)
-{
-    uint256_t inv = mod_inv(a_mont, p);
-
-    return mont_mul(inv, R_cube);
-}
-
-// ================== 点运算 ==================
-__host__ __device__ AffinePoint mont_point_add(const AffinePoint& P_mont, const AffinePoint& Q_mont)
+// ================== 点运算 (仿射坐标) ==================
+__host__ __device__ AffinePoint point_add(const AffinePoint& P, const AffinePoint& Q)
 {
     // 处理无穷点情况
-    if (P_mont.infinity) return Q_mont;
-    if (Q_mont.infinity) return P_mont;
+    if (P.infinity) return Q;
+    if (Q.infinity) return P;
     AffinePoint R;
     R.x = {{0}};
     R.y = {{0}};
     R.infinity = true;
 
-    uint256_t x_diff = mont_sub(Q_mont.x, P_mont.x);
+    uint256_t x_diff = mod_sub(Q.x, P.x);
     if (is_zero(x_diff)) {
-        uint256_t y_sum = mod_add(P_mont.y, Q_mont.y, p);
+        uint256_t y_sum = mod_add(P.y, Q.y, p);
         if (is_zero(y_sum)) {
             return R;
         }
 
-        uint256_t x_sq = mont_mul(P_mont.x, P_mont.x);
-        uint256_t numerator = mont_mul(x_sq, three_mont); //改为加法的话，会产生负优化。
-        uint256_t lambda = mont_mul(numerator, mont_inv2(y_sum));
+        uint256_t x_sq = mul_mod(P.x, P.x);
+        uint256_t numerator = mul_mod(x_sq, three_mod); //改为加法的话，会产生负优化。
+        uint256_t lambda = mul_mod(numerator, mod_inv_p(y_sum));
 
-        uint256_t lambda_sq = mont_mul(lambda, lambda);
-        R.x = mont_sub(lambda_sq, mod_add(P_mont.x, P_mont.x, p));
+        uint256_t lambda_sq = mul_mod(lambda, lambda);
+        R.x = mod_sub(lambda_sq, mod_add(P.x, P.x, p));
 
-        uint256_t temp = mont_mul(lambda, mont_sub(P_mont.x, R.x));
-        R.y = mont_sub(temp, P_mont.y);
+        uint256_t temp = mul_mod(lambda, mod_sub(P.x, R.x));
+        R.y = mod_sub(temp, P.y);
     } else {
-        uint256_t y_diff = mont_sub(Q_mont.y, P_mont.y);
-        uint256_t lambda = mont_mul(y_diff, mont_inv2(x_diff));
+        uint256_t y_diff = mod_sub(Q.y, P.y);
+        uint256_t lambda = mul_mod(y_diff, mod_inv_p(x_diff));
 
-        uint256_t lambda_sq = mont_mul(lambda, lambda);
-        R.x = mont_sub(lambda_sq, P_mont.x);
-        R.x = mont_sub(R.x, Q_mont.x);
+        uint256_t lambda_sq = mul_mod(lambda, lambda);
+        R.x = mod_sub(lambda_sq, P.x);
+        R.x = mod_sub(R.x, Q.x);
 
-        uint256_t temp = mont_mul(lambda, mont_sub(P_mont.x, R.x));
-        R.y = mont_sub(temp, P_mont.y);
+        uint256_t temp = mul_mod(lambda, mod_sub(P.x, R.x));
+        R.y = mod_sub(temp, P.y);
     }
 
     R.infinity = false;
-    return R;
-}
-__host__ __device__ AffinePoint point_add(AffinePoint P, AffinePoint Q)
-{
-    // 转换为蒙哥马利域
-    P.x = to_mont(P.x);
-    P.y = to_mont(P.y);
-    Q.x = to_mont(Q.x);
-    Q.y = to_mont(Q.y);
-
-    AffinePoint R = mont_point_add(P, Q);
-
-    // 转换回普通形式
-    R.x = from_mont(R.x);
-    R.y = from_mont(R.y);
     return R;
 }
 
@@ -798,7 +684,7 @@ __host__ __device__ void transfer(unsigned char* mp, const unsigned char* mp2)
         mp[i] = mp2[31 - i];
     }
 }
-class RhoPoint_mont
+class RhoPoint_dev
 {
 public:
     uint256_t m = {0};
@@ -808,25 +694,22 @@ public:
     void from(const RhoPoint& r) {
         transfer((unsigned char*)&this->m, r.m);
         transfer((unsigned char*)&this->n, r.n);
+        // pubkey 字节即坐标, 直接拷入
         memcpy(&this->x, r.x.data, sizeof(r.x.data));
-        x.x = to_mont(x.x);
-        x.y = to_mont(x.y);
         x.infinity = false;
     }
     void to(RhoPoint& r)
     {
-        AffinePoint x_ = {{0}};
-        x_.x = from_mont(x.x);
-        x_.y = from_mont(x.y);
-        memcpy(r.x.data, &x_.x, sizeof(r.x.data));
+        // x.x 与 x.y 在 AffinePoint 中连续, 正好是 64 字节的未压缩坐标
+        memcpy(r.x.data, &this->x.x, sizeof(r.x.data));
         transfer(r.m, (unsigned char*)&this->m);
         transfer(r.n, (unsigned char*)&this->n);
     }
-    __device__ bool operator==(const RhoPoint_mont& other) const
+    __device__ bool operator==(const RhoPoint_dev& other) const
     {
         const unsigned char* a = (const unsigned char*)&this->m;
         const unsigned char* b = (const unsigned char*)&other.m;
-        for (size_t i = 0; i < /*sizeof(RhoPoint_mont)*/ 129; i++) {
+        for (size_t i = 0; i < /*sizeof(RhoPoint_dev)*/ 129; i++) {
             if (a[i] != b[i]) {
                 //printf("%d ", i);
                 return false;
@@ -837,11 +720,11 @@ public:
 } ;
 
 // 设备常量内存存储 adds_pub_dev
-__constant__ RhoPoint_mont adds_pub_dev[256];
+__constant__ RhoPoint_dev adds_pub_dev[256];
 
 
 constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
-__constant__ RhoPoint_mont RhoStates_rand[dp_buffer_size];
+__constant__ RhoPoint_dev RhoStates_rand[dp_buffer_size];
 
 // 可区分点判断 (设备端)
 __host__ __device__ uint64_t distinguishable(const uint256_t& x)
@@ -853,9 +736,9 @@ __host__ __device__ uint64_t distinguishable(const uint256_t& x)
     return 0;
 }
 
-__host__ __device__ void fun_add(RhoPoint_mont& s, const RhoPoint_mont& a)
+__host__ __device__ void fun_add(RhoPoint_dev& s, const RhoPoint_dev& a)
 {
-    s.x = mont_point_add(s.x, a.x);
+    s.x = point_add(s.x, a.x);
     s.m = mod_add(s.m, a.m, N);
     s.n = mod_add(s.n, a.n, N);
 }
@@ -874,11 +757,11 @@ bool* break_flag_host = nullptr;                // 主机端指针
 extern bool gameover;
 
 
-RhoPoint_mont* RhoStates_host = nullptr;
-__device__ RhoPoint_mont* RhoStates_dev = nullptr;
+RhoPoint_dev* RhoStates_host = nullptr;
+__device__ RhoPoint_dev* RhoStates_dev = nullptr;
 
 // 添加 DP 到缓冲区 (设备端)
-__device__ void add_dp_to_buffer(uint64_t d, RhoPoint_mont& r,
+__device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
                                  DpBuffer* buffer, unsigned int max_size)
 {
     // 原子递增获取缓冲区位置
@@ -1016,7 +899,7 @@ __host__ __device__ void uint256_to_hex_be(char* output, const uint256_t& value)
 }
 
 // 设备端函数：打印RhoPoint_dev的大端序十六进制表示
-__host__ __device__ void print_rho_point_dev(const RhoPoint_mont& point)
+__host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
 {
     // 缓冲区大小：4个256位值 * 64字符 + 分隔符 + 终结符
     constexpr int buf_size = 4 * 64 + 10;
@@ -1059,13 +942,12 @@ __global__ void rho()
 {
     // 获取全局线程索引
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    RhoPoint_mont s = RhoStates_dev[idx];
-    uint256_t x_ord = from_mont(s.x.x);
+    RhoPoint_dev s = RhoStates_dev[idx];
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
     /*
     // 设备共享内存存储 adds_pub
-    __shared__ RhoPoint_mont adds_pub[256];
+    __shared__ RhoPoint_dev adds_pub[256];
     // 共享内存产生的优化微乎其微， 2% 左右，但会多占用10个寄存器。
     // 从全局内存复制adds_pub到共享内存
     if (threadIdx.x == 0) {
@@ -1075,16 +957,15 @@ __global__ void rho()
     __syncthreads(); // 确保所有线程已完成加载
     */
     while (true) {
-        fun_add(s, adds_pub_dev[(unsigned char)x_ord.limb[0]]);
+        // s.x.x 就是最终坐标, 取低字节做索引无需任何域转换
+        fun_add(s, adds_pub_dev[(unsigned char)s.x.x.limb[0]]);
         count_rho++;
         // 检查是否可区分
-        x_ord = from_mont(s.x.x);
-        uint64_t d = distinguishable(x_ord);
+        uint64_t d = distinguishable(s.x.x);
         if (d != 0) {
             count_dp++;
             // 保存可区分点
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
-            x_ord = from_mont(s.x.x);
         }
         if ((count_rho & 0x3FFFF) == 0) {
             if (*break_flag_dev)
@@ -1097,86 +978,43 @@ __global__ void rho()
     }
 }
 
-// 获取最佳线程块大小
-void get_optimal_block_size(int& multiProcessorCount, int& block_size)
+// 选择 rho kernel 的 <grid, block> 配置。
+//
+// 单个 walker 是 ILP≈0 的长依赖链，只能靠 warp 并行掩盖延迟：每 SM 只有 1 个 warp
+// 时执行单元大面积空转；但 warp 太多只是抢功率（固定 -pl 下会触发降频），吞吐不增
+// 而单线程变慢。所以取一个固定的折中档位，温度交给外部 nvidia-smi -pl / -lgc。
+void get_optimal_block_size(int& grid_size, int& block_size)
 {
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
 
-    // 根据GPU架构特性选择最佳线程数
-    // 每个流处理器(SM)的 CUDA 核心数，参考 CUDA Samples 的 deviceQuery
-    int coresPerSM;
-    int multiple; // 每核心线程数：2 = 优先单线程速度；4 优先总吞吐
-    switch (g_run_mode) {
-    case 2: multiple = 1; break; // 模式2：每核心1线程，最快单线程速度
-    case 4: multiple = 2; break; // 模式4走 occupancy 路径，此值不生效
-    case 3:                        // 模式3（默认）
-    default: multiple = 2; break; // 模式3：每核心2线程
-    }
-    switch (prop.major) {
-    case 2: // Fermi
-        coresPerSM = (prop.minor == 1) ? 48 : 32;
-        break;
-    case 3: // Kepler
-        coresPerSM = 192;
-        break;
-    case 5: // Maxwell
-        coresPerSM = 128;
-        break;
-    case 6: // Pascal: 6.0(GTX 10 以下/P100)=64, 6.1/6.2(GTX 10 系)=128
-        coresPerSM = (prop.minor == 0) ? 64 : 128;
-        break;
-    case 7: // Volta(7.0/7.2)/Turing(7.5)
-        coresPerSM = 64;
-        break;
-    case 8: // Ampere: 8.0(A100)=64, 8.6(RTX 30)/8.7(Orin)/8.9(Ada RTX 40)=128
-        coresPerSM = (prop.minor == 0) ? 64 : 128;
-        break;
-    case 9: // Hopper
-        coresPerSM = 128;
-        break;
-    case 10: // Blackwell
-    case 12:
-        coresPerSM = 128;
-        break;
-    default: // 未知架构，按当前主流估计
-        coresPerSM = 128;
-    }
-    // 确保不超过硬件限制，且为 warp(32) 整数倍
-    block_size = std::min(coresPerSM * multiple, (int)prop.maxThreadsPerBlock);
-    block_size -= block_size % 32;
-    if (block_size < 32) block_size = 32;
-    multiProcessorCount = prop.multiProcessorCount;
-    if (g_run_mode == 4) {
-        // 模式4：使用 occupancy API 计算的 blockSize / gridSize
-        CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(
-            &multiProcessorCount,
-            &block_size,
-            rho,
-            0, // 无动态共享内存
-            0  // 线程块大小上限
-            ));
-    }
+    // 每 SM 驻留的线程数：调小单线程更快，调大吞吐更高，256 (8 warp) 是折中起点
+    const int threadsPerSM = 256;
+    block_size = std::min(threadsPerSM, (int)prop.maxThreadsPerBlock);
+    grid_size = prop.multiProcessorCount;
+
+    std::cout << get_time() << " : GPU " << prop.name << " grid " << grid_size
+              << " x block " << block_size << std::endl;
 }
 
 extern RhoPoint adds_pub[2][256];
 
 void init_adds_pub_dev()
 {
-    for (int i = 0; i < sizeof(adds_pub_dev) / sizeof(RhoPoint_mont); i++) {
-        RhoPoint_mont t;
+    for (int i = 0; i < sizeof(adds_pub_dev) / sizeof(RhoPoint_dev); i++) {
+        RhoPoint_dev t;
         t.from(adds_pub[0][i]);
-        CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_dev, &t, sizeof(RhoPoint_mont), sizeof(RhoPoint_mont) * i, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_dev, &t, sizeof(RhoPoint_dev), sizeof(RhoPoint_dev) * i, cudaMemcpyHostToDevice));
     }
 }
 
 void init_RhoStates_rand() {
-    for (int i = 0; i < sizeof(RhoStates_rand) / sizeof(RhoPoint_mont); i++) {
-        RhoPoint_mont t;
+    for (int i = 0; i < sizeof(RhoStates_rand) / sizeof(RhoPoint_dev); i++) {
+        RhoPoint_dev t;
         RhoPoint r;
         r.rand();
         t.from(r);
-        CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_rand, &t, sizeof(RhoPoint_mont), sizeof(RhoPoint_mont) * i, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_rand, &t, sizeof(RhoPoint_dev), sizeof(RhoPoint_dev) * i, cudaMemcpyHostToDevice));
     }
 }
 
@@ -1187,13 +1025,13 @@ bool saveRhoState(const RhoState* s, int num, const std::string& name);
 void init_RhoStates_dev(int total_points, const std::string& name)
 {
     //分配设备内存并复制初始状态
-    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_mont)));
-    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_mont*)));
+    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_dev)));
+    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_dev*)));
     std::vector<RhoState> rsv;
     rsv.resize(total_points);
     int num = loadRhoState(rsv.data(), total_points, name);
     for (int i = 0; i < total_points; i++) {
-        RhoPoint_mont t;
+        RhoPoint_dev t;
         if (i < num) {
             t.from(rsv[i]);
         } else {
@@ -1201,7 +1039,7 @@ void init_RhoStates_dev(int total_points, const std::string& name)
             r.rand();
             t.from(r);
         }
-        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_mont), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
     }
 }
 
@@ -1210,8 +1048,8 @@ void save_RhoStates_dev(int total_points, const std::string& name)
     std::vector<RhoState> rsv;
     rsv.resize(total_points);
     for (int i = 0; i < total_points; i++) {
-        RhoPoint_mont t;
-        CHECK_CUDA(cudaMemcpy(&t, RhoStates_host + i, sizeof(RhoPoint_mont), cudaMemcpyDeviceToHost));
+        RhoPoint_dev t;
+        CHECK_CUDA(cudaMemcpy(&t, RhoStates_host + i, sizeof(RhoPoint_dev), cudaMemcpyDeviceToHost));
         t.to(rsv[i]);
         rsv[i].times = 0;
     }
@@ -1223,33 +1061,33 @@ extern secp256k1_context* ctx;
 void init_RhoStates_test(int total_points)
 {
     // 分配设备内存并复制初始状态
-    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_mont)));
-    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_mont*)));
+    CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_dev)));
+    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_dev*)));
     RhoState r;
     set_int256(r.m, "569103012ff8d20291a62809f4ac5f6c8f88a13d4208a6a674cec68f1307254e");
     set_int256(r.n, "92ce814fc881620c4461460d5144b54780edbae642905b0b847eb34ea5688bd3");
     create(ctx, &r.x, r.m, r.n);
-    RhoPoint_mont t;
+    RhoPoint_dev t;
     for (int i = 0; i < total_points - 1; i++) {
         t.from(r);
-        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_mont), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
         rho_F(ctx, r);
     }
     set_int256(r.m, "4795cc3b02cfd7772a0f913b7cf18ed3cbff9c59b2c8899d0f719449c641e0a0");
     set_int256(r.n, "38468e1ca1ab59348d856b441274666059c1fc7fabf1fb267a80b0ff83eca274");
     create(ctx, &r.x, r.m, r.n);
     t.from(r);
-    CHECK_CUDA(cudaMemcpy(RhoStates_host + total_points - 1, &t, sizeof(RhoPoint_mont), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(RhoStates_host + total_points - 1, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
 }
 
 void rho_play() {
+    enable_blocking_sync(); // 必须最先调用：避免 cudaDeviceSynchronize 自旋空转占满一个核
     // 创建 DP 管理器
     DpManager dp_manager(dp_buffer_size);
-    int multiProcessorCount = 0;
+    int gridSize = 0;
     int blockSize = 0;
-    get_optimal_block_size(multiProcessorCount, blockSize);
-    std::cout << get_time() << " : multiProcessorCount: " << multiProcessorCount << ", blockSize : " << blockSize << std::endl;
-    int total_points = multiProcessorCount * blockSize;
+    get_optimal_block_size(gridSize, blockSize);
+    int total_points = gridSize * blockSize;
     init_RhoStates_dev(total_points, _RSFile2_name);
     init_adds_pub_dev();
     // 初始化break_flag
@@ -1257,7 +1095,7 @@ void rho_play() {
     while (!gameover) {
         break_rho(false);
         init_RhoStates_rand();
-        rho<<<multiProcessorCount, blockSize>>>();
+        rho<<<gridSize, blockSize>>>();
         // 等待核函数完成
         CHECK_CUDA(cudaDeviceSynchronize());
         dp_manager.save_dps();
@@ -1284,7 +1122,7 @@ __constant__ AffinePoint G = {
 
 __global__ void validate_safegcd()
 {
-    // 测试 safegcd 模逆与旧欧几里得实现一致性
+    // 测试 safegcd 模逆: 直接验证 a * a^-1 == 1 (mod p)
     uint256_t probe[4] = {
         {{0x5F8E52C7, 0xD3A21B04, 0x9C56B9AF, 0x6E1F3D82, 0x2A8C77D1, 0xB4E09F63, 0x1D5AC7E8, 0x7F3B29A0}},
         {{0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000}},
@@ -1292,16 +1130,10 @@ __global__ void validate_safegcd()
         {{0x12345678, 0x9ABCDEF0, 0x0FEDCBA9, 0x87765432, 0x1A2B3C4D, 0x5E6F7081, 0x92A3B4C5, 0xD6E7F809}},
     };
     for (int i = 0; i < 4; ++i) {
-        uint256_t m1 = mont_inv2(probe[i]);
-        uint256_t m2 = mont_inv2_euclid(probe[i]);
-        assert(memcmp(&m1, &m2, sizeof(uint256_t)) == 0); // 与旧实现结果一致
-
-        // 直接验证: mont_mul(m1, to_mont(a)) 应等于 to_mont(1), 即 a * a^-1 == 1 (mod p)
+        uint256_t m1 = mod_inv_p(probe[i]);
         uint256_t one = {1};
-        uint256_t a_ord = mont_mul(probe[i], one); // 转普通域
-        uint256_t expect_one_mont = to_mont(one);
-        uint256_t got = mont_mul(m1, to_mont(a_ord));
-        assert(memcmp(&got, &expect_one_mont, sizeof(uint256_t)) == 0);
+        uint256_t got = mul_mod(m1, probe[i]);
+        assert(u256_equal(got, one));
     }
 }
 
@@ -1322,7 +1154,7 @@ __global__ void validate_1()
 
     // 测试1.1: G+(-G)
     AffinePoint res_1G;
-    uint256_t _y = mont_sub({0}, G.y);
+    uint256_t _y = mod_sub({0}, G.y);
     res_1G.x = G.x;
     res_1G.y = _y;
     res_1G.infinity = false;
@@ -1342,8 +1174,8 @@ __global__ void validate_1()
     assert(res3G.y.limb[7] == 0x388f7b0f); // 3G的y坐标高位
 
     //测试 distinguishable
-    assert(distinguishable(from_mont(RhoStates_dev[0].x.x)) == 0);
-    assert(distinguishable(from_mont(RhoStates_dev[RHOSTATES_TEST_NUM].x.x)) == 867600860383096976);
+    assert(distinguishable(RhoStates_dev[0].x.x) == 0);
+    assert(distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x.x) == 867600860383096976);
 
     assert(*break_flag_dev == true);
 }
@@ -1353,8 +1185,8 @@ __global__ void validate_multi()
     //测试 rho_f_dev
     for (int i = 0; i < RHOSTATES_TEST_NUM / (blockDim.x * gridDim.x); i++) {
         int index = i * blockDim.x * gridDim.x + blockDim.x * blockIdx.x + threadIdx.x;
-        RhoPoint_mont rs = RhoStates_dev[index];
-        auto t = (unsigned char)from_mont(rs.x.x).limb[0];
+        RhoPoint_dev rs = RhoStates_dev[index];
+        auto t = (unsigned char)rs.x.x.limb[0];
         fun_add(rs, adds_pub_dev[t]);
         assert((rs == RhoStates_dev[index + 1]));
     }
@@ -1365,17 +1197,15 @@ __global__ void validate_multi()
     }
 }
 
-__host__ __device__ uint64_t perf_fun(RhoPoint_mont& s, const RhoPoint_mont* adds)
+__host__ __device__ uint64_t perf_fun(RhoPoint_dev& s, const RhoPoint_dev* adds)
 {
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
-    uint256_t x_ord = from_mont(s.x.x);
     while (count_rho < 800000) {
-        fun_add(s, adds[(unsigned char)x_ord.limb[0]]);
+        fun_add(s, adds[(unsigned char)s.x.x.limb[0]]);
         count_rho++;
         // 检查是否可区分
-        x_ord = from_mont(s.x.x);
-        uint64_t d = distinguishable(x_ord);
+        uint64_t d = distinguishable(s.x.x);
         if (d != 0) {
             count_dp++;
         }
@@ -1384,11 +1214,11 @@ __host__ __device__ uint64_t perf_fun(RhoPoint_mont& s, const RhoPoint_mont* add
 }
 
 void perf_test_cpu() {
-    RhoPoint_mont adds_pub_tmp[256];
-    for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_mont); i++) {
+    RhoPoint_dev adds_pub_tmp[256];
+    for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_dev); i++) {
         adds_pub_tmp[i].from(adds_pub[0][i]);
     }
-    RhoPoint_mont s = adds_pub_tmp[0];
+    RhoPoint_dev s = adds_pub_tmp[0];
     const auto start = std::chrono::steady_clock::now();
     uint64_t count_rho = perf_fun(s, adds_pub_tmp);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1400,8 +1230,8 @@ void perf_test_cpu() {
 
 __global__ void perf_test_gpu_kernel()
 {
-    RhoPoint_mont s = adds_pub_dev[threadIdx.x % 256];
-    __shared__ RhoPoint_mont adds_pub[256];
+    RhoPoint_dev s = adds_pub_dev[threadIdx.x % 256];
+    __shared__ RhoPoint_dev adds_pub[256];
     // 从全局内存复制adds_pub到共享内存
     for (int i = 0; i < 256; i++)
         adds_pub[i] = adds_pub_dev[i];
@@ -1430,6 +1260,7 @@ void perf_test_gpu()
 
 void perf_test() {
     // 性能测试
+    enable_blocking_sync();
     init_adds_pub_dev();
     perf_test_cpu();
     perf_test_libsecp256k1();
@@ -1439,6 +1270,7 @@ void perf_test() {
 
 void validate_test()
 {
+    enable_blocking_sync();
     init_RhoStates_test(RHOSTATES_TEST_NUM + 1);
     init_adds_pub_dev();
     init_break_flag();
@@ -1461,7 +1293,7 @@ void validate_test()
     for (int i = 0; i < 4096; i++) {
         RhoPoint r, r2;
         r.rand();
-        RhoPoint_mont t;
+        RhoPoint_dev t;
         t.from(r);
         DpBuffer buffer;
         transfer(buffer.sp.m, (const unsigned char*)&t.m);

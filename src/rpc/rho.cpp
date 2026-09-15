@@ -244,16 +244,20 @@ static uint64_t perf_fun_lib(RhoState& s, uint64_t iters)
         (void)r;
         count_rho++;
 
-        // DP 判定: 对应设备端 distinguishable(x 低 32 位为 0 时取 bit32..95)
-        // x 以 ge_storage 形式存放(5x52), 故:
-        //   x mod 2^32        = n0 的低 32 位
-        //   x 的 bit 64..95   = n1 的 bit 12..43
-        uint64_t n0 = 0, n1 = 0;
-        memcpy(&n0, s.x.data, sizeof(n0));
-        memcpy(&n1, s.x.data + sizeof(n0), sizeof(n1));
+        // DP 判定: 对应 distinguishable(x 的 bit 0..31 全 0 时返回 bit 32..95)。
+        // s.x.data 是 ge_storage (4 x 64 位存储字, 不是 5x52 肢体), 按字节看:
+        //   x 的 bit 0..63   = 存储字 w0
+        //   x 的 bit 64..127 = 存储字 w1
+        // 所以
+        //   x mod 2^32      = w0 的低 32 位
+        //   x 的 bit 32..63 = w0 的高 32 位
+        //   x 的 bit 64..95 = w1 的低 32 位
+        uint64_t w0 = 0, w1 = 0;
+        memcpy(&w0, s.x.data, sizeof(w0));
+        memcpy(&w1, s.x.data + sizeof(w0), sizeof(w1));
         uint64_t d = 0;
-        if ((uint32_t)n0 == 0) {
-            d = (uint64_t)(uint32_t)(n0 >> 32) | ((uint64_t)(uint32_t)(n1 >> 12) << 32);
+        if ((uint32_t)w0 == 0) {
+            d = (uint64_t)(uint32_t)(w0 >> 32) | ((uint64_t)(uint32_t)w1 << 32);
         }
         if (d != 0) {
             count_dp++;
@@ -537,14 +541,22 @@ inline void rho_affine_step(RhoAffineState& s)
     add_mod_N(s.n, A.n);
 }
 
-// 对应设备端 distinguishable(): x 低 32 位为 0 时返回 x 的 bit 32..95
+// 对应 distinguishable(): x 的 bit 0..31 全 0 时, 返回 x 的 bit 32..95 (连续 64 位)。
+//
+// distinguishable 是按字节读的: *(uint64_t*)(x.data + 4), 也就是 x 的 bit 32..95
+// 这一段连续 64 位。这里要在 5x52 肢体上取出同一段, 分三段拼接:
+//   bit 32..51 = X.n[0] 的 bit 32..51   (n[0] 只覆盖到 bit 51)
+//   bit 52..63 = X.n[1] 的 bit 0..11    (n[1] 的 bit 0 即 x 的 bit 52)
+//   bit 64..95 = X.n[1] 的 bit 12..43
+// 合并即 (X.n[0] >> 32) | (X.n[1] << 20): n[1] 的低 44 位整体左移 20 位后, 正好
+// 对接上 n[0] >> 32 的高端; n[1] 多出来的 bit 44..51 被移出 64 位自然丢弃。
+//
+// 注意: 这里假定 X 已全规约 (rho_affine_add 每步结尾保证), 否则 limb 与 x 的
+//       二进制位对不上。
 inline uint64_t rho_affine_dp(const RhoAffineState& s)
 {
-    if ((uint32_t)s.X.n[0] != 0) return 0;
-    // x mod 2^32      = X.n[0] 的低 32 位
-    // x 的 bit 64..95 = X.n[1] 的 bit 12..43
-    return (uint64_t)(uint32_t)(s.X.n[0] >> 32)
-         | ((uint64_t)(uint32_t)(s.X.n[1] >> 12) << 32);
+    if ((uint32_t)s.X.n[0] != 0) return 0;   // x bit 0..31 != 0 -> 不构成 DP
+    return (s.X.n[0] >> 32) | (s.X.n[1] << 20);
 }
 
 // 正确性自检: 与库公开 API 路径逐步对拍 (点坐标 + m/n 标量)
@@ -579,23 +591,17 @@ bool rho_affine_selfcheck(int steps)
 
         rho_affine_step(aff);
 
-        // 对比点坐标 (affine 侧 Y 只做了 normalize_weak, 比较前先全规约)
-        secp256k1_fe x = aff.X, y = aff.Y;
-        secp256k1_fe_normalize_var(&x);
-        secp256k1_fe_normalize_var(&y);
-        RhoGeStorage st;
-        secp256k1_fe_to_storage(&st.x, &x);
-        secp256k1_fe_to_storage(&st.y, &y);
-        if (memcmp(&st, lib.x.data, sizeof(st)) != 0) {
+        // 对比点坐标 + 标量: 直接走生产路径的 rho_affine_store, 顺带验证
+        // 打包出的字节与库的规范 ge_storage 一致 (affine 侧 Y 只做 normalize_weak,
+        // 与规范值存在差别的概率约 2^-224, 可忽略)。
+        RhoPoint rp;
+        rho_affine_store(aff, rp);
+        if (memcmp(rp.x.data, lib.x.data, sizeof(lib.x.data)) != 0) {
             std::cout << "rho-affine selfcheck: 第 " << i << " 步点坐标不一致" << std::endl;
             return false;
         }
 
-        // 对比 m/n
-        uint64_t ml[4], nl[4];
-        be32_to_limbs(ml, lib.m);
-        be32_to_limbs(nl, lib.n);
-        if (memcmp(ml, aff.m, sizeof(ml)) != 0 || memcmp(nl, aff.n, sizeof(nl)) != 0) {
+        if (memcmp(rp.m, lib.m, sizeof(rp.m)) != 0 || memcmp(rp.n, lib.n, sizeof(rp.n)) != 0) {
             std::cout << "rho-affine selfcheck: 第 " << i << " 步标量不一致" << std::endl;
             return false;
         }
@@ -641,6 +647,57 @@ void validate_rho_affine()
     std::cout << "rho-affine selfcheck (2000 steps vs libsecp256k1 public API): "
               << (ok ? "PASS" : "FAIL") << std::endl;
     assert(ok);
+
+    // rho_affine_dp 与 distinguishable() 的对拍。
+    //
+    // 随机游走中 x 低 32 位全 0 的概率约 2^-32, 2000 步自检基本不可能触发 DP
+    // 分支, 所以这里用构造值专门覆盖它。参考值走生产回写路径
+    // (rho_affine_store -> rs.x.data), 再按 distinguishable 的读法取
+    // x.data[4..12), 即 x 的 bit 32..95。
+    bool dp_ok = true;
+    {
+        // 32 字节大端, 末 4 字节均为 0 (即 x 的 bit 0..31 全 0); 值均 < p
+        static const char* const kDpBe[] = {
+            "0000000000000000000000000000000000000000000000000000000000000000", // x = 0
+            "0000000000000000000000000000000000000000000000000000000100000000", // x = 2^32
+            "000000000000000000000000000000000000000000000000fff0000000000000", // x = 0xFFF << 52
+            "0000000000000000000000000000000000000000deadbeefcafebabe00000000", // bit 32..95 填满
+            "0000000000000000000000000000000000000000000000000000000012345678", // 低 32 位非 0
+        };
+
+        for (const char* be : kDpBe) {
+            unsigned char b32[32];
+            for (int k = 0; k < 32; ++k) {
+                const int hi = (be[2 * k] <= '9') ? be[2 * k] - '0' : be[2 * k] - 'a' + 10;
+                const int lo = (be[2 * k + 1] <= '9') ? be[2 * k + 1] - '0' : be[2 * k + 1] - 'a' + 10;
+                b32[k] = (unsigned char)((hi << 4) | lo);
+            }
+
+            RhoAffineState s;
+            secp256k1_fe_set_b32_mod(&s.X, b32);
+            secp256k1_fe_normalize_var(&s.X);
+            s.Y = s.X;   // 与 DP 判定无关
+            memset(s.m, 0, sizeof(s.m));
+            memset(s.n, 0, sizeof(s.n));
+
+            RhoPoint rp;
+            rho_affine_store(s, rp);
+            uint64_t t0 = 0, t1 = 0;
+            memcpy(&t0, rp.x.data, sizeof(t0));
+            memcpy(&t1, rp.x.data + 4, sizeof(t1));
+            const uint64_t want = ((uint32_t)t0 == 0) ? t1 : 0;
+
+            const uint64_t got = rho_affine_dp(s);
+            if (got != want) {
+                std::cout << "rho-affine dp mismatch: be=" << be << " got=" << got
+                          << " want=" << want << std::endl;
+                dp_ok = false;
+            }
+        }
+    }
+    std::cout << "rho-affine dp vs distinguishable (5 values): " << (dp_ok ? "PASS" : "FAIL")
+              << std::endl;
+    assert(dp_ok);
 }
 
 // ---------------------------------------------------------------------------
