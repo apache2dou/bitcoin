@@ -44,6 +44,9 @@ void break_rho(bool value);
 void rho_play();
 void validate_test();
 void perf_test();
+// 定义在 rpc/cuda.cu (BUILD_BITCOIN_CUDA) 或 rpc/cuda_stub.cpp: GPU 多 walker
+// 批量求逆的基准测试, 由 perf_test() 调用
+void perf_test_rho_gpu_walkers();
 // 定义在 rpc/rho.cpp: libsecp256k1 版本的点加性能测试, 由 perf_test() 调用
 void perf_test_libsecp256k1();
 // 定义在 rpc/rho.cpp: 直接用 libsecp256k1 内部 5x52 域实现的仿射点加性能测试

@@ -19,3 +19,8 @@ void perf_test()
 {
     throw std::runtime_error("CUDA support is not enabled in this build.");
 }
+
+void perf_test_rho_gpu_walkers()
+{
+    throw std::runtime_error("CUDA support is not enabled in this build.");
+}
