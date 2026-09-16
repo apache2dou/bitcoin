@@ -1265,6 +1265,7 @@ void perf_test() {
     perf_test_cpu();
     perf_test_libsecp256k1();
     perf_test_rho_affine();
+    perf_test_rho_affine_walkers();
     perf_test_gpu();
 }
 

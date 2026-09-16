@@ -3421,7 +3421,13 @@ private:
     iLog _dplog;
 
 public:
+    // 巨人步每条都要查表, 凑不出批量求逆, 固定单 walker
+    static constexpr int WALKERS0 = 1;
+    static constexpr int WALKERS = 1;
+
     BabyGiant() : _dplog(_DPFile_name) {}
+    // 它每步都直接写 rs, 无缓存, 无需 flush (接口对齐 Rho)
+    void flush(const int i, RhoState* rs) {}
     void prepare()
     {
         //先load _Mvec, 好让它早点儿被swapout
@@ -3430,24 +3436,24 @@ public:
         BabyNUM = _Xvec.size();
         assert(_Xvec.size() == _Mvec.size());
     }
-    bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
+    bool shoot(const int i, RhoState* rs, unsigned int& count_dstg, std::string& log)
     {
-        giantStep(ctx, rs);
-        auto b = find_baby(ctx, _Xvec, _Mvec, rs.x);
+        giantStep(ctx, rs[0]);
+        auto b = find_baby(ctx, _Xvec, _Mvec, rs[0].x);
         if (b != 0) {
             CKey k;
-            if (bingo(ctx, k, rs, b)) {
+            if (bingo(ctx, k, rs[0], b)) {
                 save_key(k);
             } else {
                 log += "!!!!short circulation!!!!\n";
             }
             return false;
         }
-        if (auto d = distinguishable(rs.x)) {
+        if (auto d = distinguishable(rs[0].x)) {
             ++count_dstg;
-            saveDP(_dplog.ofs, d, rs);
-            rs.rand();
-            fun_mul(rs, 2);
+            saveDP(_dplog.ofs, d, rs[0]);
+            rs[0].rand();
+            fun_mul(rs[0], 2);
         }
         return true;
     }
@@ -3461,7 +3467,27 @@ private:
     iLog _dplog;
 
 public:
+    // 每线程交错推进的 walker 数。同线程多 walker 的全部意义是让 W 个独立的分母
+    // 凑成一批只求一次模逆 (见 rpc/rho.cpp 的 Montgomery 批量求逆), 这一点跨线程
+    // 做不到。宽度按线程分工 (实测数据见 common.h):
+    //   线程0 取 WALKERS0 (窄批, 单条链推进快);
+    //   其余线程取 WALKERS (宽批, 总吞吐高)。
+    static constexpr int WALKERS0 = RHO_WALKERS0;
+    static constexpr int WALKERS = RHO_WALKERS;
+
     Rho() : _dplog(_DPFile_name) {}
+
+    // 存档 / 线程退出前把线程局部缓存里的最新 walker 状态写回 rs。
+    // rho_affine_FW 平时不写 rs (只在 DP 命中时写), 所以 saveRhoState /
+    // archive 读到的 rs 必须先经过这里才是最新值。宽度因线程而异, 要传线程号。
+    void flush(const int i, RhoState* rs)
+    {
+        if (i == 0) {
+            rho_affine_flush<WALKERS0>(rs);
+        } else {
+            rho_affine_flush<WALKERS>(rs);
+        }
+    }
     void prepare()
     {
         /* _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
@@ -3473,34 +3499,27 @@ public:
         rho_affine_prepare();
     }
 
-    bool shoot(const int i, RhoState& rs, unsigned int& count_dstg, std::string& log)
+    bool shoot(const int i, RhoState* rs, unsigned int& count_dstg, std::string& log)
     {
         // ------------------------------------------------------------------
         // 旧实现: libsecp256k1 公开 API 的点加 (ge 解析 + 完整群运算)。
-        // 保留备查 / 需要对照时启用。注意: 它与下面的 rho_affine_F 共用线程局部的
-        // 状态缓存, 二者不要在同一个线程里交替调用。
+        // 保留备查 / 需要对照时启用。注意: 它与 rho_affine_F / rho_affine_FW
+        // 各有自己的线程局部状态缓存, 不要在同一个线程里交替调用。
         // ------------------------------------------------------------------
-        // rho_F(ctx, rs);
+        // rho_F(ctx, rs[0]);
 
-        // 仿射点加 (libsecp256k1 内部 5x52 域实现), 语义与 rho_F 完全一致
-        rho_affine_F(rs);
+        // 单 walker 对照 (无批量求逆): rho_affine_F(rs[0]);
 
-        /* auto b = find_baby(ctx, _Xvec, _Mvec, rs.x);
-        if (b != 0) {
-            CKey k;
-            if (bingo(ctx, k, rs, b)) {
-                save_key(k);
-            } else {
-                log += "!!!!short circulation!!!!\n";
-            }
-            return false;
-        }*/
-        if (auto d = distinguishable(rs.x)) {
+        // 同一线程内 WALKERS 个 walker 交错走一步: WALKERS 次模逆 -> 1 次。
+        // 返回值是 DP 命中掩码; 未命中的 walker 状态留在 rho.cpp 的线程局部
+        // cache 里, rs[k] 的 x/m/n 只在命中时才是新值 (times 始终每步递增)。
+        const uint32_t dp_mask = (i == 0) ? rho_affine_FW<WALKERS0>(rs)
+                                          : rho_affine_FW<WALKERS>(rs);
+
+        for (uint32_t m = dp_mask; m != 0; m &= m - 1) {
+            const int k = std::countr_zero(m);
             ++count_dstg;
-            saveDP(_dplog.ofs, d, rs);
-            /*if (i != 0 && count_dstg % 3 == 0) {
-                rs.rand();
-            }*/
+            saveDP(_dplog.ofs, distinguishable(rs[k].x), rs[k]);
         }
         return true;
     }
@@ -3597,13 +3616,17 @@ static bool pin_to_physical_core(unsigned index)
 
 template <typename PLAYER>
 void play() {
-    std::string _logvec[256];
-    RhoState rs[256] = {0};
+    // 槽位数与 initRhoState 生成器共用同一个常量 (common.h), 存档文件条数一致
+    std::string _logvec[RHO_STATE_SLOTS];
+    RhoState rs[RHO_STATE_SLOTS] = {0};
     bool pause = false;
-    if (loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name) < sizeof(rs) / sizeof(RhoState)) {
-        for (RhoState& r : rs) {
-            r.rand();
-            r.times = 0;
+    {
+        // 部分加载: 旧档条数不足槽位数时 (比如 256 条的旧档), 只把缺的槽补
+        // 随机, 已有进度全部保留。loadRhoState 返回成功加载的条数。
+        const int loaded = loadRhoState(rs, RHO_STATE_SLOTS, _RSFile1_name);
+        for (int i = loaded; i < RHO_STATE_SLOTS; ++i) {
+            rs[i].rand();
+            rs[i].times = 0;
         }
     }
     for (RhoState& r : rs) {
@@ -3611,6 +3634,11 @@ void play() {
     }
     PLAYER _player;
     _player.prepare();
+    // 每个线程交错推进 W 个 walker (见 rpc/rho.cpp 的批量求逆)。
+    // 线程0 用窄批 W0 (单条链推进快, 单线程模式也只有它), 其余线程用宽批 W
+    // (总吞吐高), 宽度由 PLAYER 按线程号分派。
+    constexpr int W0 = PLAYER::WALKERS0;
+    constexpr int W = PLAYER::WALKERS;
     unsigned hw = std::thread::hardware_concurrency();
     int n_tasks;
     switch (g_run_mode) {
@@ -3620,8 +3648,13 @@ void play() {
     case 3:                                // 模式3：multiple=2，CPU 1/2核
     default: n_tasks = std::max(1u, hw / 2); break;
     }
-    std::cout << "run mode " << g_run_mode << ", cpu threads " << n_tasks << std::endl;
-    assert(n_tasks <= sizeof(rs) / sizeof(RhoState));
+    // 槽位按线程分段独占: 线程0 占 [0, W0), 线程 i>0 各占连续 W 个,
+    // 槽位总数见 common.h 的 RHO_STATE_SLOTS
+    constexpr int k_slots = RHO_STATE_SLOTS;
+    const int max_tasks = 1 + (k_slots - W0) / W;
+    n_tasks = std::min(n_tasks, max_tasks);
+    std::cout << "run mode " << g_run_mode << ", cpu threads " << n_tasks
+              << ", walkers/thread " << W0 << "(#0)/" << W << std::endl;
     auto saveStates = [&]() {
         saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
     };
@@ -3637,13 +3670,16 @@ void play() {
         if ((g_run_mode == 2 || g_run_mode == 3) && !pin_to_physical_core(i)) {
             std::cout << "thread " << i << " pin core failed." << std::endl;
         }
+        const int w_i = (i == 0) ? W0 : W;
+        // 本线程独占的 walker 段: 线程0 在头部, 其余线程紧随其后连续排列
+        RhoState* rs_i = &rs[(i == 0) ? 0 : W0 + (i - 1) * W];
         uint64_t count_try{0};
         unsigned int count_dstg{0};
         auto start = std::chrono::high_resolution_clock::now();
         while (!gameover) {
             try {
                 ++count_try;
-                _player.shoot(i, rs[i], count_dstg, _logvec[i]);
+                _player.shoot(i, rs_i, count_dstg, _logvec[i]);
             } catch (...) {
                 stop_game();
             }
@@ -3652,16 +3688,22 @@ void play() {
                 std::cout << get_time() << " : game pause!" << std::endl;
             }
             if (pause) {
+                // 暂停存档前把缓存写回 rs: on_barrier -> saveStates 读的是 rs,
+                // 而 rho_affine_FW 平时不写 rs (只在 DP 命中时写)
+                _player.flush(i, rs_i);
                 barrier.arrive_and_wait();
             }
         }
+        // 线程退出前同样要写回: 线程局部缓存随线程销毁, 主线程 join 之后的
+        // saveStates 只能看到 rs
+        _player.flush(i, rs_i);
         std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
         if (elapsed.count() > 300) {
             std::stringstream ss;
             if (i == 0) {
-                ss << count_try << " points, " << count_dstg
+                ss << count_try * w_i << " points, " << count_dstg
                    << " distinguishable. in " << elapsed.count() << " s, avg "
-                   << (uint64_t)(count_try / elapsed.count()) << " points/s" << std::endl;
+                   << (uint64_t)(count_try * w_i / elapsed.count()) << " points/s" << std::endl;
             } else {
                 ss << count_dstg << " ";
             }
@@ -4073,7 +4115,7 @@ static RPCHelpMan testmvp()
             }
 
             auto initRhoState = []() {
-                RhoState rs[256] = {0};
+                RhoState rs[RHO_STATE_SLOTS] = {0};
                 for (RhoState& r : rs) {
                     r.rand();                    
                     r.times = 0;
@@ -4087,7 +4129,7 @@ static RPCHelpMan testmvp()
             if (ta == 120 && ta2 == 888) {
                 initRhoState();
 
-                RhoState rs2[256] = {0};
+                RhoState rs2[RHO_STATE_SLOTS] = {0};
                 loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState), _RSFile1_name);
                 for (RhoState& r : rs2) {
                     assert(check(ctx, &r.x, r.m, r.n));
@@ -4095,7 +4137,7 @@ static RPCHelpMan testmvp()
             }
             //测试 rho_F 与 rho_Fi 或者 giantStep 与 giantStepi
             if (ta == 121) {
-                RhoState rs[256] = {0};
+                RhoState rs[RHO_STATE_SLOTS] = {0};
                 loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
                 auto f = rho_F;
                 auto fi = rho_Fi;

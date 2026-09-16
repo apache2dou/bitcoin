@@ -220,6 +220,8 @@ static SECP256K1_INLINE void secp256k1_int_cmov(int *r, const int *a, int flag) 
 #pragma warning(pop)
 #endif
 
+#include <bit>          // std::popcount / std::countr_zero
+
 // 由 rpc/blockchain.cpp 定义
 extern secp256k1_context* ctx;
 extern RhoPoint adds_pub[2][256];
@@ -559,6 +561,136 @@ inline uint64_t rho_affine_dp(const RhoAffineState& s)
     return (s.X.n[0] >> 32) | (s.X.n[1] << 20);
 }
 
+// ===========================================================================
+// 同线程多 walker
+//
+// 一次仿射点加倍价: 3 次域乘 + 1 次域模逆。模逆 (modinv64_var, 实测平均 ~18 轮
+// divsteps) 是唯一的瓶颈, 比一次域乘贵约一两个数量级; 而同一个线程里 W 个互相
+// 独立的 walker, 它们的模逆分母彼此无关, 可以先乘成一个总积只求一次逆, 再沿前缀
+// 逐个还原 (Montgomery 批量求逆)。于是每点的模逆成本从 1 次降到 1/W 次:
+//
+//     W=1:  1 逆 +  3 乘
+//     W=4:  1 逆 + 18 乘  -> 每点 ≈ 1/4 逆 + 4.5 乘
+//
+// 这正是"同线程多 walker"相对于"多开线程"唯一的额外收益 —— 跨线程没法把分母
+// 凑成一批一起求逆。W 越大摊得越薄, 但收益迅速递减, 在哪一档最划算靠实测
+// (perf_test_rho_affine_walkers) 决定。
+// ===========================================================================
+
+// Montgomery 批量求逆: inv[i] = 1 / d[i] (mod p)。
+// W == 1 时退化为一次普通求逆, 与单 walker 路径完全等价。
+//
+// 某个 d[i] == 0 时整条前缀积为 0 (域无零因子), 返回 false 交调用方回退逐点
+// 路径。这样 W 次零检查合并成了整批一次 (对积检查), 概率仍约 W * 2^-256。
+template <int W>
+bool fe_batch_inv(secp256k1_fe (&inv)[W], const secp256k1_fe (&d)[W])
+{
+    secp256k1_fe prefix[W];
+    secp256k1_fe acc = d[0];
+    for (int i = 1; i < W; ++i) {
+        prefix[i] = acc;                        // 前缀积 d[0..i-1]
+        secp256k1_fe_mul(&acc, &acc, &d[i]);    // acc = d[0..i]
+    }
+    if (secp256k1_fe_normalizes_to_zero_var(&acc)) return false;
+    secp256k1_fe_inv_var(&acc, &acc);           // 整批唯一的一次模逆
+    for (int i = W - 1; i > 0; --i) {
+        secp256k1_fe_mul(&inv[i], &acc, &prefix[i]);  // inv[i] = 1/d[i]
+        secp256k1_fe_mul(&acc, &acc, &d[i]);          // acc = 1/d[0..i-1]
+    }
+    inv[0] = acc;
+    return true;
+}
+
+// 一次推进 W 个 walker 各一步。仿射公式与 rho_affine_add 逐字相同, 区别只有
+// 一处: 分母 1/dx 不再各自求逆, 而是整批一次求出来。
+//
+// 返回 DP 命中的 walker 掩码 (bit i = walker i 的 x 低 32 位全 0)。命中者由
+// rho_affine_FW 写回 rs 并按需重置; 未命中者 fe 状态留在 cache 里, 完全不碰
+// rs 的 136 字节 —— rs 只有 DP 判定 (概率 2^-32) 和存档 (每 2^30 步) 才需要,
+// 每步全量写回是纯浪费 (实测占每点成本的 1/3)。
+//
+// 零分母 (概率约 W * 2^-256) 由 fe_batch_inv 对整批一次检出, 整批回退逐点路径
+// (rho_affine_step -> rho_affine_add, 那条路径里有点倍分支)。
+template <int W>
+inline uint32_t rho_affine_step_batch(RhoAffineState (&st)[W])
+{
+    unsigned char t[W];
+    secp256k1_fe dx[W], dy[W];
+
+    for (int i = 0; i < W; ++i) {
+        // st[i].X 上一轮结尾已全规约, 低 8 位就是 x mod 256
+        t[i] = (unsigned char)(st[i].X.n[0] & 0xFF);
+        const RhoAffineAdd& A = g_affine_adds[t[i]];
+        secp256k1_fe_negate(&dx[i], &st[i].X, 1);
+        secp256k1_fe_add(&dx[i], &A.x);    // dx = A.x - X   (mag 3)
+        secp256k1_fe_negate(&dy[i], &st[i].Y, 1);
+        secp256k1_fe_add(&dy[i], &A.y);     // dy = A.y - Y   (mag 3)
+    }
+
+    secp256k1_fe inv[W];
+    if (!fe_batch_inv<W>(inv, dx)) {
+        for (int i = 0; i < W; ++i) {
+            rho_affine_step(st[i]);
+        }
+        // 回退路径各自维护 X 全规约, DP 判定照常可用
+    } else {
+        for (int i = 0; i < W; ++i) {
+            const RhoAffineAdd& A = g_affine_adds[t[i]];
+            secp256k1_fe lam, nx, ny, tt;
+
+            secp256k1_fe_mul(&lam, &dy[i], &inv[i]);    // λ             (mag 1)
+            secp256k1_fe_sqr(&nx, &lam);                // λ²            (mag 1)
+            secp256k1_fe_negate(&tt, &st[i].X, 1);
+            secp256k1_fe_add(&nx, &tt);                 //               (mag 3)
+            secp256k1_fe_negate(&tt, &A.x, 1);
+            secp256k1_fe_add(&nx, &tt);                 // x3            (mag 5)
+            secp256k1_fe_normalize_var(&nx);
+            secp256k1_fe_negate(&tt, &nx, 1);
+            secp256k1_fe_add(&tt, &st[i].X);            // X - x3        (mag 3)
+            secp256k1_fe_mul(&ny, &tt, &lam);           // λ(X - x3)     (mag 1)
+            secp256k1_fe_negate(&tt, &st[i].Y, 1);
+            secp256k1_fe_add(&ny, &tt);                 // y3            (mag 3)
+            secp256k1_fe_normalize_weak(&ny);
+
+            st[i].X = nx;
+            st[i].Y = ny;
+            add_mod_N(st[i].m, A.m);
+            add_mod_N(st[i].n, A.n);
+        }
+    }
+
+    // DP 判定在 fe 域做 (rho_affine_dp 已与 distinguishable 对拍过), 不再经过
+    // rs 的存储字节。X 此时全规约, 与单点路径口径一致。
+    uint32_t dp_mask = 0;
+    for (int i = 0; i < W; ++i) {
+        if (rho_affine_dp(st[i]) != 0) {
+            dp_mask |= (uint32_t)1 << i;
+        }
+    }
+    return dp_mask;
+}
+
+// 一批 walker 的线程局部 fe 缓存: slot i 与外部 rs[i] 一一对应
+// (同一线程内始终传同一个 rs 基址, 映射才稳定)。
+//
+// rs[i] 不再每步写回 (只有 DP 命中 / flush 才写), 所以 x/m/n 平时是陈旧的,
+// 真状态在 st[i] 里; rs[i].times 仍每步递增, 用来检测外部重置:
+// 调用方重置某个 walker 后把 times 清零 (play() 的约定), 下一次调用自动重载。
+template <int W>
+struct RhoCache {
+    RhoAffineState st[W];
+    bool inited[W] = {};
+    uint64_t synced_times[W] = {};
+};
+
+// 每个线程每份宽度一份 cache。FW / flush / 内部共用, 必须走同一个对象。
+template <int W>
+RhoCache<W>& rho_affine_cache()
+{
+    static thread_local RhoCache<W> cache;
+    return cache;
+}
+
 // 正确性自检: 与库公开 API 路径逐步对拍 (点坐标 + m/n 标量)
 bool rho_affine_selfcheck(int steps)
 {
@@ -609,7 +741,135 @@ bool rho_affine_selfcheck(int steps)
     return true;
 }
 
+// 批量路径自检: 同一批 W 个 walker, 一路用 rho_affine_FW<W> (批量求逆) 推进,
+// 另一路逐个用 rho_affine_step (单点求逆, 与 rho_affine_F 同一条路径) 推进,
+// 每步逐项对比四元组 (x 存储字节 / m / n / times)。
+//
+// 注意参考侧不能用 rho_affine_F: 它的线程局部缓存只按 times 判重, 天生假定
+// "一个线程只喂一个 rs"。同一个线程里轮流喂 W 个不同 rs 会让缓存串味。
+// 这里直接用 RhoAffineState 逐点推进, 与 rho_affine_F 内部的步进完全等价。
+template <int W>
+bool rho_affine_batch_selfcheck(int steps)
+{
+    RhoState batch[W] = {};
+    RhoState ref[W] = {};
+    RhoAffineState single[W];
+
+    for (int i = 0; i < W; ++i) {
+        batch[i].x = adds_pub[0][i].x;
+        memcpy(batch[i].m, adds_pub[0][i].m, sizeof(batch[i].m));
+        memcpy(batch[i].n, adds_pub[0][i].n, sizeof(batch[i].n));
+        batch[i].times = 0;
+        ref[i] = batch[i];
+        rho_affine_set_start(single[i], i);
+    }
+
+    for (int s = 0; s < steps; ++s) {
+        rho_affine_FW<W>(batch);
+        rho_affine_flush<W>(batch);      // rs 平时只有 times 是新的, 对拍前写真
+        for (int i = 0; i < W; ++i) {
+            rho_affine_step(single[i]);
+            rho_affine_store(single[i], ref[i]);
+            ++ref[i].times;
+
+            const char* what = nullptr;
+            if (memcmp(batch[i].x.data, ref[i].x.data, sizeof(batch[i].x.data)) != 0) {
+                what = "x";
+            } else if (memcmp(batch[i].m, ref[i].m, sizeof(batch[i].m)) != 0) {
+                what = "m";
+            } else if (memcmp(batch[i].n, ref[i].n, sizeof(batch[i].n)) != 0) {
+                what = "n";
+            } else if (batch[i].times != ref[i].times) {
+                what = "times";
+            }
+            if (what != nullptr) {
+                std::cout << "rho-affine batch selfcheck: W=" << W << " step " << s
+                          << " walker " << i << " mismatch on " << what << std::endl;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// 同线程多 walker 的对外入口
+// ---------------------------------------------------------------------------
+
+// 一次推进同一线程内连续的 W 个 walker。每个 walker 走恰好一步, 语义与
+// rho_affine_F(RhoState&) 完全一致, 区别有两处:
+//   1. W 个模逆被摊成了一次 (批量求逆);
+//   2. rs[i] 只在 DP 命中时写回 (概率 2^-32), 未命中步完全不碰那 136 字节 ——
+//      rs 的唯一消费者是 DP 判定和存档, 而存档走 flush 路径。
+//
+// 返回 DP 命中的 walker 掩码 (bit i = walker i 命中)。调用方对命中者做
+// saveDP 等后处理即可, 不需要额外重置。
+//
+// 缓存同步靠 times: 外部若重置某个 walker (loadRhoState / rand), 必须同时
+// 改变它的 times (如清零), 否则缓存察觉不到。当前所有重置都发生在线程启动
+// 之前, 线程运行中无人重置。
+//
+// 前提是同一线程始终传同一段 rs。
+template <int W>
+uint32_t rho_affine_FW(RhoState* rs)
+{
+    static_assert(W >= 1 && W <= RHO_WALKERS_MAX, "walker 数超出已实例化的范围");
+    assert(g_affine_adds_ready);
+
+    RhoCache<W>& cache = rho_affine_cache<W>();
+
+    for (int i = 0; i < W; ++i) {
+        if (!cache.inited[i] || cache.synced_times[i] != rs[i].times) {
+            rho_affine_load(cache.st[i], rs[i]);
+            cache.inited[i] = true;
+        }
+    }
+
+    const uint32_t dp_mask = rho_affine_step_batch<W>(cache.st);
+
+    for (int i = 0; i < W; ++i) {
+        ++rs[i].times;
+        cache.synced_times[i] = rs[i].times;
+    }
+    if (dp_mask != 0) {
+        for (int i = 0; i < W; ++i) {
+            if (dp_mask & ((uint32_t)1 << i)) {
+                rho_affine_store(cache.st[i], rs[i]);
+            }
+        }
+    }
+    return dp_mask;
+}
+
+// 把 W 个 walker 的真状态整体写回 rs (存档前调用, 如 saveRhoState 之前 / 线程
+// 退出前)。平时 rs 只有 times 是新鲜的, x/m/n 只在 DP 命中时才是新值。
+template <int W>
+void rho_affine_flush(RhoState* rs)
+{
+    RhoCache<W>& cache = rho_affine_cache<W>();
+    for (int i = 0; i < W; ++i) {
+        if (cache.inited[i]) {
+            rho_affine_store(cache.st[i], rs[i]);
+        }
+    }
+}
+
+// 显式实例化: 可选 walker 数就是下面这些, 别的值会链接失败。
+// 全部展开成编译期宽度固定的循环, 这样 d[]/dy[]/inv[] 这些中间量留在寄存器里。
+template uint32_t rho_affine_FW<1>(RhoState* rs);
+template uint32_t rho_affine_FW<2>(RhoState* rs);
+template uint32_t rho_affine_FW<4>(RhoState* rs);
+template uint32_t rho_affine_FW<8>(RhoState* rs);
+template uint32_t rho_affine_FW<16>(RhoState* rs);
+template uint32_t rho_affine_FW<32>(RhoState* rs);
+template void rho_affine_flush<1>(RhoState* rs);
+template void rho_affine_flush<2>(RhoState* rs);
+template void rho_affine_flush<4>(RhoState* rs);
+template void rho_affine_flush<8>(RhoState* rs);
+template void rho_affine_flush<16>(RhoState* rs);
+template void rho_affine_flush<32>(RhoState* rs);
 
 // 仿射点加的性能基准: 与 perf_test_libsecp256k1 / perf_test_cpu / perf_test_gpu 同样的
 // 80w 次点加 + DP 判定循环。
@@ -635,6 +895,53 @@ void perf_test_rho_affine()
     const double sec = elapsed.count() / 1000.0;
     std::cout << "rho-affine test elapsed: " << elapsed.count() << " ms, with " << count_rho
               << " RhoPoint, avg " << (uint64_t)(count_rho / sec) << " points/s." << std::endl;
+}
+
+namespace {
+
+// 在同一个线程里跑 W 个 walker 的基准。走的是生产路径 rho_affine_FW<W>,
+// DP 判定已内含在返回掩码里, 数出来的就是真实吞吐。
+template <int W>
+void bench_rho_walkers(uint64_t steps)
+{
+    RhoState rs[W] = {};
+    for (int i = 0; i < W; ++i) {
+        rs[i].x = adds_pub[0][i].x;
+        memcpy(rs[i].m, adds_pub[0][i].m, sizeof(rs[i].m));
+        memcpy(rs[i].n, adds_pub[0][i].n, sizeof(rs[i].n));
+        rs[i].times = 0;
+    }
+
+    uint64_t count_dp = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint64_t s = 0; s < steps; ++s) {
+        count_dp += std::popcount(rho_affine_FW<W>(rs));
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    const double sec = elapsed.count() / 1000.0;
+    const uint64_t points = steps * W;
+    std::cout << "rho-affine walkers=" << W << " : " << elapsed.count() << " ms, "
+              << points << " points, " << count_dp << " dp, avg "
+              << (uint64_t)(points / sec) << " points/s." << std::endl;
+}
+
+}  // namespace
+
+// 扫描每个线程 1/2/4/8/16/32 个 walker 的吞吐, 用来选 common.h 里的 RHO_WALKERS。
+// 总点数固定, 与 perf_test_rho_affine 同口径, 可直接对比。
+// 最后一档 W=1 再跑一次作为漂移对照: 同一进程内的首尾两个 W=1 读数应该很接近。
+void perf_test_rho_affine_walkers()
+{
+    rho_affine_init_adds();
+    constexpr uint64_t kTotal = 800000;
+    bench_rho_walkers<1>(kTotal / 1);
+    bench_rho_walkers<2>(kTotal / 2);
+    bench_rho_walkers<4>(kTotal / 4);
+    bench_rho_walkers<8>(kTotal / 8);
+    bench_rho_walkers<16>(kTotal / 16);
+    bench_rho_walkers<32>(kTotal / 32);
+    bench_rho_walkers<1>(kTotal / 1);
 }
 
 // 仿射点加的正确性验证, 由 validate_test() 调用。
@@ -698,6 +1005,18 @@ void validate_rho_affine()
     std::cout << "rho-affine dp vs distinguishable (5 values): " << (dp_ok ? "PASS" : "FAIL")
               << std::endl;
     assert(dp_ok);
+
+    // 同线程多 walker 的对拍: W 个 walker 交错推进 vs 逐个单点推进。
+    // 步数取得短, 因为两条路都跑 2000 步已经足够暴露批量求逆的任何下标错位。
+    bool batch_ok = true;
+    batch_ok &= rho_affine_batch_selfcheck<2>(1000);
+    batch_ok &= rho_affine_batch_selfcheck<4>(1000);
+    batch_ok &= rho_affine_batch_selfcheck<8>(1000);
+    batch_ok &= rho_affine_batch_selfcheck<16>(1000);
+    batch_ok &= rho_affine_batch_selfcheck<32>(1000);
+    std::cout << "rho-affine batch selfcheck (W=2/4/8/16/32 vs single walker): "
+              << (batch_ok ? "PASS" : "FAIL") << std::endl;
+    assert(batch_ok);
 }
 
 // ---------------------------------------------------------------------------
