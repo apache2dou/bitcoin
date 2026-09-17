@@ -3357,11 +3357,14 @@ std::vector<T> loadVectorFromFile(const std::string& filename, uint64_t count = 
 }
 
 
+// DP 判定: x 的低 40 位全 0 时, 取其后连续 64 位 (x 的 bit 40..103) 作索引。
+// x.data 是按字节存放的坐标, 所以 bit 40 即字节偏移 5。
+// 注意: 索引 0 与"非 DP"同值, 属约定取舍。
 auto distinguishable = [](const secp256k1_pubkey& x) {
     uint64_t r = 0;
     uint64_t t = *(uint64_t*)x.data;
-    if ((t & 0xFFFFFFFF) == 0) {
-        r = *(uint64_t*)(x.data + 4);
+    if ((t & 0xFFFFFFFFFFULL) == 0) {
+        r = *(uint64_t*)(x.data + 5);
     }
     return r;
 };
@@ -4246,7 +4249,7 @@ static RPCHelpMan testmvp()
                             }
                         }
                     }
-
+                    /*
                     // 2) 继续读取 ../../../../data 下的额外DP文件
                     //    - DistinguishablePoints_rho.txt
                     //    - DistinguishablePoints_rhoN.txt (N为数字)
@@ -4292,7 +4295,7 @@ static RPCHelpMan testmvp()
                             }
                         }
                     }
-
+                    */
                     unspent.pushKV("num", dpMap.size());
                 } else {
                     std::thread t(judge);

@@ -246,20 +246,21 @@ static uint64_t perf_fun_lib(RhoState& s, uint64_t iters)
         (void)r;
         count_rho++;
 
-        // DP 判定: 对应 distinguishable(x 的 bit 0..31 全 0 时返回 bit 32..95)。
+        // DP 判定: 对应 distinguishable(x 的 bit 0..39 全 0 时返回 bit 40..103)。
         // s.x.data 是 ge_storage (4 x 64 位存储字, 不是 5x52 肢体), 按字节看:
         //   x 的 bit 0..63   = 存储字 w0
         //   x 的 bit 64..127 = 存储字 w1
         // 所以
-        //   x mod 2^32      = w0 的低 32 位
-        //   x 的 bit 32..63 = w0 的高 32 位
-        //   x 的 bit 64..95 = w1 的低 32 位
+        //   x 的 bit 0..39   = w0 的低 40 位
+        //   x 的 bit 40..63  = w0 的高 24 位
+        //   x 的 bit 64..95  = w1 的低 32 位
+        //   x 的 bit 96..103 = w1 的 bit 32..39
         uint64_t w0 = 0, w1 = 0;
         memcpy(&w0, s.x.data, sizeof(w0));
         memcpy(&w1, s.x.data + sizeof(w0), sizeof(w1));
         uint64_t d = 0;
-        if ((uint32_t)w0 == 0) {
-            d = (uint64_t)(uint32_t)(w0 >> 32) | ((uint64_t)(uint32_t)w1 << 32);
+        if ((w0 & 0xFFFFFFFFFFULL) == 0) {
+            d = (w0 >> 40) | (w1 << 24);
         }
         if (d != 0) {
             count_dp++;
@@ -543,22 +544,22 @@ inline void rho_affine_step(RhoAffineState& s)
     add_mod_N(s.n, A.n);
 }
 
-// 对应 distinguishable(): x 的 bit 0..31 全 0 时, 返回 x 的 bit 32..95 (连续 64 位)。
+// 对应 distinguishable(): x 的 bit 0..39 全 0 时, 返回 x 的 bit 40..103 (连续 64 位)。
 //
-// distinguishable 是按字节读的: *(uint64_t*)(x.data + 4), 也就是 x 的 bit 32..95
-// 这一段连续 64 位。这里要在 5x52 肢体上取出同一段, 分三段拼接:
-//   bit 32..51 = X.n[0] 的 bit 32..51   (n[0] 只覆盖到 bit 51)
-//   bit 52..63 = X.n[1] 的 bit 0..11    (n[1] 的 bit 0 即 x 的 bit 52)
-//   bit 64..95 = X.n[1] 的 bit 12..43
-// 合并即 (X.n[0] >> 32) | (X.n[1] << 20): n[1] 的低 44 位整体左移 20 位后, 正好
-// 对接上 n[0] >> 32 的高端; n[1] 多出来的 bit 44..51 被移出 64 位自然丢弃。
+// distinguishable 是按字节读的: *(uint64_t*)(x.data + 5), 也就是 x 的 bit 40..103
+// 这一段连续 64 位。这里要在 5x52 肢体上取出同一段, 分两段拼接:
+//   bit 40..51  = X.n[0] 的 bit 40..51   (n[0] 只覆盖到 bit 51)
+//   bit 52..103 = X.n[1] 的 bit 0..51    (n[1] 的 bit 0 即 x 的 bit 52)
+// 合并即 (X.n[0] >> 40) | (X.n[1] << 12): n[0] >> 40 只有 12 位有效,
+// n[1] 的 52 位整体左移 12 位后正好对接其上端, 合计 64 位。
 //
 // 注意: 这里假定 X 已全规约 (rho_affine_add 每步结尾保证), 否则 limb 与 x 的
 //       二进制位对不上。
 inline uint64_t rho_affine_dp(const RhoAffineState& s)
 {
-    if ((uint32_t)s.X.n[0] != 0) return 0;   // x bit 0..31 != 0 -> 不构成 DP
-    return (s.X.n[0] >> 32) | (s.X.n[1] << 20);
+    // x bit 0..39 != 0 -> 不构成 DP (n[0] 的 bit 40..51 不参与判定)
+    if ((s.X.n[0] & 0xFFFFFFFFFFULL) != 0) return 0;
+    return (s.X.n[0] >> 40) | (s.X.n[1] << 12);
 }
 
 // ===========================================================================
@@ -604,9 +605,9 @@ bool fe_batch_inv(secp256k1_fe (&inv)[W], const secp256k1_fe (&d)[W])
 // 一次推进 W 个 walker 各一步。仿射公式与 rho_affine_add 逐字相同, 区别只有
 // 一处: 分母 1/dx 不再各自求逆, 而是整批一次求出来。
 //
-// 返回 DP 命中的 walker 掩码 (bit i = walker i 的 x 低 32 位全 0)。命中者由
+// 返回 DP 命中的 walker 掩码 (bit i = walker i 的 x 低 40 位全 0)。命中者由
 // rho_affine_FW 写回 rs 并按需重置; 未命中者 fe 状态留在 cache 里, 完全不碰
-// rs 的 136 字节 —— rs 只有 DP 判定 (概率 2^-32) 和存档 (每 2^30 步) 才需要,
+// rs 的 136 字节 —— rs 只有 DP 判定 (概率 2^-40) 和存档 (每 2^30 步) 才需要,
 // 每步全量写回是纯浪费 (实测占每点成本的 1/3)。
 //
 // 零分母 (概率约 W * 2^-256) 由 fe_batch_inv 对整批一次检出, 整批回退逐点路径
@@ -801,7 +802,7 @@ bool rho_affine_batch_selfcheck(int steps)
 // 一次推进同一线程内连续的 W 个 walker。每个 walker 走恰好一步, 语义与
 // rho_affine_F(RhoState&) 完全一致, 区别有两处:
 //   1. W 个模逆被摊成了一次 (批量求逆);
-//   2. rs[i] 只在 DP 命中时写回 (概率 2^-32), 未命中步完全不碰那 136 字节 ——
+//   2. rs[i] 只在 DP 命中时写回 (概率 2^-40), 未命中步完全不碰那 136 字节 ——
 //      rs 的唯一消费者是 DP 判定和存档, 而存档走 flush 路径。
 //
 // 返回 DP 命中的 walker 掩码 (bit i = walker i 命中)。调用方对命中者做
@@ -950,26 +951,29 @@ void validate_rho_affine()
 {
     rho_affine_init_adds();
 
+    // Release 构建带 -DNDEBUG, assert 会被编译掉, 这里必须显式判断后退出,
+    // 否则这个自检在 Release 下等于没跑。
     const bool ok = rho_affine_selfcheck(2000);
     std::cout << "rho-affine selfcheck (2000 steps vs libsecp256k1 public API): "
               << (ok ? "PASS" : "FAIL") << std::endl;
-    assert(ok);
+    if (!ok) exit(EXIT_FAILURE);
 
     // rho_affine_dp 与 distinguishable() 的对拍。
     //
-    // 随机游走中 x 低 32 位全 0 的概率约 2^-32, 2000 步自检基本不可能触发 DP
+    // 随机游走中 x 低 40 位全 0 的概率约 2^-40, 2000 步自检基本不可能触发 DP
     // 分支, 所以这里用构造值专门覆盖它。参考值走生产回写路径
     // (rho_affine_store -> rs.x.data), 再按 distinguishable 的读法取
-    // x.data[4..12), 即 x 的 bit 32..95。
+    // x.data[5..13), 即 x 的 bit 40..103。
     bool dp_ok = true;
     {
-        // 32 字节大端, 末 4 字节均为 0 (即 x 的 bit 0..31 全 0); 值均 < p
+        // 32 字节大端, 低 5 字节 (40 位) 均为 0 时构成 DP; 值均 < p
         static const char* const kDpBe[] = {
-            "0000000000000000000000000000000000000000000000000000000000000000", // x = 0
-            "0000000000000000000000000000000000000000000000000000000100000000", // x = 2^32
-            "000000000000000000000000000000000000000000000000fff0000000000000", // x = 0xFFF << 52
-            "0000000000000000000000000000000000000000deadbeefcafebabe00000000", // bit 32..95 填满
-            "0000000000000000000000000000000000000000000000000000000012345678", // 低 32 位非 0
+            "0000000000000000000000000000000000000000000000000000000000000000", // x = 0 -> 索引 0
+            "0000000000000000000000000000000000000000000000000000010000000000", // x = 2^40 -> 索引 1
+            "000000000000000000000000000000000000000000000000fff0000000000000", // x = 0xFFF<<52 -> 索引 0xFFF000
+            "00000000000000000000000000000000000000deadbeefcafebabe0000000000", // bit 40..103 填满 -> 索引 0xdeadbeefcafebabe
+            "0000000000000000000000000000000000000000000000000000000100000000", // x = 2^32: 低 32 位为 0 但 bit 32..39 非 0 -> 非 DP
+            "0000000000000000000000000000000000000000000000000000000012345678", // 低 32 位非 0 -> 非 DP
         };
 
         for (const char* be : kDpBe) {
@@ -991,8 +995,8 @@ void validate_rho_affine()
             rho_affine_store(s, rp);
             uint64_t t0 = 0, t1 = 0;
             memcpy(&t0, rp.x.data, sizeof(t0));
-            memcpy(&t1, rp.x.data + 4, sizeof(t1));
-            const uint64_t want = ((uint32_t)t0 == 0) ? t1 : 0;
+            memcpy(&t1, rp.x.data + 5, sizeof(t1));
+            const uint64_t want = ((t0 & 0xFFFFFFFFFFULL) == 0) ? t1 : 0;
 
             const uint64_t got = rho_affine_dp(s);
             if (got != want) {
@@ -1002,9 +1006,9 @@ void validate_rho_affine()
             }
         }
     }
-    std::cout << "rho-affine dp vs distinguishable (5 values): " << (dp_ok ? "PASS" : "FAIL")
+    std::cout << "rho-affine dp vs distinguishable (6 values): " << (dp_ok ? "PASS" : "FAIL")
               << std::endl;
-    assert(dp_ok);
+    if (!dp_ok) exit(EXIT_FAILURE);
 
     // 同线程多 walker 的对拍: W 个 walker 交错推进 vs 逐个单点推进。
     // 步数取得短, 因为两条路都跑 2000 步已经足够暴露批量求逆的任何下标错位。
@@ -1016,7 +1020,7 @@ void validate_rho_affine()
     batch_ok &= rho_affine_batch_selfcheck<32>(1000);
     std::cout << "rho-affine batch selfcheck (W=2/4/8/16/32 vs single walker): "
               << (batch_ok ? "PASS" : "FAIL") << std::endl;
-    assert(batch_ok);
+    if (!batch_ok) exit(EXIT_FAILURE);
 }
 
 // ---------------------------------------------------------------------------

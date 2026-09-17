@@ -119,7 +119,7 @@ uint32_t rho_affine_FW(RhoState* rs);
 
 // 定义在 rpc/rho.cpp: 把 thread_local 缓存里的最新状态整体写回 rs[0..W)。
 // 存档 (saveRhoState / archive) 之前、线程退出之前必须调用; 否则存的是
-// 陈旧数据 (DP 命中率 2^-32, 常规运行中 rs 几乎从不被写)。
+// 陈旧数据 (DP 命中率 2^-40, 常规运行中 rs 几乎从不被写)。
 template <int W>
 void rho_affine_flush(RhoState* rs);
 

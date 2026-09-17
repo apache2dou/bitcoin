@@ -57,6 +57,18 @@ struct AffinePoint {
         }                                                                                               \
     } while (0)
 
+// HOST_ASSERT: host 侧校验。Release 构建带 -DNDEBUG, assert 会被整个编译掉
+// (表现为 nvcc/MSVC 的 "variable ... was set but never used" 告警), 等于没检查,
+// 所以 host 侧一律用 HOST_ASSERT: 失败就打印文件/行号/条件并退出。
+// 设备端对应 DEV_ASSERT (见 g_validate_fail)。
+#define HOST_ASSERT(cond)                                                   \
+    do {                                                                    \
+        if (!(cond)) {                                                      \
+            printf("[HOST_ASSERT] %s:%d  %s\n", __FILE__, __LINE__, #cond); \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
+
 // 默认策略下 cudaDeviceSynchronize() 是自旋忙等（spin），会让调用线程 100% 占满一个 CPU 核。
 // 改为阻塞式等待（Windows 上走 WaitForSingleObject），把该核让给 CPU 工作线程。
 // 注意：必须在任何会创建 CUDA context 的调用之前执行，否则返回 cudaErrorSetOnActiveProcess 且不生效。
@@ -743,12 +755,19 @@ __constant__ RhoPoint_dev RhoStates_rand[dp_buffer_size];
 // W=32 收益已饱和 (+5%) 而寄存器/显存占用翻倍, 当前运行取 8 作为稳妥折中)。
 constexpr int RHO_GPU_WALKERS = 8;
 
-// 可区分点判断 (设备端)
+// 可区分点 (DP) 判断 (设备端): x 的低 40 位 (bit 0..39) 全 0 即为 DP,
+// 返回其后连续 64 位 (bit 40..103) 作为索引; 否则返回 0。
+// 约定: 索引 0 与"非 DP"同值 (x 恰为 2^40 的倍数时无法区分, 概率可忽略)。
 __host__ __device__ uint64_t distinguishable(const uint256_t& x)
 {
-    if (x.limb[0] == 0) {
-        uint64_t t2 = x.limb[1] + ((uint64_t)x.limb[2] << 32);
-        return t2;
+    // limb[0] = x bit 0..31, limb[1] 低 8 位 = x bit 32..39
+    if (x.limb[0] == 0 && (x.limb[1] & 0xFF) == 0) {
+        // limb[1] 高 24 位 -> 索引 bit 0..23  (x bit 40..63)
+        // limb[2] 整体     -> 索引 bit 24..55 (x bit 64..95)
+        // limb[3] 低 8 位  -> 索引 bit 56..63 (x bit 96..103)
+        return (uint64_t)(x.limb[1] >> 8) |
+               ((uint64_t)x.limb[2] << 24) |
+               ((uint64_t)(x.limb[3] & 0xFF) << 56);
     }
     return 0;
 }
@@ -877,6 +896,27 @@ extern bool gameover;
 
 RhoPoint_dev* RhoStates_host = nullptr;
 __device__ RhoPoint_dev* RhoStates_dev = nullptr;
+
+// ---------------------------------------------------------------------------
+// 验证内核的失败上报机制
+//
+// Release 构建带 -DNDEBUG, 设备端的 assert 会被完全编译掉 (看 nvcc 的
+// "variable ... was set but never used" 告警就知道), 所以验证内核里不能再写
+// assert —— 那等于没检查。统一改成:
+//   DEV_ASSERT(cond)  失败时原子累加 g_validate_fail, 打印 __FILE__/__LINE__;
+//   host 侧           validate_reset() 清零, validate_ok() 读回并在有失败时退出。
+// ---------------------------------------------------------------------------
+__device__ unsigned long long g_validate_fail = 0;
+
+// 同一轮里只打印前若干次失败, 避免多线程内核刷屏
+#define DEV_ASSERT(cond)                                                        \
+    do {                                                                        \
+        if (!(cond)) {                                                          \
+            unsigned long long _dev_fail_n = atomicAdd(&g_validate_fail, 1ULL);  \
+            if (_dev_fail_n < 16)                                               \
+                printf("[DEV_ASSERT] %s:%d  %s\n", __FILE__, __LINE__, #cond);  \
+        }                                                                       \
+    } while (0)
 
 // 添加 DP 到缓冲区 (设备端)
 __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
@@ -1085,8 +1125,15 @@ __global__ void rho()
             // 保存可区分点
             add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
         }
+        // 周期性返回, 与 rho_w<W> 对齐:
+        //   每 2^18 点 poll 一次外部 break_flag;
+        //   第 2^26 点无条件返回。
+        // 这里 W=1, count_rho 就是点数, 与 rho_w 的批数掩码数值不同但含义一致:
+        // rho_w 掩码 2^23 批 × W=8 = 2^26 点/线程。换算关系: 
+        //   **rho() 掩码 = rho_w 掩码 × W**, 两边一起改才能保持每线程点数的节奏。
+        // 2^26 点/线程与 CPU 侧 play() 的保存周期 (2^31 点 ≈ 30 分钟) 时长相当。
         if ((count_rho & 0x3FFFF) == 0) {
-            if (*break_flag_dev)
+            if (*break_flag_dev || (count_rho & 0x3FFFFFF) == 0)
                 break;
         }
     }
@@ -1122,7 +1169,18 @@ __global__ void rho_w()
                 add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 10);
             }
         }
-        if ((count_rho & 0x3FFFF) == 0 && *break_flag_dev) break;
+        // 周期性返回, 让 rho_play 能定期落盘 (意外关机最多丢这一段):
+        //   每 2^18 批 poll 一次外部 break_flag;
+        //   第 2^23 批无条件返回 (W=8 时 = 2^26 点/线程)。
+        // 时长对齐: 2^26 点/线程 与 CPU 侧 play() 的保存周期 (2^31 点 ≈ 30 分钟)
+        //           量级相当, 两边落盘间隔不再差一个数量级。
+        // 注意: 内层判断被外层 (count_rho & 0x3FFFF) == 0 短路, 所以 2^23 必须
+        //       是 2^18 的整数倍 (当前成立), 否则这一支永远不会被求值。
+        // 注意: count_rho 是批数, 而 printf 打的是点数, 两套单位不要混。
+        // 注意: 改这里时 rho() 的掩码要跟着改, rho() 掩码 = 本掩码 × W。
+        if ((count_rho & 0x3FFFF) == 0) {
+            if (*break_flag_dev || (count_rho & 0x7FFFFF) == 0) break;
+        }
     }
 #pragma unroll
     for (int k = 0; k < W; ++k) RhoStates_dev[idx * W + k] = s[k];
@@ -1132,7 +1190,7 @@ __global__ void rho_w()
 }
 
 // 基准内核: 固定批次数, 用 clock64 累计周期。DP 只计数不写缓冲
-// (命中率 2^-32, 不影响指令构成; 省去对 dp 缓冲的依赖)。
+// (命中率 2^-40, 不影响指令构成; 省去对 dp 缓冲的依赖)。
 template <int W>
 __global__ void perf_rho_w_kernel(int batches, unsigned long long* cycles_out, unsigned int* dp_out)
 {
@@ -1240,6 +1298,17 @@ void save_RhoStates_dev(int total_points, const std::string& name)
     std::cout << get_time() << " : save_RhoStates_dev. " << std::endl;
 }
 
+// DP 测试样点 (供 init_RhoStates_test 的尾槽使用): 取自 D:\DistinguishablePoints.txt
+// 第 1 条记录, 即 40 位判据下的一次真实运行写出的可区分点。已离线核验:
+//   x = m*G + n*MVP
+//     = d0670ffb7d97f164bcb5e73ec8da8f5575ace1a94bf211911028d30000000000
+// 低 40 位 (byte0..4) 全 0, 故构成 DP; 且 x 的 bit 40..103 恰好等于文件里记录的
+// 索引, 即 RHO_DP_TEST_IDX。该点同时覆盖了 limb[2] (bit 64..95) 非 0 的情形,
+// 这是纯构造值 (x≈2^40 / x≈2^104) 测不到的索引拼接分支。
+#define RHO_DP_TEST_M   "18094cbd5ecb190d6ed18af0d31ccdb4c86d748c074d56c3ac111ea7d1e9631f"
+#define RHO_DP_TEST_N   "f4ed2be3b6d43ec1c60c0bb1c62dfe9be31698293a68408337d3627bf716ccb5"
+#define RHO_DP_TEST_IDX 12199110172925241555ULL
+
 extern secp256k1_context* ctx;
 void init_RhoStates_test(int total_points)
 {
@@ -1256,8 +1325,13 @@ void init_RhoStates_test(int total_points)
         CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
         rho_F(ctx, r);
     }
-    set_int256(r.m, "4795cc3b02cfd7772a0f913b7cf18ed3cbff9c59b2c8899d0f719449c641e0a0");
-    set_int256(r.n, "38468e1ca1ab59348d856b441274666059c1fc7fabf1fb267a80b0ff83eca274");
+    // 尾槽 (total_points-1) 是独立填充点, 不接在链上, 专门作 DP 判据的被测样点。
+    // m/n 取自 D:\DistinguishablePoints.txt 的记录 (见 RHO_DP_TEST_*), 所以这个
+    // 点在新判据下确实是可区分点, 其索引必须等于 RHO_DP_TEST_IDX。
+    // 注: 早先此处填的是 E:\github\bitcoin\data\DistinguishablePoints_rho.txt 的
+    //     一条记录, 那是按旧 32 位判据挑的点, 40 位判据下已不是 DP。
+    set_int256(r.m, RHO_DP_TEST_M);
+    set_int256(r.n, RHO_DP_TEST_N);
     create(ctx, &r.x, r.m, r.n);
     t.from(r);
     CHECK_CUDA(cudaMemcpy(RhoStates_host + total_points - 1, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
@@ -1307,14 +1381,13 @@ __constant__ AffinePoint G = {
 #define RHODP_TEST_NUM 102
 
 // 验证内核: 沿 init_RhoStates_test 生成的确定性测试链, 取连续 W 个状态
-// 做一次批量步进, 逐个与链上后继对拍。Release 下 assert 会被编译掉,
-// 用失败计数器 + printf 报告。
+// 做一次批量步进, 逐个与链上后继对拍。失败计入 g_validate_fail。
 template <int W>
-__global__ void validate_multi_w(unsigned long long* fail_out)
+__global__ void validate_multi_w()
 {
     int stride = blockDim.x * gridDim.x;
     // 上界 RHOSTATES_TEST_NUM-1: 链后继只到索引 RHOSTATES_TEST_NUM-1 -> RHOSTATES_TEST_NUM,
-    // 最后一个槽位 (RHOSTATES_TEST_NUM) 是 DP 测试专用点, 不参与链对拍
+    // 最后一个槽位 (RHOSTATES_TEST_NUM) 是独立填的 DP 测试样点, 不是链后继, 不参与链对拍
     for (int base = blockDim.x * blockIdx.x + threadIdx.x; base + W <= RHOSTATES_TEST_NUM - 1; base += stride) {
         RhoPoint_dev s[W];
 #pragma unroll
@@ -1323,8 +1396,8 @@ __global__ void validate_multi_w(unsigned long long* fail_out)
 #pragma unroll
         for (int k = 0; k < W; ++k) {
             if (!(s[k] == RhoStates_dev[base + k + 1])) {
-                atomicAdd(fail_out, 1);
-                if (*fail_out < 4) {
+                unsigned long long n = atomicAdd(&g_validate_fail, 1ULL);
+                if (n < 4) {
                     printf("validate_multi_w<W=%d> MISMATCH at base=%d k=%d\n", W, base, k);
                     print_rho_point_dev(s[k]);
                 }
@@ -1346,7 +1419,7 @@ __global__ void validate_safegcd()
         uint256_t m1 = mod_inv_p(probe[i]);
         uint256_t one = {1};
         uint256_t got = mul_mod(m1, probe[i]);
-        assert(u256_equal(got, one));
+        DEV_ASSERT(u256_equal(got, one));
     }
 }
 
@@ -1359,10 +1432,10 @@ __global__ void validate_1()
     inf.infinity = true;
 
     AffinePoint res1G = point_add(G, inf);
-    assert(!res1G.infinity);
+    DEV_ASSERT(!res1G.infinity);
     for (int i = 0; i < 8; ++i) {
-        assert(res1G.x.limb[i] == G.x.limb[i]);
-        assert(res1G.y.limb[i] == G.y.limb[i]);
+        DEV_ASSERT(res1G.x.limb[i] == G.x.limb[i]);
+        DEV_ASSERT(res1G.y.limb[i] == G.y.limb[i]);
     }
 
     // 测试1.1: G+(-G)
@@ -1372,25 +1445,41 @@ __global__ void validate_1()
     res_1G.y = _y;
     res_1G.infinity = false;
     AffinePoint res0G = point_add(G, res_1G);
-    assert(res0G.infinity);
+    DEV_ASSERT(res0G.infinity);
 
     // 测试2：G + G的有效性
     AffinePoint res2G = point_add(G, G);
-    assert(!res2G.infinity);
-    assert(res2G.x.limb[7] == 0xC6047F94); // 2G的x坐标高位
-    assert(res2G.y.limb[7] == 0x1ae168fe); // 2G的y坐标高位
+    DEV_ASSERT(!res2G.infinity);
+    DEV_ASSERT(res2G.x.limb[7] == 0xC6047F94); // 2G的x坐标高位
+    DEV_ASSERT(res2G.y.limb[7] == 0x1ae168fe); // 2G的y坐标高位
         
     // 测试3：G + 2G的有效性
     AffinePoint res3G = point_add(G, res2G);
-    assert(!res3G.infinity);
-    assert(res3G.x.limb[7] == 0xf9308a01); // 3G的x坐标高位
-    assert(res3G.y.limb[7] == 0x388f7b0f); // 3G的y坐标高位
+    DEV_ASSERT(!res3G.infinity);
+    DEV_ASSERT(res3G.x.limb[7] == 0xf9308a01); // 3G的x坐标高位
+    DEV_ASSERT(res3G.y.limb[7] == 0x388f7b0f); // 3G的y坐标高位
 
-    //测试 distinguishable
-    assert(distinguishable(RhoStates_dev[0].x.x) == 0);
-    assert(distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x.x) == 867600860383096976);
+    //测试 distinguishable: 低 40 位全 0 才构成 DP, 索引取随后的 64 位 (bit 40..103)。
+    // 构造值先卡住索引拼接的三段边界: bit 40..63 (limb[1]>>8),
+    // bit 64..95 (limb[2]<<24), bit 96..103 ((limb[3]&0xFF)<<56)。
+    {
+        uint256_t v = {{0}};
+        DEV_ASSERT(distinguishable(v) == 0);   // 索引 0 与"非 DP"同值
+        v.limb[1] = 0x00000100u;               // x = 2^40 -> 低 40 位全 0
+        DEV_ASSERT(distinguishable(v) == 1);   // 索引 = x 的 bit 40 = 1
+        v.limb[3] = 0x000000ABu;               // x 的 bit 96..103
+        DEV_ASSERT(distinguishable(v) == (1ULL | (0xABULL << 56)));
+        v.limb[1] = 0x00000101u;               // x 的 bit 32 置位 -> 低 40 位非 0
+        DEV_ASSERT(distinguishable(v) == 0);
+        DEV_ASSERT(distinguishable(RhoStates_dev[0].x.x) == 0);
+    }
 
-    assert(*break_flag_dev == true);
+    // 真实数据正例: 尾槽 (RHOSTATES_TEST_NUM) 是 init_RhoStates_test 按 40 位判据
+    // 从 D:\DistinguishablePoints.txt 填入的可区分点, 索引应与文件记录逐位相符。
+    // (limb[2] 非 0, 补上上面构造值没覆盖到的那段拼接)
+    DEV_ASSERT(distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x.x) == RHO_DP_TEST_IDX);
+
+    DEV_ASSERT(*break_flag_dev == true);
 }
 
 __global__ void validate_multi()
@@ -1401,12 +1490,18 @@ __global__ void validate_multi()
         RhoPoint_dev rs = RhoStates_dev[index];
         auto t = (unsigned char)rs.x.x.limb[0];
         fun_add(rs, adds_pub_dev[t]);
-        assert((rs == RhoStates_dev[index + 1]));
+        DEV_ASSERT((rs == RhoStates_dev[index + 1]));
     }
 
+    // DP 缓冲测试: 往缓冲区写 RHODP_TEST_NUM 条记录以验证溢出/break 路径。
+    // 索引用尾点的真实索引 (RHO_DP_TEST_IDX), 与尾点自洽。
+    // 必须传尾点的**局部副本**: add_dp_to_buffer 会把传入的点换成 RhoStates_rand,
+    // 直接传 RhoStates_dev[RHOSTATES_TEST_NUM] 会把尾点改掉, 而 validate_1
+    // 还要用尾点做 DP 判据检查 (本内核排在 validate_1 之前跑)。
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx < RHODP_TEST_NUM) {
-        add_dp_to_buffer(867600860383096976, RhoStates_dev[RHOSTATES_TEST_NUM], dp_device_buffer, RHODP_TEST_NUM);
+        RhoPoint_dev tail = RhoStates_dev[RHOSTATES_TEST_NUM];
+        add_dp_to_buffer(RHO_DP_TEST_IDX, tail, dp_device_buffer, RHODP_TEST_NUM);
     }
 }
 
@@ -1578,6 +1673,25 @@ void perf_test() {
     perf_test_rho_gpu_walkers();
 }
 
+// 清零设备端验证失败计数 (每个验证阶段开跑前调用)
+static void validate_reset()
+{
+    unsigned long long zero = 0;
+    CHECK_CUDA(cudaMemcpyToSymbol(g_validate_fail, &zero, sizeof(zero)));
+}
+
+// 读回设备端失败计数; 有失败则打印阶段名并返回 false
+static bool validate_ok(const char* stage)
+{
+    unsigned long long n = 0;
+    CHECK_CUDA(cudaMemcpyFromSymbol(&n, g_validate_fail, sizeof(n)));
+    if (n != 0) {
+        printf("validate FAILED: %s  (%llu failed check(s))\n", stage, n);
+        return false;
+    }
+    return true;
+}
+
 void validate_test()
 {
     enable_blocking_sync();
@@ -1585,37 +1699,42 @@ void validate_test()
     init_adds_pub_dev();
     init_break_flag();
     DpManager dp_manager(RHODP_TEST_NUM + 10);
-       
+
+    // 设备端失败计数清零。Release 下内核里的 assert 会被 NDEBUG 编译掉, 所以
+    // 内核内统一用 DEV_ASSERT 累加 g_validate_fail, 每个阶段跑完在这里查一次。
+    validate_reset();
+    const auto stage_ok = [](const char* name) {
+        if (!validate_ok(name)) exit(EXIT_FAILURE);
+    };
+
+    // 单 walker 步进 vs 链后继对拍 + DP 缓冲写入/溢出路径
     validate_multi<<<10, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
+    stage_ok("validate_multi");
+
+    // safegcd 模逆: a * a^-1 == 1 (mod p)
     validate_safegcd<<<1, 1>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
+    stage_ok("validate_safegcd");
+
+    // 仿射点加 (G / G+G / G+2G / G+(-G)) 与 distinguishable 判据
+    // (含测试链尾槽那个真实 DP 样点的索引核对)
     validate_1<<<1, 1>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
+    stage_ok("validate_1");
 
     // 多 walker 批量求逆对拍: 沿同一测试链, 连续 W 个状态批量步进一步,
-    // 逐个与单 walker 后继对拍 (Release 下 assert 失效, 用失败计数报告)
-    {
-        unsigned long long* d_fail;
-        CHECK_CUDA(cudaMalloc(&d_fail, sizeof(unsigned long long)));
-        CHECK_CUDA(cudaMemset(d_fail, 0, sizeof(unsigned long long)));
-        validate_multi_w<2><<<10, 256>>>(d_fail);
-        CHECK_CUDA(cudaDeviceSynchronize());
-        validate_multi_w<4><<<10, 256>>>(d_fail);
-        CHECK_CUDA(cudaDeviceSynchronize());
-        validate_multi_w<8><<<10, 256>>>(d_fail);
-        CHECK_CUDA(cudaDeviceSynchronize());
-        unsigned long long fail = 0;
-        CHECK_CUDA(cudaMemcpy(&fail, d_fail, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaFree(d_fail));
-        if (fail != 0) {
-            printf("validate_multi_w FAILED: %llu mismatches\n", fail);
-            exit(EXIT_FAILURE);
-        }
-        printf("validate_multi_w passed (W=2/4/8).\n");
-    }
+    // 逐个与单 walker 后继对拍
+    validate_multi_w<2><<<10, 256>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    validate_multi_w<4><<<10, 256>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    validate_multi_w<8><<<10, 256>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    stage_ok("validate_multi_w (W=2/4/8)");
 
-    // 仿射点加 (libsecp256k1 内部 5x52 域实现) 的正确性验证
+    // 仿射点加 (libsecp256k1 内部 5x52 域实现) 的正确性验证。
+    // 它自己内部也把 assert 换成了显式判断 + exit, 见 rho.cpp。
     validate_rho_affine();
 
     //dp_manager.save_dps();
@@ -1630,9 +1749,9 @@ void validate_test()
         DpBuffer buffer;
         transfer(buffer.sp.m, (const unsigned char*)&t.m);
         transfer(buffer.sp.n, (const unsigned char*)&t.n);
-        assert(buffer.sp == r);
+        HOST_ASSERT(buffer.sp == r);
         t.to(r2);
-        assert(memcmp(&r, &r2, sizeof(r2)) == 0);
+        HOST_ASSERT(memcmp(&r, &r2, sizeof(r2)) == 0);
     }
 
     // 清理资源
@@ -1656,8 +1775,8 @@ void validate_test()
     save_RhoStates_dev(points, fn2_);
     loadRhoState(rsv2.data(), points, fn2_);
     for (int i = 0; i < points; i++) {
-        assert(check(ctx, &rsv[i].x, rsv[i].m, rsv[i].n));
-        assert(memcmp(&rsv[i], &rsv2[i], sizeof(rsv[i])) == 0);
+        HOST_ASSERT(check(ctx, &rsv[i].x, rsv[i].m, rsv[i].n));
+        HOST_ASSERT(memcmp(&rsv[i], &rsv2[i], sizeof(rsv[i])) == 0);
     }
     std::remove(fn_.c_str());
     std::remove(fn2_.c_str());
