@@ -306,7 +306,7 @@ __host__ __device__ static int32_t divsteps30(int32_t zeta, uint32_t f0, uint32_
 #endif // USE_CONSTTIME_MODINV
 
 // modinv32_inv256[i] = -(2*i+1)^-1 (mod 256)
-// 设备端需要放在常量内存里 (与 modinfo_p 同样的做法), 主机端退化为普通常量数组
+// 设备端用常量数组; 主机端退化为普通常量数组
 CONSTANT uint8_t modinv32_inv256[128] = {
     0xFF, 0x55, 0x33, 0x49, 0xC7, 0x5D, 0x3B, 0x11, 0x0F, 0xE5, 0xC3, 0x59,
     0xD7, 0xED, 0xCB, 0x21, 0x1F, 0x75, 0x53, 0x69, 0xE7, 0x7D, 0x5B, 0x31,
@@ -730,11 +730,8 @@ public:
     }
 } ;
 
-// 设备常量内存存储 adds_pub_dev
-__constant__ RhoPoint_dev adds_pub_dev[256];
-// 同一张表的普通全局内存副本 (cudaMalloc 的设备缓冲), 见 get_add<GM> 的说明
-__device__ RhoPoint_dev* adds_pub_g_dev = nullptr;
-
+// 设备全局内存存储 adds_pub_dev
+__device__ RhoPoint_dev adds_pub_dev[256];
 
 constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
 __constant__ RhoPoint_dev RhoStates_rand[dp_buffer_size];
@@ -743,8 +740,8 @@ __constant__ RhoPoint_dev RhoStates_rand[dp_buffer_size];
 // (1-1/W) 次 safegcd 模逆; 同时寄存器每 walker 涨 ~33 个, W 太大掉占用。
 // 具体取值由 perf_test_rho_gpu_walkers 实测后确定 (RTX 3070 Ti Laptop 实测:
 // W=1:156M W=2:267M W=4:420M W=8:563M W=16:670M W=32:705M points/s,
-// W=32 收益已饱和 (+5%) 而寄存器/显存占用翻倍, 故取 16)。
-constexpr int RHO_GPU_WALKERS = 16;
+// W=32 收益已饱和 (+5%) 而寄存器/显存占用翻倍, 当前运行取 8 作为稳妥折中)。
+constexpr int RHO_GPU_WALKERS = 8;
 
 // 可区分点判断 (设备端)
 __host__ __device__ uint64_t distinguishable(const uint256_t& x)
@@ -776,19 +773,7 @@ __host__ __device__ void fun_add(RhoPoint_dev& s, const RhoPoint_dev& a)
 //    只有实测能回答 (perf_test_rho_gpu_walkers)。
 // 2. 寄存器压力: 每多一个 walker 多 ~33 个寄存器 (132 字节状态)。96~128
 //    寄存器区间不影响占用率, W 大了会掉 warp。
-// 3. 表读取: 常量内存带发散索引的读取会串行化全部命中 (每点 33 条 LDC);
-//    GM=1 时改读全局内存副本, 依赖 L1/L2 缓存与内存级并行, 实测更快。
-
-// 取步进表表项。__constant__ 的广播读取只在所有线程同一索引时高效,
-// rho 以 x 坐标低字节做索引, 同 warp 32 个线程几乎必然发散,
-// 常量内存会把一次读取串行成最多 32 次; GM=1 走全局内存副本 (靠 L1 缓存)。
-// 仅限设备端: 宿主代码不能直接引用 __constant__ 变量。
-template <bool GM>
-__device__ __forceinline__ const RhoPoint_dev* get_add(const RhoPoint_dev* table, unsigned idx)
-{
-    if (GM) return table + idx;
-    return &adds_pub_dev[idx];
-}
+// 3. 表读取: 发散索引下设备全局表是唯一实现路径，避免常量内存串行化。
 
 // 用分母逆元 inv_den 推进一个 walker 一步 (标量 m/n 同步累加)。
 // mode: 0 = 一般加法 (den = Qx-Px); 1 = 倍点 (den = Py+Qy, x 相同);
@@ -828,11 +813,10 @@ __device__ static void step_walker(RhoPoint_dev& s, const uint256_t& inv_den, in
 }
 
 // 一步批量仿射点加: W 个 walker 各走一步, 只做一次域模逆。
-// table 仅在 GM=1 时使用 (指向 adds_pub_g_dev 表首)。
 // 分母构造上恒非零: 被跳过的 walker (无穷远 / P=-Q) 用 1 凑前缀积,
 // 倍点分母 Py+Qy != 0, 一般加法分母 Qx-Px != 0, 故无需兜底路径。
-template <int W, bool GM>
-__device__ void fun_add_w(RhoPoint_dev* s, const RhoPoint_dev* table)
+template <int W>
+__device__ void fun_add_w(RhoPoint_dev* s)
 {
     // den[k]: 该 walker 本步的分母; prefix[k] = d[0]*...*d[k]
     uint256_t den[W], prefix[W];
@@ -840,7 +824,7 @@ __device__ void fun_add_w(RhoPoint_dev* s, const RhoPoint_dev* table)
     int mode[W];
     for (int k = 0; k < W; ++k) {
         const AffinePoint& P = s[k].x;
-        a[k] = get_add<GM>(table, (unsigned char)P.x.limb[0]);
+        a[k] = &adds_pub_dev[(unsigned char)P.x.limb[0]];
         const AffinePoint& Q = a[k]->x;
         den[k] = uint256_t{{1}};
         if (P.infinity || Q.infinity) {
@@ -893,9 +877,6 @@ extern bool gameover;
 
 RhoPoint_dev* RhoStates_host = nullptr;
 __device__ RhoPoint_dev* RhoStates_dev = nullptr;
-
-// 步进表的全局内存副本 (宿主侧指针, 见 get_add<GM> 的说明)
-RhoPoint_dev* adds_pub_g_host = nullptr;
 
 // 添加 DP 到缓冲区 (设备端)
 __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
@@ -1120,24 +1101,19 @@ __global__ void rho()
 // 每线程推进 W 个 walker, 每批一次批量求逆 (fun_add_w)。状态按
 // idx*W + k 交错存放。DP 命中的 walker 由 add_dp_to_buffer 原地换成
 // RhoStates_rand 池里的随机点, 与单 walker 语义一致。
-//
-// W 与 GM 是模板参数: W 影响寄存器分配 (每 walker ~33 个), GM 选择
-// 步进表放常量内存 (GM=0) 还是全局内存 (GM=1)。发散索引下常量内存读取
-// 会串行化 (每点 33 条 LDC), 全局内存副本靠 L1 缓存反而更快。
-template <int W, bool GM>
+template <int W>
 __global__ void rho_w()
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     RhoPoint_dev s[W];
 #pragma unroll
     for (int k = 0; k < W; ++k) s[k] = RhoStates_dev[idx * W + k];
-    const RhoPoint_dev* table = GM ? adds_pub_g_dev : nullptr;
 
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
     while (true) {
-        fun_add_w<W, GM>(s, table);
-        count_rho += W;
+        fun_add_w<W>(s);
+        count_rho ++;
 #pragma unroll
         for (int k = 0; k < W; ++k) {
             uint64_t d = distinguishable(s[k].x.x);
@@ -1151,25 +1127,24 @@ __global__ void rho_w()
 #pragma unroll
     for (int k = 0; k < W; ++k) RhoStates_dev[idx * W + k] = s[k];
     if (idx == 0) {
-        printf("rho_w<W=%d,GM=%d> count_rho:%llu count_dp:%d\n", W, (int)GM, count_rho, count_dp);
+        printf("rho_w<W=%d> count_rho:%llu count_dp:%d\n", W, count_rho * W, count_dp);
     }
 }
 
 // 基准内核: 固定批次数, 用 clock64 累计周期。DP 只计数不写缓冲
 // (命中率 2^-32, 不影响指令构成; 省去对 dp 缓冲的依赖)。
-template <int W, bool GM>
+template <int W>
 __global__ void perf_rho_w_kernel(int batches, unsigned long long* cycles_out, unsigned int* dp_out)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     RhoPoint_dev s[W];
 #pragma unroll
     for (int k = 0; k < W; ++k) s[k] = RhoStates_dev[idx * W + k];
-    const RhoPoint_dev* table = GM ? adds_pub_g_dev : nullptr;
 
     unsigned int dp = 0;
     long long t0 = clock64();
     for (int i = 0; i < batches; ++i) {
-        fun_add_w<W, GM>(s, table);
+        fun_add_w<W>(s);
 #pragma unroll
         for (int k = 0; k < W; ++k) {
             if (distinguishable(s[k].x.x) != 0) dp++;
@@ -1211,22 +1186,6 @@ void init_adds_pub_dev()
         RhoPoint_dev t;
         t.from(adds_pub[0][i]);
         CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_dev, &t, sizeof(RhoPoint_dev), sizeof(RhoPoint_dev) * i, cudaMemcpyHostToDevice));
-    }
-    // 全局内存副本: 发散索引下常量内存读取串行化, 全局副本靠 L1 缓存更快
-    if (!adds_pub_g_host) {
-        CHECK_CUDA(cudaMalloc(&adds_pub_g_host, sizeof(adds_pub_dev)));
-        CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_g_dev, &adds_pub_g_host, sizeof(RhoPoint_dev*)));
-    }
-    static std::vector<RhoPoint_dev> staging(256);
-    for (int i = 0; i < 256; i++) staging[i].from(adds_pub[0][i]);
-    CHECK_CUDA(cudaMemcpy(adds_pub_g_host, staging.data(), sizeof(adds_pub_dev), cudaMemcpyHostToDevice));
-}
-
-void free_adds_pub_g()
-{
-    if (adds_pub_g_host) {
-        CHECK_CUDA(cudaFree(adds_pub_g_host));
-        adds_pub_g_host = nullptr;
     }
 }
 
@@ -1322,7 +1281,7 @@ void rho_play() {
     while (!gameover) {
         break_rho(false);
         init_RhoStates_rand();
-        rho_w<W, true><<<gridSize, blockSize>>>();
+        rho_w<W><<<gridSize, blockSize>>>();
         // 等待核函数完成
         CHECK_CUDA(cudaDeviceSynchronize());
         dp_manager.save_dps();
@@ -1350,10 +1309,9 @@ __constant__ AffinePoint G = {
 // 验证内核: 沿 init_RhoStates_test 生成的确定性测试链, 取连续 W 个状态
 // 做一次批量步进, 逐个与链上后继对拍。Release 下 assert 会被编译掉,
 // 用失败计数器 + printf 报告。
-template <int W, bool GM>
+template <int W>
 __global__ void validate_multi_w(unsigned long long* fail_out)
 {
-    const RhoPoint_dev* table = GM ? adds_pub_g_dev : nullptr;
     int stride = blockDim.x * gridDim.x;
     // 上界 RHOSTATES_TEST_NUM-1: 链后继只到索引 RHOSTATES_TEST_NUM-1 -> RHOSTATES_TEST_NUM,
     // 最后一个槽位 (RHOSTATES_TEST_NUM) 是 DP 测试专用点, 不参与链对拍
@@ -1361,13 +1319,13 @@ __global__ void validate_multi_w(unsigned long long* fail_out)
         RhoPoint_dev s[W];
 #pragma unroll
         for (int k = 0; k < W; ++k) s[k] = RhoStates_dev[base + k];
-        fun_add_w<W, GM>(s, table);
+        fun_add_w<W>(s);
 #pragma unroll
         for (int k = 0; k < W; ++k) {
             if (!(s[k] == RhoStates_dev[base + k + 1])) {
                 atomicAdd(fail_out, 1);
                 if (*fail_out < 4) {
-                    printf("validate_multi_w<W=%d,GM=%d> MISMATCH at base=%d k=%d\n", W, (int)GM, base, k);
+                    printf("validate_multi_w<W=%d> MISMATCH at base=%d k=%d\n", W, base, k);
                     print_rho_point_dev(s[k]);
                 }
             }
@@ -1515,40 +1473,22 @@ void perf_test_gpu()
 
 // ================== GPU 多 walker 基准 ==================
 //
-// 同进程 A/B: 生产形态 (46x256 线程) 下跑 W/GM 各组合, 每组合固定批次数,
+// 同进程 A/B: 生产形态 (46x256 线程) 下跑不同 W 的组合, 每组合固定批次数,
 // 用 cudaEvent 计时 + clock64 累计周期 (对 GPU 降频免疫), W=1 走原单
 // walker 路径作基线与漂移对照。
 //
-// 基准需要 RhoStates_dev 已按 total = threads*W_MAX 初始化 (直接复用
-// rho_play 的初始化: init_RhoStates_dev(total_points_max, _RSFile2_name))。
-
-// 验证内核: 步进表的全局内存副本与常量内存版本逐字节一致
-__global__ void validate_adds_g(unsigned long long* fail_out)
-{
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i >= 256) return;
-    const unsigned char* a = (const unsigned char*)&adds_pub_dev[i];
-    const unsigned char* b = (const unsigned char*)&adds_pub_g_dev[i];
-    for (int j = 0; j < (int)sizeof(RhoPoint_dev); ++j) {
-        if (a[j] != b[j]) {
-            atomicAdd(fail_out, 1);
-            printf("validate_adds_g mismatch at %d byte %d\n", i, j);
-            break;
-        }
-    }
-}
+// 仅保留 device-table 方案: 步进表统一存放在 adds_pub_dev, 不再保留 GM
+// 常量表/全局表分支。
 
 // 基线内核: 原 rho 生产路径的循环体 (fun_add 一次一模逆), 固定步数
-template <bool GM>
 __global__ void perf_rho_single_kernel(int steps, unsigned long long* cycles_out, unsigned int* dp_out)
 {
-    const RhoPoint_dev* table = GM ? adds_pub_g_dev : nullptr;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     RhoPoint_dev s = RhoStates_dev[idx];
     unsigned int dp = 0;
     long long t0 = clock64();
     for (int i = 0; i < steps; ++i) {
-        fun_add(s, *get_add<GM>(table, (unsigned char)s.x.x.limb[0]));
+        fun_add(s, adds_pub_dev[(unsigned char)s.x.x.limb[0]]);
         if (distinguishable(s.x.x) != 0) dp++;
     }
     long long t1 = clock64();
@@ -1557,7 +1497,7 @@ __global__ void perf_rho_single_kernel(int steps, unsigned long long* cycles_out
     RhoStates_dev[idx] = s;
 }
 
-template <int W, bool GM>
+template <int W>
 static void run_perf_rho_w(int grid, int block, int batches)
 {
     unsigned long long* d_cycles;
@@ -1572,9 +1512,9 @@ static void run_perf_rho_w(int grid, int block, int batches)
     CHECK_CUDA(cudaEventCreate(&stop));
     CHECK_CUDA(cudaEventRecord(start));
     if (W == 1) {
-        perf_rho_single_kernel<GM><<<grid, block>>>(batches, d_cycles, d_dp);
+        perf_rho_single_kernel<<<grid, block>>>(batches, d_cycles, d_dp);
     } else {
-        perf_rho_w_kernel<W, GM><<<grid, block>>>(batches, d_cycles, d_dp);
+        perf_rho_w_kernel<W><<<grid, block>>>(batches, d_cycles, d_dp);
     }
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
@@ -1593,7 +1533,7 @@ static void run_perf_rho_w(int grid, int block, int batches)
 
     uint64_t points = (uint64_t)grid * block * W * batches;
     double sec = ms / 1000.0;
-    std::cout << "perf rho W=" << W << " GM=" << (int)GM << ": " << points << " points, " << ms
+    std::cout << "perf rho W=" << W << ": " << points << " points, " << ms
               << " ms, " << (uint64_t)(points / sec) << " points/s, " << (cycles / points)
               << " cycles/point(sum), dp=" << dp << std::endl;
 }
@@ -1614,19 +1554,13 @@ void perf_test_rho_gpu_walkers()
 
     const int batches = 20000;
     // 首尾各跑一次 W=1 基线作漂移对照
-    run_perf_rho_w<1, false>(gridSize, blockSize, batches);
-    run_perf_rho_w<1, true>(gridSize, blockSize, batches);
-    run_perf_rho_w<2, false>(gridSize, blockSize, batches);
-    run_perf_rho_w<2, true>(gridSize, blockSize, batches);
-    run_perf_rho_w<4, false>(gridSize, blockSize, batches);
-    run_perf_rho_w<4, true>(gridSize, blockSize, batches);
-    run_perf_rho_w<8, false>(gridSize, blockSize, batches);
-    run_perf_rho_w<8, true>(gridSize, blockSize, batches);
-    run_perf_rho_w<16, false>(gridSize, blockSize, batches);
-    run_perf_rho_w<16, true>(gridSize, blockSize, batches);
-    run_perf_rho_w<32, false>(gridSize, blockSize, batches);
-    run_perf_rho_w<32, true>(gridSize, blockSize, batches);
-    run_perf_rho_w<1, false>(gridSize, blockSize, batches);
+    run_perf_rho_w<1>(gridSize, blockSize, batches);
+    run_perf_rho_w<2>(gridSize, blockSize, batches);
+    run_perf_rho_w<4>(gridSize, blockSize, batches);
+    run_perf_rho_w<8>(gridSize, blockSize, batches);
+    run_perf_rho_w<16>(gridSize, blockSize, batches);
+    run_perf_rho_w<32>(gridSize, blockSize, batches);
+    run_perf_rho_w<1>(gridSize, blockSize, batches);
 
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
@@ -1665,13 +1599,11 @@ void validate_test()
         unsigned long long* d_fail;
         CHECK_CUDA(cudaMalloc(&d_fail, sizeof(unsigned long long)));
         CHECK_CUDA(cudaMemset(d_fail, 0, sizeof(unsigned long long)));
-        validate_multi_w<2, false><<<10, 256>>>(d_fail);
+        validate_multi_w<2><<<10, 256>>>(d_fail);
         CHECK_CUDA(cudaDeviceSynchronize());
-        validate_multi_w<4, false><<<10, 256>>>(d_fail);
+        validate_multi_w<4><<<10, 256>>>(d_fail);
         CHECK_CUDA(cudaDeviceSynchronize());
-        validate_multi_w<8, false><<<10, 256>>>(d_fail);
-        CHECK_CUDA(cudaDeviceSynchronize());
-        validate_multi_w<4, true><<<10, 256>>>(d_fail);
+        validate_multi_w<8><<<10, 256>>>(d_fail);
         CHECK_CUDA(cudaDeviceSynchronize());
         unsigned long long fail = 0;
         CHECK_CUDA(cudaMemcpy(&fail, d_fail, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
@@ -1680,24 +1612,7 @@ void validate_test()
             printf("validate_multi_w FAILED: %llu mismatches\n", fail);
             exit(EXIT_FAILURE);
         }
-        printf("validate_multi_w passed (W=2/4/8 const + W=4 gmem).\n");
-    }
-
-    // 步进表全局副本一致性
-    {
-        unsigned long long* d_fail;
-        CHECK_CUDA(cudaMalloc(&d_fail, sizeof(unsigned long long)));
-        CHECK_CUDA(cudaMemset(d_fail, 0, sizeof(unsigned long long)));
-        validate_adds_g<<<1, 256>>>(d_fail);
-        CHECK_CUDA(cudaDeviceSynchronize());
-        unsigned long long fail = 0;
-        CHECK_CUDA(cudaMemcpy(&fail, d_fail, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaFree(d_fail));
-        if (fail != 0) {
-            printf("validate_adds_g FAILED: %llu mismatches\n", fail);
-            exit(EXIT_FAILURE);
-        }
-        printf("validate_adds_g passed.\n");
+        printf("validate_multi_w passed (W=2/4/8).\n");
     }
 
     // 仿射点加 (libsecp256k1 内部 5x52 域实现) 的正确性验证
