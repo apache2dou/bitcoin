@@ -1,0 +1,2 @@
+DistinguishablePoints.txt、DistinguishablePoints_rho.txt、DistinguishablePoints_rho2.txt、DistinguishablePoints_rho3.txt 都是32为的可分点
+DistinguishablePoints_rho3.txt中 和DistinguishablePoints_rho2.txt的末尾 包含串行的可分点
