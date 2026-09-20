@@ -1,16 +1,30 @@
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cuda_runtime.h>
+#include <fstream>
+#include <string>
+#include <thread>
 #include <vector>
 #include <iostream>
 #include <cstdio>
 
 // 256-bit数值（小端序，32位肢体）
-struct uint256_t {
+//
+// alignas(16) 是性能关键, 不是洁癖: 这个结构在设备端会大量出现在
+//   (1) 全局步进表 adds_pub_dev[idx]  —— 每次点加一次表查询
+//   (2) 本地内存的 walker 状态 s[W] / 批量求逆的 den[W]、prefix[W]
+// 两处。若对齐只有 4 字节, 编译器证明不了 16 字节对齐, 一条 32 字节的
+// 值就要拆成 8 条 32 位 LDG/LDL/STL (实测 RhoPoint_dev 132 B 的表项被拆成
+// 33 条); 给出 16 字节对齐后同样一段数据只要 2 条 128 位访问。
+struct alignas(16) uint256_t {
     uint32_t limb[8];
 };
 
@@ -40,7 +54,23 @@ CONSTANT uint256_t three_mod = {
     0x00000003, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000};
 
+// fun_add_w 里两个 W 循环的展开因子。
+//
+// 已实测 (OPT-4): 部分展开是净损失, 全展开最优 --
+//   展开因子 4: W=1 232.6M(-1.6%) W=2 404.6M(+7.0%) W=4 476.5M(+9.8%)
+//               W=8 335.0M(-42.7%) W=16 384.5M(-44.5%) W=32 410.4M(-43.4%)
+//   W>=8 时 local 足迹几乎没变 (2656 -> 2688 @W8, 13648 -> 13648 @W32), 掉的
+//   全是 ILP: 限制展开等于限制同时活跃的 walker 链数, 而本内核是纯延迟受限
+//   (实测 IPC ~= 0.02), 只能靠链间重叠掩盖访存/依赖延迟。只有 W<=4 因为状态
+//   本来就塞得进寄存器 (local 528->72 @W2, 960->240 @W4), 减少溢出才划算。
+// 所以回到"不写 pragma"(由 ptxas 全展开) 的原始行为, 保留以下记录以备参考。
+//
+// 注意: `#pragma unroll` 的值必须写死 (预处理器不展开 #pragma 里的宏),
+// 所以这里不再提供可调宏, 要再扫就把 `#pragma unroll` 直接写进循环上方。
+
 // 点结构（仿射坐标）
+// uint256_t 已经 alignas(16), 所以本结构自然也是 16 字节对齐、大小 80 字节
+// (x 0..31, y 32..63, infinity 64, 尾部填充到 80)。
 struct AffinePoint {
     uint256_t x;
     uint256_t y;
@@ -72,18 +102,65 @@ struct AffinePoint {
 // 默认策略下 cudaDeviceSynchronize() 是自旋忙等（spin），会让调用线程 100% 占满一个 CPU 核。
 // 改为阻塞式等待（Windows 上走 WaitForSingleObject），把该核让给 CPU 工作线程。
 // 注意：必须在任何会创建 CUDA context 的调用之前执行，否则返回 cudaErrorSetOnActiveProcess 且不生效。
-static void enable_blocking_sync()
+// 返回值 = 标志是否真的生效。返回 false 意味着 cudaDeviceSynchronize() 会退回自旋
+// （表现为 4 线程模式下多出一个 100% 的核），所以生产循环一律用 wait_kernel_done() 等。
+// 诊断开关 RHO_NO_BLOCKING_SYNC=1 可强制跳过（复现自旋现场）。
+static bool enable_blocking_sync()
 {
-    static bool done = false;
-    if (done) return;
-    done = true;
+    static int state = -1; // -1 = 未执行, 0 = 没生效, 1 = 生效
+    if (state >= 0) return state == 1;
+    const char* off = getenv("RHO_NO_BLOCKING_SYNC");
+    if (off != nullptr && off[0] == '1') {
+        state = 0;
+        return false;
+    }
     cudaError_t err = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-    // context 已存在说明本进程更早的地方碰过 CUDA，此处无力回天，静默忽略即可
-    if (err != cudaSuccess && err != cudaErrorSetOnActiveProcess) {
-        fprintf(stderr, "cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) failed: %s\n",
+    state = (err == cudaSuccess) ? 1 : 0;
+    if (err != cudaSuccess) {
+        // cudaErrorSetOnActiveProcess = context 已存在, 标志改不动了
+        fprintf(stderr, "[rho_play] cudaSetDeviceFlags(BlockingSync) NOT applied: %s\n",
                 cudaGetErrorString(err));
     }
     (void)cudaGetLastError(); // 清除残留的错误状态，避免污染后续 CHECK_CUDA
+    return state == 1;
+}
+
+// 等 kernel 完成的两种方式:
+//   poll (默认) = 事件轮询 + sleep(100ms)。不依赖 blocking-sync 标志, 任何情况下都不自旋;
+//                 代价是每轮最多多 100ms 延迟 (生产轮 = 30 分钟, 可忽略)。
+//   sync        = cudaDeviceSynchronize()。标志生效时同样是阻塞等待, 没生效时自旋占满一个核。
+// 用 RHO_WAIT_MODE=sync 可切回旧行为做对照。
+//
+// run-19 实测 (mode 2 = 4 个 CPU walker 线程, 30 s 窗口, 取 TotalProcessorTime 增量):
+//   wait=poll + blocking-sync=ok        -> 进程 3.949 核, 等待线程 0.000 核
+//   wait=sync + RHO_NO_BLOCKING_SYNC=1  -> 进程 4.946 核, 第 5 个线程 0.959 核 (自旋现场复现)
+//   wait=poll + RHO_NO_BLOCKING_SYNC=1  -> 进程 3.958 核 (本函数对标志失效免疫)
+// 另外用短轮掩码 (2^18 批 = 32 s/轮) 连跑 3 轮: 每轮都正常退出 -> save_dps -> 落盘 -> 下一轮,
+// 进程稳定 3.977 核, 证明 poll 的退出路径与落盘路径都正常。
+static const char* gpu_wait_mode()
+{
+    const char* m = getenv("RHO_WAIT_MODE");
+    if (m != nullptr && (m[0] == 's' || m[0] == 'S')) return "sync";
+    return "poll";
+}
+
+static bool gpu_wait_is_sync() { return gpu_wait_mode()[0] == 's'; }
+
+static void wait_kernel_done()
+{
+    if (gpu_wait_is_sync()) {
+        CHECK_CUDA(cudaDeviceSynchronize());
+        return;
+    }
+    static cudaEvent_t ev = nullptr;
+    if (ev == nullptr) CHECK_CUDA(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    CHECK_CUDA(cudaEventRecord(ev, 0));
+    cudaError_t st;
+    while ((st = cudaEventQuery(ev)) == cudaErrorNotReady) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK_CUDA(st);
+    (void)cudaGetLastError(); // 清掉轮询期间 cudaErrorNotReady 的残留
 }
 
 // ================== 基础算术函数 ==================
@@ -144,6 +221,48 @@ __host__ __device__ int u256_equal(const uint256_t& a, const uint256_t& b)
 // hn 必须是模板参数: 运行期参数会让 a[12]/b[12] 局部数组带可变下标寻址,
 // nvcc 直接把数组降级到本地内存 (LDL/STL, 实测 ~540 条/点, 占指令数 39%);
 // 模板参数配合调用点的常量循环界可完全展开, 数组留在寄存器里。
+//
+// ⚠ 进位传播是 fold256 唯一出过真 bug、也是唯一"看着对但慢 24%"的地方 ——
+//   动它之前先看 reduce_product 上面的注释和下面的 A/B 表。
+//
+//   满宽乘 (micro MODE 4, mul_mod(x,x)) 的实测 (cycles/op, 4 warps/SM / 16 warps/SM):
+//     r168 HEAD (只补 dst[hn+1..hn+2] 两格)   734 / 1691   ← 快, 但**错**
+//     v1  带 break 的独立循环                 926 / 1863
+//     v2  'if constexpr' 递归                 922 / 1893
+//     v3  进位并进主循环 (无条件跑到下标 9)    950 / 1978   ← 静态指令最少 (400)
+//     v4  无 break 的局部 for                 1094 / 2271
+//     v5  每格 'if (c==0) return 0'           1091 / 2284
+//     v6  每格一个真分支 + 32 位进位           897 / 1811
+//     v7  同 v6, 但 hn==8 那格去掉分支         897 / 1811   ← v6/v7 的 SASS 完全一致
+//   SASS 证据 (cuobjdump -sass, micro_kernel<4>): r168=360 条 / v2=464 / v3=400 /
+//   v4=472 / v5=472 / v6=v7=432, **全部 0 条 LDL/STL** —— 所以"数组落到本地内存"
+//   的猜测是错的。真正的差别:
+//     · v5 的 'if (c==0) return 0' 被 nvcc if-convert 成 ISETP.NE + SEL 选通链
+//       (相对 r168: SEL +30, IMAD.X +26, ISETP.NE.U32 +34), 112 条新指令**全部
+//       压在串行依赖链上** (4 warps/SM 下 ≈ 2.3 cyc/条 => +357)。
+//     · v6 改用 32 位进位 + 显式分支 (BRA 2 -> 18), 静态 432 条, 实测回到 897。
+//       剩下的 +155 cyc 是**分支本身**的代价 (分支 = 调度屏障, 打散了原来跨整个
+//       mul_mod 的软件流水)。
+//   教训: 只压指令数没用, 要压**依赖链长度**; 而一旦引入真分支, 就再也回不到
+//   r168 那种"零分支、全 if-convert、可全局调度"的状态。**+21% 的满宽乘是这笔
+//   正确性修复的固有代价**, 除非把进位传播改成无分支的 O(1) 形式 (没成功)。
+//   真实 rho 内核 (rhoperf, RHO_PERF_BATCHES=5000, 3 轮交叉):
+//     W=16  r168 1780.5/1789.7/1789.7 ms  vs  v6/v7 1808.9/1812.9/1809.5 ms  (-1.5%)
+//     W=32  r168 3484.9/3515.8/3501.8 ms  vs  v6/v7 3484.3/3585.0/3513.0 ms  (噪声内)
+//     W=64  r168 7075.5/7098.1/7109.4 ms  vs  v6/v7 6944.1/7119.5/7134.9 ms  (噪声内)
+//   => 真实代价 <= ~1.8% (只在 W=16), W=32/64 完全在噪声内。可以接受。
+//
+// 单格进位吸收: dst[k] += c, 返回新的进位。k 是编译期常量 => 调用点完全展开、
+// dst 留在寄存器。进位恒为 0/1 (见 fold256 里的取值范围推导), 所以用 32 位算术,
+// 不要 uint64_t —— 后者会让 nvcc 每格生成 IMAD.MOV.U32 + IMAD.X 两条 64 位加法。
+template <int k>
+__host__ __device__ static inline uint32_t fold_step(uint32_t* dst, uint32_t c)
+{
+    const uint32_t t = dst[k] + c;
+    dst[k] = t;
+    return t < c ? 1u : 0u;
+}
+
 template <int hn>
 __host__ __device__ static void fold256(const uint32_t* src, uint32_t* dst)
 {
@@ -152,6 +271,7 @@ __host__ __device__ static void fold256(const uint32_t* src, uint32_t* dst)
 
     uint64_t c = 0;
     // hi[i]*M = hi[i]*0x3D1 + hi[i]*2^32 , 分别落在位置 i 与 i+1
+    // (0x3D1 = 977, 故 hi*977 <= 2^42, c 最大 ~978*2^32, 不会溢出 64 位)
     for (int i = 0; i <= hn; ++i) {
         if (i < hn) c += (uint64_t)src[8 + i] * PSEUDO_MERSENNE_M0;
         if (i >= 1) c += (uint64_t)src[7 + i];
@@ -159,21 +279,104 @@ __host__ __device__ static void fold256(const uint32_t* src, uint32_t* dst)
         dst[i] = (uint32_t)cur;
         c = cur >> 32;
     }
-    // 进位传播: 结果 < 2^256 + 2^(32*hn+33), 至多再写到下标 hn+2;
-    // 用常量下标的条件写代替数据依赖的循环, 避免数组被降级到本地内存。
-    if (c != 0) {
-        uint64_t cur = c + (uint64_t)dst[hn + 1];
-        dst[hn + 1] = (uint32_t)cur;
-        c = cur >> 32;
-    }
-    if (c != 0) {
-        uint64_t cur = c + (uint64_t)dst[hn + 2];
-        dst[hn + 2] = (uint32_t)cur;
+
+    // ── 进位传播 (v6) ────────────────────────────────────────────────────────
+    // 三条硬约束, 每条都是实测换来的:
+    //   1) 必须一路走到下标 8 (hn=8 时是下标 9)。dst[hn+1..7] 由拷贝循环填成
+    //      src[hn+1..7], 那是正确的"低位肢体"值, 但 c=1 撞上一串 0xFFFFFFFF 会
+    //      一直穿过去; r168 那版只补两格, 于是丢掉 2^256 ≡ M 的那一份
+    //      (reduce_product 上面有构造用例)。dst[8]/dst[9] 初值 0, 进位必停在那里。
+    //   2) 不能独立成循环/递归。v1/v2/v4 都试过, 循环体或递归体没被内联进主线,
+    //      实测比 r168 慢 24%~49%, 且 SASS 里 LDL/STL 是 0 —— 不是本地内存问题。
+    //   3) 不能无条件执行。v3 把整条链并进主循环, 指令最少却最慢 (950 cyc):
+    //      静态指令数不是模型, 串行依赖链长度才是。
+    //   所以这里把整段套在**一个** if 里, 用编译期下标手写展开: 公共路径
+    //   (c == 0) 上是一条跳过的分支, 静态代价 ~2 条指令; 只有真的出进位时
+    //   才走进去 —— 而进位本身几乎不可能出现 (下面推导 c 恒为 0 或 1,
+    //   且为 1 的概率 < 2^-30)。
+    //
+    // 取值范围推导 (保证 c ∈ {0,1}, 所以 32 位进位够用):
+    //   记 c_i 为主循环第 i 轮结束后的进位, 恒有 c_i < 2^11:
+    //     c_0 = src[8]*977 >> 32 < 2^10; 之后每轮 c += (2^32-1)*977 + (2^32-1),
+    //     而每轮都 >>32, 故 c_i < 2^10 + 2^10 < 2^11 恒定成立。
+    //   末轮 (i = hn): hn=8 只加 src[15] < 2^32, 且 dst[8] 此时初值 0,
+    //     cur < 2^32 + 2^11  =>  c_8 <= 1;
+    //     hn=2 只加 src[9] <= 1, dst[2] < 2^32  =>  cur < 2^32 + 2^11  =>  c_2 <= 1;
+    //     hn=1 同理 c_1 <= 1。
+    //   (fold256 的入参已经归一化, 所以主循环里 c 永远是"纯进位", 不会有别的量。)
+    {
+        if constexpr (hn == 8) {
+            // hn = 8: 主循环已经写完 dst[0..8], dst[9..11] 还是 0。进位落在下标 9
+            // 就必然被吸收 (c <= 1 < 2^32), 所以一条赋值就够, **不需要分支** ——
+            // 少一个分支区域就少一份流水线气泡。
+            dst[9] = (uint32_t)c;
+        } else {
+            const uint32_t c0 = (uint32_t)c;   // 由上推导 c <= 1, 截断无损
+            if (c0 != 0) {
+                uint32_t cy = c0;
+                if constexpr (hn == 2) {
+                    cy = fold_step<3>(dst, cy);
+                    cy = fold_step<4>(dst, cy);
+                    cy = fold_step<5>(dst, cy);
+                    cy = fold_step<6>(dst, cy);
+                    cy = fold_step<7>(dst, cy);
+                    cy = fold_step<8>(dst, cy);
+                } else {
+                    static_assert(hn == 1, "fold256 只实例化 hn = 1 / 2 / 8");
+                    cy = fold_step<2>(dst, cy);
+                    cy = fold_step<3>(dst, cy);
+                    cy = fold_step<4>(dst, cy);
+                    cy = fold_step<5>(dst, cy);
+                    cy = fold_step<6>(dst, cy);
+                    cy = fold_step<7>(dst, cy);
+                    cy = fold_step<8>(dst, cy);
+                }
+                (void)cy;   // 下标 8 初值为 0 => 到那里进位必然被吸收
+            }
+        }
     }
 }
 
 // 512 位归一化乘积 prod[0..15] 归约到 [0, p)
 // 折叠链 16 肢体 -> 10 有效 -> 9 有效 -> 9 有效 -> < 2^256
+//
+// todo: 本函数 (及其 fold256 的进位传播) 是唯一被 validate 抓出过真 bug 的地方,
+// 改它之前先看下面这段历史。
+//
+// ── 2024 A/B 记录 ─────────────────────────────────────────────────────────
+// 背景: 旧版 fold256 的进位传播只写了 dst[hn+1] 和 dst[hn+2] 两个条件写,
+// 一度被判断为"没问题: 主循环结束后的 c 最多是 ~1, 不会形成长进位链"。
+// **这个判断是错的**: c=1 遇到 dst[hn+1..] 连续 0xFFFFFFFF 时会一路穿到底。
+// 实例 (validate 的构造用例, 现已全部通过):
+//     prod 全 0xFFFFFFFF, 正确结果 V = 2^512 - 1 ≡ M^2 - 1
+//     = 2^64 + 0x7A2*2^32 + 0xE90A0
+//   旧代码给出 2^64 + 0x7A1*2^32 + 0xE8CCF, 正好少了 M —— 少的那个进位落在一串
+//   0xFFFFFFFF 上。这个 bug 极难在随机路径上触发 (概率 ~2^-64), 只有构造输入能
+//   稳定复现, 这就是 validate 里那几个"全 f"用例存在的理由。
+//
+// 另外试过 OPT-9: 换成"一趟直接写 10 个肢体 + 数据相关的 3 趟回折"的实现,
+// 前提是"第二折几乎不执行"。该前提也是错的 —— 对满宽乘积 hi 近似均匀,
+// H = a[8] + a[9]*2^32 远非 0, 回折是常态。实测 (micro, 同 session, 三次一致):
+//     mul_mod(x,x) 满宽乘法: 735.9 -> 908.0 cyc (4 warps), 1716.8 -> 1864.7 (16 warps)
+//     mul_mod(x, 小常数):    ~持平
+//   真实内核 (RHO_PERF_BATCHES=5000, W=16/32/64): W16 -1.9%, W32 +0.9%, W64 -0.6%
+// OPT-9 本身**是对的** (它通过了全部 6 个构造/随机用例), 只是更慢, 所以弃用;
+// 这里保留 fold256 的结构 + 修好进位传播, 拿到同样的正确性且不付那份代价。
+//
+// 正确性: validate 里用**完全独立**的教科书式逐位移位归约 ref_mod_p (512 次
+// r = 2r + bit) 做对拍, 覆盖随机 + 4 个构造极端输入 (全 f / hi全f / lo全f / 全0),
+// host 6/6 + 设备 2048 线程全部一致。
+// 其中三个构造用例可与手推解析解对照 (M = 2^32 + 977):
+//     全 f      -> V = 2^512 - 1     ≡ M^2 - 1 = 2^64 + 0x7A2*2^32 + 0xE90A0
+//     hi全f/lo0 -> V = 2^512 - 2^256 ≡ M^2 - M = 2^64 + 0x7A1*2^32 + 0xE8CD0
+//     lo全f/hi0 -> V = 2^256 - 1     ≡ M - 1   = 2^32 + 0x3D0
+// 这三个解析解是手推的, 不要改。插曲: 期间 ref_mod_p 自己的三态比较写错过
+// (判到"小于"后没停下, 低位把 ge 又翻回 true, 多减一次 p 并让 r[8] 下溢),
+// 一度表现为 "1024 failed"; 修好之后才发现生产代码**确实**有 bug。
+// 教训: 对拍有两个方向 —— 参考错会误报, 参考对就会抓到真错, 两边都得看。
+//
+// 历史教训 (保留): 折叠的每次迭代的位宽必须是**编译期常量**, 否则 nvcc 会把
+// 结果数组带可变下标寻址而降级到本地内存 (实测 ~540 条 LDL/STL 每点, 占指令 39%)。
 __host__ __device__ static uint256_t reduce_product(const uint32_t* prod)
 {
     uint32_t a[12], b[12];
@@ -657,47 +860,187 @@ __host__ __device__ uint256_t mod_inv_p(const uint256_t& a)
 }
 
 // ================== 点运算 (仿射坐标) ==================
-__host__ __device__ AffinePoint point_add(const AffinePoint& P, const AffinePoint& Q)
+//
+// 仿射点加唯一的一处实现, 拆成"判定分支 / 应用公式"两步。拆开的唯一动机是
+// 多 walker 批量求逆: W 个 walker 的**分母**必须先凑齐, 做一次 Montgomery
+// 批量求逆, 才能回头各自套公式。拆开之后:
+//
+//   fun_add_w<W>  —— 生产路径。表索引出发, W 个分母一次求逆。
+//   point_step    —— 给定任意 (P, Q) 的单步入口, 每步一次 mod_inv_p。
+//                    生产不跑它, 只用于验证三个分支 (点倍 / 无穷远 / 一般
+//                    加法): 这三个分支的触发条件由具体操作数决定, 没法用
+//                    表索引构造出来。
+//
+// 以前这里是一份独立的 point_add (单点) + fun_add_w 里另一份逐字重复的分支
+// 判定, 两份代码必须同步维护 —— 已经删掉, 分支判定只剩这一份。
+//
+// 合并后实测 (perf, W 扫描, block=128, batches=20000):
+//   W=1:  regs 140->114, local 144B->72B, occBlocks 3->4 (12->16 warps/SM),
+//         grid 138->184 (线程数 x1.333), 总吞吐 240.3M -> 257.2M pts/s (+7.0%)
+//   W=2..64: 全部在 ±0.5% 内 (regs 168 / local / occ 均未变, 即只是少了一份
+//         重复代码, 生产路径的指令流完全没动)
+// 也就是说这次清理不但没有代价, 还顺手把 W=1 的寄存器压力降下来了 —— 删掉的
+// fun_add 在 W=1 时多留了 26 个寄存器和 72B 本地内存。
+//
+// W=1 那部分收益的确切因果 (不要读成"每点变快了") —— 用 RHO_PERF_WS=1:138,1:184
+// 在同一份二进制、同一轮运行里交错 A/B 4 组钉死的:
+//     grid=138 (12 warps/SM): 210.71 / 212.47 / 209.95 / 209.50 M pts/s -> 210.66M
+//                             130322 / 129773 / 130472 / 130589 cyc/pt  -> 130289
+//     grid=184 (16 warps/SM): 225.04 / 222.54 / 222.09 / 220.38 M pts/s -> 222.51M
+//                             157193 / 157419 / 157375 / 157386 cyc/pt  -> 157343
+//   => 纯并发度带来的吞吐 +5.6%, 而**每点周期数反而 +20.8%**。两件事同时成立:
+//      同一份代码多塞 1/3 的 warp, 延迟隐藏变好所以总吞吐涨; 但每 SM 内部更挤,
+//      单线程的依赖链走得更慢。这就是"总吞吐随占位率上升、每线程延迟也随之上
+//      升"的典型交易, 净结果 +5.6%。生产用的 W=4 完全没吃到这个影响
+//      (regs/local/occ/cyc 全不变)。
+//      第 3 列那个 "+7.0%" 是跨运行读出来的, 里面混了机器态漂移; 同轮交错读出的
+//      +5.6% 才是这条因果的干净数值, 引用时优先引用它。
+//
+// 口径警告 (本轮实测的噪声底, 记录在此以免以后误读):
+//   - 同一会话内 base vs final 两次运行, 未被改动的 W=2..64 的 cyc/pt 只漂了
+//     +0.2% ~ +1.0%, 所以上面 W=1 的差异是真实的, 不是漂移。
+//   - 但隔一段时间重跑同一份二进制, 整张表的 cyc/pt 会整体平移 (实测某次整体
+//     +9%, W=1 从 145721 变 157501), 绝对值 pts/s 的机器态方差约 ±10% (GPU 时钟
+//     1410~1785 MHz 随温度/功耗浮动)。所以结论要么用同一轮内的漂移对照行归一,
+//     要么用 RHO_PERF_WS=...:grid 交错 A/B, 绝不要跨会话比绝对值。
+//
+// mode 取值 (由 step_prepare 返回):
+//   0 = 一般加法,  den = Qx - Px        (非零)
+//   1 = 倍点,      den = Py + Qy        (非零, Px == Qx 且 Py + Qy != 0)
+//   2 = P = -Q,    结果为无穷远         (den 无意义)
+//   3 = P 或 Q 为无穷远, 结果取另一个   (den 无意义)
+//
+// mode 2/3 下 den 必须置 1 而不是 0: 批量路径的前缀积要把被跳过的 walker 乘上
+// 中性元, 否则整批前缀积变 0, 一次 mod_inv_p(0) 会把整批的逆全部毁掉。置 1 之后
+// 分母恒非零, fun_add_w 里就不需要任何兜底路径 (CPU 侧 rho.cpp 的 fe_batch_inv
+// 靠对整批积做零检查 + 整批回退逐点路径, 这里用分类消掉了这个兜底)。
+//
+// 判定只算分母, 不碰点坐标 —— 前向循环里 P 还是旧值, 回代循环里才推进。
+__host__ __device__ static int step_prepare(const AffinePoint& P, const AffinePoint& Q, uint256_t* den)
 {
-    // 处理无穷点情况
-    if (P.infinity) return Q;
-    if (Q.infinity) return P;
-    AffinePoint R;
-    R.x = {{0}};
-    R.y = {{0}};
-    R.infinity = true;
-
+    if (P.infinity || Q.infinity) {
+        *den = uint256_t{{1}};
+        return 3;
+    }
     uint256_t x_diff = mod_sub(Q.x, P.x);
     if (is_zero(x_diff)) {
         uint256_t y_sum = mod_add(P.y, Q.y, p);
         if (is_zero(y_sum)) {
-            return R;
+            *den = uint256_t{{1}}; // P = -Q, 结果无穷远
+            return 2;
         }
+        *den = y_sum;
+        return 1;
+    }
+    *den = x_diff;
+    return 0;
+}
 
-        uint256_t x_sq = mul_mod(P.x, P.x);
-        uint256_t numerator = mul_mod(x_sq, three_mod); //改为加法的话，会产生负优化。
-        uint256_t lambda = mul_mod(numerator, mod_inv_p(y_sum));
-
-        uint256_t lambda_sq = mul_mod(lambda, lambda);
-        R.x = mod_sub(lambda_sq, mod_add(P.x, P.x, p));
-
-        uint256_t temp = mul_mod(lambda, mod_sub(P.x, R.x));
-        R.y = mod_sub(temp, P.y);
-    } else {
-        uint256_t y_diff = mod_sub(Q.y, P.y);
-        uint256_t lambda = mul_mod(y_diff, mod_inv_p(x_diff));
-
-        uint256_t lambda_sq = mul_mod(lambda, lambda);
-        R.x = mod_sub(lambda_sq, P.x);
-        R.x = mod_sub(R.x, Q.x);
-
-        uint256_t temp = mul_mod(lambda, mod_sub(P.x, R.x));
-        R.y = mod_sub(temp, P.y);
+// 用分母的逆 inv_den 把 P 推进到 P + Q。公式与 step_prepare 的判定严格配套。
+__host__ __device__ static void step_apply(AffinePoint& P, const uint256_t& inv_den, int mode, const AffinePoint& Q)
+{
+    if (mode == 3) {
+        if (P.infinity) P = Q; // P+∞ = P; Q=∞ 时 P 不变 (∞+Q=Q 亦覆盖)
+        return;
+    }
+    if (mode == 2) {
+        // 坐标清零, 避免残留值误触发 DP 判定
+        P.x = uint256_t{{0}};
+        P.y = uint256_t{{0}};
+        P.infinity = true;
+        return;
     }
 
+    // λ = num / den; mode 1 的 num = 3X², mode 0 的 num = Qy - Py
+    const uint256_t num = (mode == 1) ? mul_mod(mul_mod(P.x, P.x), three_mod)
+                                      : mod_sub(Q.y, P.y); // 改成加法会产生负优化
+    const uint256_t lambda = mul_mod(num, inv_den);
+    const uint256_t lambda_sq = mul_mod(lambda, lambda);
+
+    AffinePoint R;
+    R.x = (mode == 1) ? mod_sub(lambda_sq, mod_add(P.x, P.x, p))
+                      : mod_sub(mod_sub(lambda_sq, P.x), Q.x);
+    R.y = mod_sub(mul_mod(lambda, mod_sub(P.x, R.x)), P.y);
     R.infinity = false;
+    P = R;
+}
+
+// 给定任意 (P, Q) 走一步 (每步一次 mod_inv_p)。仅验证用, 生产路径走 fun_add_w<W>。
+__host__ __device__ static AffinePoint point_step(const AffinePoint& P, const AffinePoint& Q)
+{
+    AffinePoint R = P;
+    uint256_t den;
+    const int mode = step_prepare(R, Q, &den);
+    step_apply(R, mod_inv_p(den), mode, Q);
     return R;
 }
+
+// ========== 关于 "把 rho.cpp 的 rho_affine_FW 写法移植到 CUDA 侧" ==========
+//
+// 结论: 不能, 而且没有东西可移。rho_affine_FW 里只有两件事, 第一件**已经**
+// 移植了 (它就是 fun_add_w), 第二件在 CUDA 侧根本没有对应物。逐条给实测。
+//
+// (A) "W 个分母凑一批, 一次求逆" —— 已移植, 就是本文件的 fun_add_w<W>。
+//     数学结构与 rho_affine_FW<W> 完全同构: 前缀积 -> 一次 Montgomery 逆
+//     -> 回代。收益也已吃到, 生产核 W 扫描 (block=128, batches=20000) 总吞吐:
+//        W=1 : 256.7M pts/s   (每点一次 mod_inv_p)      基准
+//        W=2 : 404.3M  (+57%)
+//        W=4 : 560.8M  (+118%)   <- RHO_GPU_WALKERS
+//        W=8 : 746.9M  (+191%)
+//        W=16: 861.1M  (+235%)
+//        W=32: 902.4M  (+252%)   <- 已饱和 (W=64 为 902.7M, 只差 0.03%)
+//     注: W=1 那一档 (256.7M) 本身就因为这次点加合并降了寄存器 (见上面
+//     "合并后实测"), 合并前是 240.3M, 所以括号里的百分比偏保守。
+//     曲线形状 (1->2 最大跳变, 16 后平坦) 与 CPU 侧 rho_affine walkers 扫描
+//     (0.74M -> 1.30M -> 2.05M -> 2.96M -> 3.77M -> 4.12M) 同形, 说明这条
+//     优化在 GPU 上已经用尽。
+//
+// (B) "状态缓存在 thread_local RhoCache<W>, 只在 DP 命中 / 定期 flush 才写回"
+//     —— CUDA 侧没有对应物, 所以无从移植。rho_w<W> 的热循环里**一次都不碰**
+//     RhoStates_dev: W 个 walker 全程只活在寄存器 + 本地内存里, 直到 kernel
+//     退出才写回一次 (见 rho_w 尾部, 循环外):
+//         for (int k = 0; k < W; ++k) RhoStates_dev[idx * W + k] = s[k];
+//     量化: 生产核每线程一轮 2^20 点, W=4 时写回 4*144 = 576 B, 即
+//     576 / 2^20 = 5.5e-4 B/点; 而每点光读步进表就是 144 B。写回占访存量
+//     的 4e-6, 已经是噪声底 —— 把它优化到 0 也不可能量出来。
+//     那 CPU 的 RhoCache 到底在解决什么? 解决"状态装不进寄存器, 每步都得按
+//     RhoState 地址回内存读写 136 B"。GPU 这边装不下时溢出到本地内存
+//     (实测 localSizeBytes: W=4 -> 1104 B, W=8 -> 3024 B), 而本地内存由 L1
+//     承载、偏移是编译期常量、全 warp 地址一致 —— 也就是说 RhoCache 想要的
+//     效果 (状态常驻 L1、不回 L2/DRAM) 在 GPU 上是硬件默认行为, 不需要写代码。
+//     唯一还留在内存里的**每步**访问是那张 36 KB 步进表, 那属于 Q1 的范畴,
+//     已经单独量过 (见 [共享内存结论]: 换共享内存反而慢 3~5%)。
+//
+//     这条不是靠读源码推的, 是数 SASS 数出来的。cuobjdump -sass -fun
+//     '_Z5rho_wILi4EEvv' (即 rho_w<4>, sm_86, -maxrregcount=168) 之后定位到
+//     热循环 (后向分支 0x13220 -> 0x5c80, 跨 3418 条静态指令), 循环体内:
+//         IMAD  1459   IADD3 1145   ISETP 289   LOP3 122   SHF 1
+//            -> 整数 ALU 合计 3016 = 88.2%
+//         LDG     13   (这就是那 4 个 walker 各读一次 144B 步进表)
+//         ST/STG   0   (整个热循环一条全局写都没有)
+//         LDL     20   STL   19   (状态溢出到本地内存的读写)
+//         LDS/STS  0             (没有共享内存)
+//     即: 全局访存占热循环指令数的 14/3418 = 0.4%, 且读多写零。这是"算术 +
+//     ALU 依赖延迟bound"最直接的证据 —— 也正因为如此, 所有针对访存的优化
+//     (共享内存、RhoCache 式缓存) 在这里都没有着力点。
+//
+// (C) 那 GPU 每点到底慢在哪? 慢在域算术的实现形式, 不在访存结构。
+//     同一台机器、同一轮 perf、同样 W=4 批量求逆:
+//         perf_test_cpu()      : 8x32 肢 (本文件 uint256_t)      1.2539M pts/s
+//         rho-affine walkers=4 : 5x52 肢 (libsecp256k1 手写 asm) 2.0460M pts/s
+//     同一颗 CPU 上, libsecp256k1 的表示比本文件这份实现快 1.60~1.63 倍 —— 这
+//     1.6x 就是"表示形式"的价格, 与批量求逆的写法无关 (两边都是 W=4 批量)。
+//     (两轮实测: 1.2539M/2.0460M = 1.63x, 1.2559M/2.0101M = 1.60x。)
+//     换成单线程跨机器对比更明显:
+//         GPU 1 线程 W=4: 17234 cyc/pt   (1/102924 pts/s = 9.72 us, @1.77 GHz)
+//         CPU 1 线程 W=4: ~2100 cyc/pt   (1/2.0460M pts/s = 489 ns, @4.3 GHz)
+//     GPU 单线程每点周期数是 CPU 的 8.2 倍。结合 (B), 这 8.2x 里几乎没有
+//     访存成分, 主要是 8x32 肢 + 每步一次显式归约 (mul_mod) 的结构成本。
+//     所以要再快, 该做的是给 device 侧换一套归约更省的表示 (例如 5x52 或
+//     延迟归约的 8x32'), 而不是搬 rho_affine_FW 的外壳。
+//     注: GPU 最终仍比 CPU 快得多 (产线 637M pts/s vs CPU 单核 2.0M), 那
+//     152 倍完全来自 3.5 万线程的并行度, 与单点效率无关。
+// ==========================================================================
 
 // ================== Rho算法 ==================
 #include "common.h"
@@ -707,7 +1050,11 @@ __host__ __device__ void transfer(unsigned char* mp, const unsigned char* mp2)
         mp[i] = mp2[31 - i];
     }
 }
-class RhoPoint_dev
+// 设备端 walker 状态 / 步进表元素。
+// 布局: m(32) n(32) x.AffinePoint(80) = 144 字节, 16 字节对齐 —— 每个
+// uint256_t 成员都落在 16 的整数倍偏移上, 于是表项与本地内存里的 s[W]
+// 都能用 128 位访存 (9 条访存读一条表项, 而不是 33 条)。
+class alignas(16) RhoPoint_dev
 {
 public:
     uint256_t m = {0};
@@ -742,6 +1089,20 @@ public:
     }
 } ;
 
+// 布局不变量: 上面那些 "132 -> 144 字节" 的访存优化全靠这几条。若哪天有人
+// 往 uint256_t / AffinePoint 里加成员把对齐或大小破坏掉, 这里会直接编译失败,
+// 而不是悄悄退回标量访存(性能掉 5% 而没人发现)。
+// 注意: 本文件的字符串字面量只能用 ASCII, 中文会让 cudafe++ 报 missing closing quote。
+static_assert(alignof(uint256_t) >= 16, "uint256_t needs 16B alignment");
+static_assert(sizeof(uint256_t) == 32, "uint256_t should stay 8x32-bit");
+static_assert(offsetof(AffinePoint, x) % 16 == 0, "AffinePoint.x needs 16B alignment");
+static_assert(offsetof(AffinePoint, y) % 16 == 0, "AffinePoint.y needs 16B alignment");
+static_assert(offsetof(RhoPoint_dev, m) % 16 == 0, "RhoPoint_dev.m needs 16B alignment");
+static_assert(offsetof(RhoPoint_dev, n) % 16 == 0, "RhoPoint_dev.n needs 16B alignment");
+static_assert(offsetof(RhoPoint_dev, x) % 16 == 0, "RhoPoint_dev.x needs 16B alignment");
+static_assert(alignof(RhoPoint_dev) >= 16, "RhoPoint_dev alignment too small (scalar loads)");
+static_assert(sizeof(RhoPoint_dev) % 16 == 0, "array stride must be 16B or only [0] is aligned");
+
 // 设备全局内存存储 adds_pub_dev
 __device__ RhoPoint_dev adds_pub_dev[256];
 
@@ -749,11 +1110,223 @@ constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
 __constant__ RhoPoint_dev RhoStates_rand[dp_buffer_size];
 
 // GPU 多 walker: 每线程 walker 数。批量求逆每点多付 ~3 次模乘, 换掉
-// (1-1/W) 次 safegcd 模逆; 同时寄存器每 walker 涨 ~33 个, W 太大掉占用。
-// 具体取值由 perf_test_rho_gpu_walkers 实测后确定 (RTX 3070 Ti Laptop 实测:
-// W=1:156M W=2:267M W=4:420M W=8:563M W=16:670M W=32:705M points/s,
-// W=32 收益已饱和 (+5%) 而寄存器/显存占用翻倍, 当前运行取 8 作为稳妥折中)。
-constexpr int RHO_GPU_WALKERS = 8;
+// (1-1/W) 次 safegcd 模逆。
+//
+// ==== W 扫描 (RTX 3070 Ti Laptop, r168, 同一段内的干净 sweep, RHO_PERF_BATCHES=5000) ====
+// 基准核 perf_rho_w_kernel<W>, block=128, grid 由各 W 的真实驻留额度定。
+//   W   grid×block  threads   regs  local    warps/SM  总吞吐      每线程     每 walker   相对上档
+//   1   138x128      17664     140    144B     12     214.2M      12,127     12,127       —
+//   2   184x128      23552     112    512B     16     378.8M      16,083      8,042    +76.8%
+//   4   138x128      17664     168   1104B     12     520.4M      29,460      7,365    +37.4%
+//   5   138x128      17664     168   1632B     12     577.7M      32,706      6,541    +11.0%
+//   6   138x128      17664     168   2144B     12     625.5M      35,414      5,902     +8.3%
+//   7   138x128      17664     168   2528B     12     660.8M      37,409      5,344     +5.6%
+//   8   138x128      17664     168   3024B     12     689.8M      39,050      4,881     +4.4%
+//   16  138x128      17664     168   6928B     12     779.1M      44,107      2,757    +12.9%
+//   32  138x128      17664     168  13824B     12     803.5M      45,489      1,422     +3.1%
+//   64  138x128      17664     168  26224B     12     794.5M      44,977        703     -1.2%
+//   (W>=4 的 grid×block 恒定 17664 线程 = 552 warp, 即 12 warps/SM 一路不变 ——
+//    所以这一段里每档的收益**纯粹**来自批量求逆的摊薄, 没有驻留量的变化混在里面。)
+//
+// 三段的重复性 (同一二进制, 不同时间, 每段都是独立进程):
+//   W=8/16/32 = 692.1/780.7/804.3 (19:57)  694.5/779.4/802.6 (20:09)  689.8/779.1/803.5 (20:25)
+//   三次两两相差 <0.6%。W=1 工作量只有 W>=4 档的 1/4, 受升频/温度影响大
+//   (199.2 / 220.3 / 214.2M, 摆幅 -7%~+3%), 所以 W=1 行只作参考。
+//
+// ==== 基准 sweep 的边际账 (W>=4 段) ====
+// 总吞吐单调递增到 W=32 见顶 (803.5M), W=64 回落;
+// 每 walker 速度单调下降 (12,127 -> 703) —— 每一档"总吞吐的增量"都是拿
+// "单个 walker 变慢" 换的。两个维度一起看:
+//   +1 walker ->  总吞吐     每 walker     多占 states
+//   4 -> 5        +11.0%       -11.2%       +35,328  (+25.0%)
+//   5 -> 6         +8.3%        -9.8%       +35,328  (+20.0%)
+//   6 -> 7         +5.6%        -9.5%       +35,328  (+16.7%)
+//   7 -> 8         +4.4%        -8.7%       +35,328  (+14.3%)
+// 即往大 W 走: 总吞吐收益递减 (11.0 -> 4.4) 而单 walker 速度固定掉 ~9~11%。
+// 往小 W 走则是每一档都便宜地买到单 walker 速度:
+//   8 -> 7: 总吞吐 -4.2%   每 walker +9.5%   states -12.5%
+//   8 -> 6: 总吞吐 -9.3%   每 walker +20.9%  states -25.0%
+//   8 -> 5: 总吞吐 -16.3%  每 walker +34.0%  states -37.5%
+// 注意 4->5 还有 +11.0%, 说明 W=5~8 之间摊薄**尚未饱和**, 每一档都是真收益;
+//
+// ==== 生产核 rho_w<W> 的资源占用 (实测, RHO_PROD_ATTRS=1, block=128) ====
+// 生产核和基准核是两份独立编译产物, 资源画像完全不同, 选 W 必须看这张表:
+//   W   regs  local      maxThreads  occBlocks  grid×block  threads  states      warps/SM
+//   1   120     96B        512          4       184x128      23552     23552         16
+//   2    76    544B        768          6       276x128      35328     70656         24
+//   4    78    960B        768          6       276x128      35328    141312         24
+//   5    78   1168B        768          6       276x128      35328    176640         24
+//   6    78   1376B        768          6       276x128      35328    211968         24
+//   7    80   1584B        768          6       276x128      35328    247296         24
+//   8    80   1792B        768          6       276x128      35328    282624         24
+//   16   80   3472B        768          6       276x128      35328    565248         24
+//   32   78   6832B        768          6       276x128      35328   1130496         24
+// 两个关键事实:
+//   (1) 生产核 W>=2 的**驻留额度**都是 6 block/SM = 24 warps/SM, 满额 grid 276,
+//       满额 threads 35,328; 基准核是 168 regs / occ 3 / grid 138 / 12 warps/SM
+//       —— 差一倍。(生产实际只用 8 warps/SM = grid 92, 见 "warps/SM 定档"。)
+//       两边每点的算术量相同 (基准核也调 distinguishable), 绝对吞吐两边都已实测,
+//       同一 warps/SM 下只差 7~13% (见 "生产核 vs 基准核")。
+//   (2) W>=4 段两边**驻留额度**都**与 W 无关** (生产恒 24 warps, 基准恒 12 warps),
+//       所以 "换 W 能换到多少相对收益" 可以从基准表搬过来;
+//       只有 W<=2 那一档两边形状不同, 不能搬。
+// 寄存器恒 76~80 说明生产核不溢出; local 恰为 128B + 208B*W
+// (= 状态 144B + den 32B + prefix 32B 每 walker 一份), 也随 W 线性。
+// 这张表用 RHO_PROD_ATTRS=1 rhoperf 就能重打, 不必为每个 W 各编译一次。
+//
+// 成本随 states = threads*W 线性增长 (生产核实测 grid 276x128 = 35,328 线程, W>=2 恒定):
+//   W     states     设备态     文本态    补点(一次性)      落盘(每轮)
+//   2     70,656     10 MB     18 MiB    0 s (文件已够)       0.28 s
+//   4     141,312     20 MB     36 MiB    0 s (文件已够)       0.56 s
+//   5     176,640     25 MB     45 MiB    0 s (文件已够)       0.69 s
+//   6     211,968     31 MB     54 MiB    1.4 s (缺 23,552)    0.83 s
+//   7     247,296     36 MB     63 MiB    3.5 s (缺 58,880)    0.97 s
+//   8     282,624     41 MB     71 MiB    5.6 s (缺 94,208)    1.11 s
+//   16    565,248     81 MB    143 MiB     25.0 s              2.22 s
+//   32  1,130,496    163 MB    286 MiB     50.0 s              4.44 s
+//   (补点按生产实况 0.0595 ms/点; 落盘按 save_RhoStates_dev_fast 实测 3.93 us/条)
+// "文件已够" 指当前 D:\RhoState2.txt 有 188,416 条: W<=5 时 states 比它小,
+// 一个缺口都不用补 (启动零额外开销); W=8 要补 94,208 个 (5.6 s, GPU 全程空转)。
+// 这些开销都发生在 kernel 之外, 是选 W 时必须和吞吐增量一起称的代价。
+//
+// ==== OPT-7: 寄存器上限 (nvcc -maxrregcount), 已设 168 ====
+// 设在哪: build\src\bitcoin_node.vcxproj 的 Release|x64 <CudaCompile><MaxRegCount>。
+// 为什么要设: W>=4 时 nvcc 默认吃满 255 个寄存器, 每 SM 只能驻留
+//   warp/SM = 4*floor(16384/(align8(regs)*32))  =>  255 -> 8, 168 -> 12, 128 -> 16。
+// 关键认识: 本内核是 **latency-bound 不是吞吐-bound** —— r168 的 cycles/point 反而
+// 更高 (18.8k -> 25.7k), 但靠 +50% 驻留线程 (256 -> 384 threads/SM) 把墙钟赚回来。
+// 3 轮交错 A/B (RHO_PERF_BATCHES=5000, W=8/16/32/64, 每轮两二进制交替), points/s:
+//            W=16              W=32              W=64
+//   255r 775.3M (21,121) 831.6M (19,382) 858.7M (18,807)   <- 无 cap
+//   168r 870.6M (25,980) 898.9M (25,672) 893.1M (26,325)   <- 保留
+//        +12.3%           +8.1%            +4.0%
+// 注意 255r W=16/64 那两行的第 1 轮明显偏低 (冷启动/升频), 所以只取第 2/3 轮对比。
+// 结论: (a) 保留 168; (b) 12-warp 带是 regs in [136,168], 168 是带宽内 spill 最少的点,
+// 所以不需要试 144/152/160。
+//
+// ==== 生产核 rho_w<W> 的真实吞吐 (W=4, block=128, RHO_CONC_CURVE=1) ====
+// 之前从没测过生产核的吞吐 —— 这里用"预置 break_flag=true, 让内核跑完第一个
+// poll 段 (2^18 批 = 每线程 2^20 点) 就返回"的办法量出纯生产循环的稳态吞吐:
+//   k   grid  threads  warps/SM    总吞吐 pts/s     每线程 pts/s    s/一轮
+//   1     46    5,888      4        263,566,679       44,763       23.4
+//   2     92   11,776      8        414,780,612       35,222       29.8
+//   3    138   17,664     12        504,393,445       28,554       36.7
+//   4    184   23,552     16        554,997,499       23,564       44.5
+//   5    230   29,440     20        584,268,676       19,846       52.8
+//   6    276   35,328     24        591,945,207       16,755       62.6  <- 当前取值
+// 边际: 1->2 +57.4%, 2->3 +21.6%, 3->4 +10.0%, 4->5 +5.3%, 5->6 +1.3%
+// 结论: (a) grid=276 (6 block/SM, 24 warps/SM) 是**纯总吞吐**最优, 到顶了;
+//         但它每线程只有单线程参照的 18.9%, 被交换比判据否决 —— 生产改用
+//         8 warps/SM (grid=92), 见下面 "warps/SM 定档" 一节。
+//       (b) 5->6 只换 +1.3% 总吞吐, 却让每线程掉 15.6%、单轮时间涨 18.6% ——
+//           若外部把 -pl 压得很紧, k=5 是几乎等价但省电得多的一档。
+//
+// ==== 生产核 vs 基准核: 同 warps/SM 下逐线程吞吐接近 (run-17 复核) ====
+//   warps/SM   基准核 perf_rho_w_kernel   生产核 rho_w
+//        4            42,762 pts/s            48,151 pts/s   (+12.6%)
+//       12            28,320 pts/s            30,385 pts/s   (+7.3%)
+// 两者是两份独立编译 (78 regs / 6 block/SM  vs  168 regs / 3 block/SM)。
+// 差的这 7~13% 是**运行长度**造成的, 不是几何: 基准 sweep 固定 batches=20,000
+// (W=4 -> 80,000 点/线程, 约 2.3 s), [prod] 固定 points/thread=1,048,576
+// (W=4 -> 8,388,608 点/线程, 约 28 s), 短的那次把启动/尾部开销摊得更重。
+// 同 warps/SM 的**相对排名**两者一致, 所以基准 sweep 的 W 排名可以外推;
+// 但绝对数值必须连运行长度一起读。唯一的结构差别: 基准核顶到 12 warps/SM,
+// 生产核顶到 24 warps/SM —— 不过 run-17 之后生产只用 8, 见下一节。
+//
+// ==== 单线程参照值 与 并发度 (回答"grid/block 该选多大") ====
+//   perf_test_gpu (1 block x 1 thread, W=4) = 91,768 pts/s = 17,867 cycles/point
+//   并发后每线程 (生产核 rho_w, 即下面表格里的 [prod] 行):
+//       4 warps/SM   48,151 pts/s (51.5% of 单线程参照)   21.7 s/round
+//       8 warps/SM   37,499 pts/s (40.1%)                 27.9 s/round
+//      12 warps/SM   30,385 pts/s (32.5%)                 34.7 s/round
+// 每点周期从 17,867 涨到 4.6e4 (2.6x) **不是**算法变慢, 也**不是**降频:
+// 用 pts/s * cyc/pt 反解时钟, 三档都是 1.64~1.65 GHz。原因是单线程时整条
+// 依赖链只占 1 个 warp (IPC≈0.08, 发射槽大量空转), 12 warps 时许多 warp 抢同一批
+// 执行单元, 每线程被拉长, 但总吞吐从 93k 涨到 536.7M (x5740)。
+// 所以 "并发时每线程低于单线程参照" 是**必然**的。判据必须同时看两个量 ——
+// 取 max(总吞吐 x 每线程速度) 的驻点, 等价于下面这个**无量纲**判据:
+//       交换比 = log(总吞吐倍率) / log(1 / 每线程倍率)
+//   交换比 > 1 : 加并发这一档"值" —— 每线程掉 1 倍, 总吞吐赚回超过 1 倍;
+//   交换比 < 1 : 净亏, 已过拐点。不需要给两个量人为配权重。
+//
+// ================== warps/SM 定档: 8 (run-17 实测) ==================
+// 口径: [prod] W=4, block=128, SM=46, points/thread=1,048,576,
+//       reps=2 交错重复 (压机器态漂移), 取两轮均值。
+//   档  warps/SM  grid   总吞吐       每线程     % of 1x1   总x每线程       交换比
+//   k=0    1        1       93,497     93,497     100.0%       --            --
+//   k=1    4       46  283,511,977     48,151      51.5%   1.365e13       12.08  值得
+//   k=2    8       92  441,592,933     37,499      40.1%   1.656e13 (峰)   1.77  值得  <- 生产档
+//   k=3   12      138  536,714,835     30,385      32.5%   1.631e13 (-1.5%) 0.93  拐点
+//   k=4   16      184  595,313,051     25,277      27.0%   1.505e13 (-9.1%) 0.56
+//   k=5   20      230  615,989,545     20,924      22.4%   1.289e13 (-22%)  0.18
+//   k=6   24      276  624,284,137     17,671      18.9%   1.103e13 (-33%)  0.08
+//   拐点落在 8->12 之间 (交换比 1.77 -> 0.93 穿过 1.0), 乘积峰值在 **8 warps/SM**。
+//   k=6 (24 warps/SM, grid=276) 正是改动前 grid_to_fill_sm 填满驻留额度的行为:
+//   改成 8 的代价是总吞吐 -29.3%, 换来每线程 +112%、单轮 59.7 s -> 27.9 s。
+//   spread: k=1..6 都 <= 1.2% (可复现); 唯 k=0 单线程档 spread 16.8% —— 单线程没有
+//   并发把调度抖动平均掉, 这一档只能读量级, 但 k=1..6 的比值已经稳定。
+//
+// 【这条拐点与 W 无关】run-17 用基准核在 grid=92 (8 warps/SM) vs grid=138 (12 warps/SM)
+//   上把同一个 8->12 步骤复测了一遍 (同进程交错, 每档 2 轮):
+//       W=4   交换比 0.93     W=8   0.97     W=16  0.60     W=32  0.37
+//   即在 W=4/8 上这一步恰好压线、在 W=16/32 上明确为亏 => 定 8 对所有 W 都安全。
+//
+// 实现: warps_per_sm_cap() 读 RHO_WARPS_PER_SM (默认 8; 0 = 不夹 = 改动前行为),
+//       cap_grid_by_warps() 按每 SM warp 数上限夹 grid (粒度整块, 打印实际值)。
+//       生产核 rho_play() 走这条; 基准 sweep 故意**不夹**, 它要的就是全档原始数据。
+//
+// ==== 逐点成本分解: mod_inv_p 是最大单项 ====
+//   micro (block=128, cycles/op, 依赖链口径):
+//        mul_mod        509.8 (4 warps/SM)    750.5 (16 warps/SM)
+//        mod_inv_p   39,255.9                69,205.5
+//        mod_sub        142.5                  174.0
+//        mod_add        147.5                  187.3
+//   W=4 每点 5.25 次 mul_mod + 0.25 次 mod_inv (前缀 3 次/批 + 回代 6 次/批 + 每点 3 次):
+//        5.25*509.8 + 0.25*39255.9 = 2,678 + 9,814 = 12,492 cyc
+//   模逆一项占 79%; 单线程实测 18,048 cyc/pt, 同量级 (差在点加自身的状态依赖链)。
+//   => 降逐点成本的现实杠杆就是 **加大 W** (每点摊到的模逆 = 1/W), 这正是
+//      W 扫描曲线的成因。run-18 实测 (grid=92 = 8 warps/SM, 11,776 线程):
+//        W        1        2        4        8       16       32
+//        总吞吐  164.7M   262.2M   399.7M   539.1M   665.7M   745.7M  pts/s
+//        cyc/pt 114,854  67,068   41,732   29,433   23,229   20,622
+//        单walker 13,989  11,134    8,485    5,722    3,533    1,979  pts/s
+//      (每 walker 速度 = 总吞吐 / (线程数 x W); grid=138 的同口径曲线形状相同)
+//   => 另一个一度以为可能的杠杆是缩短 mul_mod: 已否决。reduce_product 顶上那段
+//      "2024 A/B 记录"里的 OPT-9 就是干这个的, 实测更慢 (mul_mod(x,x) 735.9->908.0)。
+//      mul_mod 本身 (8x8 学校乘法 + 4 趟折叠) 已经是该路径上实测最优的写法。
+//
+// ==== W 轴: 拐点在 W=4, 生产取值 = 4 (两条判据一致) ====
+// 用上面同一条判据扫 W 轴。这里"单点速度"必须是**单 walker** 速度
+// (总吞吐 / (线程数 x W)); 不能用"每线程速度" —— 在固定 grid 下
+// 每线程速度 = 总吞吐 / 线程数, 与总吞吐恒同向, 交换比会退化成恒等于 1, 判据失效。
+// run-18 实测 (grid=92, RHO_PERF_BATCHES=150000, 同进程交错 2 轮取均值):
+//   step      总吞吐倍率   单walker倍率   交换比   结论
+//   1 -> 2       1.592        0.796        2.04   值得
+//   2 -> 4       1.524        0.762        1.55   值得
+//   4 -> 8       1.349        0.674        0.76   净亏      <- 拐点
+//   8 -> 16      1.234        0.617        0.44   净亏
+//   16 -> 32     1.120        0.560        0.20   净亏
+// 口径: batches=150000 把各档墙钟从 10.7 s (W=1) 拉到 80 s (W=32), 启动/升频
+//   开销摊平, 所以这张表**不含运行长度混淆**。与 batches=20000 的短程表逐档
+//   只差 <= 1.4% (W=4 404.8M -> 399.7M, W=8 547.2M -> 539.1M), 即低 W 档
+//   "短程偏乐观"在本机上很小; 4->8 在两套口径下都是净亏 (0.77 / 0.76),
+//   **拐点在 W=4 是稳的**。
+// ⚠ run-17 曾把 4->8 记成 1.27 / 拐点在 8, 源头是当时 W=8 读到 601.6M 这个
+//   复现不出来的高值; 反复复测 W=8 只在 539~558M (差 ~9%), 该记录已作废。
+// ⚠ W=16/32 档两轮间漂移 5% / 11% (机器升频); 16->32 离 1 很远, 不受影响。
+// 即: **W 轴的最优点与 warps/SM 轴的最优点重合在生产配置上
+//   (W=4 + cap 8 warps/SM), 不需要为 W 单独记账。**
+// W=4 保留的另外两个理由:
+//   W        states     设备态   文本态   启动补点(一次性)    每轮落盘
+//   4       141,312     20 MB    36 MiB   **0 s** (文件已够)        0.56 s
+//   8       282,624     41 MB    71 MiB    5.6 s (缺 94,208 点)     1.11 s
+//   32    1,130,496    163 MB   286 MiB   50.0 s (缺 942,080 点)    4.44 s
+// D:\RhoState2.txt 现有 188,416 条 => 只有 W<=5 能做到**第一轮零补点**。
+// 相对 W=8: 总吞吐 -25.9%, 单 walker +48.3%, states -50%, 补点 5.6 s -> 0 s。
+// 相对 W=32: 总吞吐 53.6%, 单 walker 4.29x, states 1/8, 补点 50.0 s -> 0 s。
+// 注意: W=1 之所以不能选, 除了吞吐低, 还因为 W=1 每点都要做一次 safegcd 模逆
+// (批量求逆只摊掉 (1-1/W)); W=1->2 的 +59.2% 就是这段收益最陡的地方。
+constexpr int RHO_GPU_WALKERS = 4;
 
 // 可区分点 (DP) 判断 (设备端): x 的低 40 位 (bit 0..39) 全 0 即为 DP,
 // 返回其后连续 64 位 (bit 40..103) 作为索引; 否则返回 0。
@@ -772,13 +1345,6 @@ __host__ __device__ uint64_t distinguishable(const uint256_t& x)
     return 0;
 }
 
-__host__ __device__ void fun_add(RhoPoint_dev& s, const RhoPoint_dev& a)
-{
-    s.x = point_add(s.x, a.x);
-    s.m = mod_add(s.m, a.m, N);
-    s.n = mod_add(s.n, a.n, N);
-}
-
 // ================== 同线程多 walker 批量求逆 ==================
 //
 // 动机与 CPU 版 (rho.cpp 的 rho_affine_FW) 相同: 仿射点加每步一次域模逆,
@@ -790,43 +1356,22 @@ __host__ __device__ void fun_add(RhoPoint_dev& s, const RhoPoint_dev& a)
 //    5x52 版本便宜; 而模乘 (mul_mod) 是 schoolbook 64 次 IMAD + 4 次折叠,
 //    相对更贵。批量每点多付 ~3 次模乘, 换掉 (1 - 1/W) 次模逆, 划不划算
 //    只有实测能回答 (perf_test_rho_gpu_walkers)。
-// 2. 寄存器压力: 每多一个 walker 多 ~33 个寄存器 (132 字节状态)。96~128
-//    寄存器区间不影响占用率, W 大了会掉 warp。
+// 2. 寄存器压力: 生产核里 s[W]/den[W]/prefix[W] 全落 local memory, 所以 W 到 32
+//    也只吃 76~80 个寄存器, 不在寄存器上受限 (实测见上面 RHO_PROD_ATTRS 表)。
+//    真正随 W 线性增长的是 local 用量 (= 128B + 208B*W) 和 states 数。
 // 3. 表读取: 发散索引下设备全局表是唯一实现路径，避免常量内存串行化。
 
+// 注: fun_add_w **必须 host 也能跑**。perf_test_cpu / perf_test_gpu_kernel 两个
+// 基准的唯一价值就是"在同一算法上比 CPU 与 GPU"、以及"给出该算法的 GPU
+// 单线程参照值"; 如果它们走别的点加实现, 两边比的就是两套不同算法, 数字没有
+// 可比性。所以表一律通过参数传入 (adds), 不在函数体里直接引用 adds_pub_dev。
+
 // 用分母逆元 inv_den 推进一个 walker 一步 (标量 m/n 同步累加)。
-// mode: 0 = 一般加法 (den = Qx-Px); 1 = 倍点 (den = Py+Qy, x 相同);
-//       2 = P = -Q, 结果为无穷远; 3 = 任一方为无穷远, 结果取另一方。
-__device__ static void step_walker(RhoPoint_dev& s, const uint256_t& inv_den, int mode, const RhoPoint_dev* a)
+// 分支判定已在前向循环里由 step_prepare 完成, 这里只套模式应用公式; 这里
+// 不再有任何分支分类, 也就不会再和别的实现各持一份公式。
+__host__ __device__ static void step_walker(RhoPoint_dev& s, const uint256_t& inv_den, int mode, const RhoPoint_dev* a)
 {
-    if (mode == 3) {
-        if (s.x.infinity) s.x = a->x; // P+∞=P; Q=∞ 时 P 不变 (∞+Q=Q 亦覆盖)
-        s.m = mod_add(s.m, a->m, N);
-        s.n = mod_add(s.n, a->n, N);
-        return;
-    }
-    if (mode == 2) {
-        // 与 point_add 的无穷远返回一致: 坐标清零, 避免残留值误触发 DP 判定
-        s.x.x = uint256_t{{0}};
-        s.x.y = uint256_t{{0}};
-        s.x.infinity = true;
-        s.m = mod_add(s.m, a->m, N);
-        s.n = mod_add(s.n, a->n, N);
-        return;
-    }
-    const AffinePoint& P = s.x;
-    const AffinePoint& Q = a->x;
-    uint256_t num = (mode == 1) ? mul_mod(mul_mod(P.x, P.x), three_mod) : mod_sub(Q.y, P.y);
-    uint256_t lambda = mul_mod(num, inv_den);
-
-    uint256_t lambda_sq = mul_mod(lambda, lambda);
-    AffinePoint R;
-    R.x = (mode == 1) ? mod_sub(lambda_sq, mod_add(P.x, P.x, p))
-                      : mod_sub(mod_sub(lambda_sq, P.x), Q.x);
-    R.y = mod_sub(mul_mod(lambda, mod_sub(P.x, R.x)), P.y);
-    R.infinity = false;
-    s.x = R;
-
+    step_apply(s.x, inv_den, mode, a->x);
     s.m = mod_add(s.m, a->m, N);
     s.n = mod_add(s.n, a->n, N);
 }
@@ -835,34 +1380,26 @@ __device__ static void step_walker(RhoPoint_dev& s, const uint256_t& inv_den, in
 // 分母构造上恒非零: 被跳过的 walker (无穷远 / P=-Q) 用 1 凑前缀积,
 // 倍点分母 Py+Qy != 0, 一般加法分母 Qx-Px != 0, 故无需兜底路径。
 template <int W>
-__device__ void fun_add_w(RhoPoint_dev* s)
+__host__ __device__ void fun_add_w(RhoPoint_dev* s, const RhoPoint_dev* adds)
 {
     // den[k]: 该 walker 本步的分母; prefix[k] = d[0]*...*d[k]
     uint256_t den[W], prefix[W];
-    const RhoPoint_dev* a[W];
-    int mode[W];
+    // 每个 walker 的"这一步用哪个表项 / 走哪个分支"打包进一个 unsigned short:
+    //   bit 0..7  = adds_pub_dev 下标, bit 8..9 = mode (0..3)
+    // 原来是 `const RhoPoint_dev* a[W]` + `int mode[W]`, 两个数组合计 12*W 字节
+    // 局部内存, 而且让 W 个 64 位指针在整个批量求逆期间保持活跃 —— 全展开时
+    // 直接把这些指针挤进栈帧。打包成一个 2 字节的标量后, 指针只在用到的
+    // 那一次迭代里临时生成, 不再跨越模逆存活。
+    // 实测 (W=8/16/32 交错 A/B): +0.8% / +1.4% / +3.7%; W=32 的 localSizeBytes
+    // 13648 -> 13328 B。
+    unsigned short code[W];
+    // 不写 pragma: 实测部分展开是净损失 (见上), 全展开最优。
     for (int k = 0; k < W; ++k) {
         const AffinePoint& P = s[k].x;
-        a[k] = &adds_pub_dev[(unsigned char)P.x.limb[0]];
-        const AffinePoint& Q = a[k]->x;
-        den[k] = uint256_t{{1}};
-        if (P.infinity || Q.infinity) {
-            mode[k] = 3;
-        } else {
-            uint256_t x_diff = mod_sub(Q.x, P.x);
-            if (is_zero(x_diff)) {
-                uint256_t y_sum = mod_add(P.y, Q.y, p);
-                if (is_zero(y_sum)) {
-                    mode[k] = 2; // P = -Q, 结果无穷远
-                } else {
-                    mode[k] = 1; // 倍点, 分母 = Py+Qy = 2*Py
-                    den[k] = y_sum;
-                }
-            } else {
-                mode[k] = 0;
-                den[k] = x_diff;
-            }
-        }
+        const unsigned int idx = (unsigned char)P.x.limb[0];
+        code[k] = (unsigned short)idx;
+        const AffinePoint& Q = adds[idx].x;
+        code[k] |= (unsigned short)(step_prepare(P, Q, &den[k]) << 8);
         if (k == 0) prefix[0] = den[0];
         else prefix[k] = mul_mod(prefix[k - 1], den[k]);
     }
@@ -875,7 +1412,7 @@ __device__ void fun_add_w(RhoPoint_dev* s)
     //   处理完 k 后 u = u * d[k] = 1/prefix[k-1]
     for (int k = W - 1; k >= 0; --k) {
         uint256_t inv_den = (k > 0) ? mul_mod(u, prefix[k - 1]) : u;
-        step_walker(s[k], inv_den, mode[k], a[k]);
+        step_walker(s[k], inv_den, code[k] >> 8, &adds[(unsigned char)(code[k] & 0xFF)]);
         if (k > 0) u = mul_mod(u, den[k]);
     }
 }
@@ -1096,52 +1633,15 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
 }
 
 
-__global__ void rho()
-{
-    // 获取全局线程索引
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    RhoPoint_dev s = RhoStates_dev[idx];
-    uint64_t count_rho = 0;
-    uint32_t count_dp = 0;
-    /*
-    // 设备共享内存存储 adds_pub
-    __shared__ RhoPoint_dev adds_pub[256];
-    // 共享内存产生的优化微乎其微， 2% 左右，但会多占用10个寄存器。
-    // 从全局内存复制adds_pub到共享内存
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < 256; i++)
-            adds_pub[i] = adds_pub_dev[i];
-    }
-    __syncthreads(); // 确保所有线程已完成加载
-    */
-    while (true) {
-        // s.x.x 就是最终坐标, 取低字节做索引无需任何域转换
-        fun_add(s, adds_pub_dev[(unsigned char)s.x.x.limb[0]]);
-        count_rho++;
-        // 检查是否可区分
-        uint64_t d = distinguishable(s.x.x);
-        if (d != 0) {
-            count_dp++;
-            // 保存可区分点
-            add_dp_to_buffer(d, s, dp_device_buffer, dp_buffer_size - 10);
-        }
-        // 周期性返回, 与 rho_w<W> 对齐:
-        //   每 2^18 点 poll 一次外部 break_flag;
-        //   第 2^26 点无条件返回。
-        // 这里 W=1, count_rho 就是点数, 与 rho_w 的批数掩码数值不同但含义一致:
-        // rho_w 掩码 2^23 批 × W=8 = 2^26 点/线程。换算关系: 
-        //   **rho() 掩码 = rho_w 掩码 × W**, 两边一起改才能保持每线程点数的节奏。
-        // 2^26 点/线程与 CPU 侧 play() 的保存周期 (2^31 点 ≈ 30 分钟) 时长相当。
-        if ((count_rho & 0x3FFFF) == 0) {
-            if (*break_flag_dev || (count_rho & 0x3FFFFFF) == 0)
-                break;
-        }
-    }
-    RhoStates_dev[idx] = s;
-    if (idx == 0) {
-        printf("count_rho:%llu count_dp:%d \n", count_rho, count_dp);
-    }
-}
+// (原单 walker 内核 rho() 已删除: 生产路径只用 rho_w<W>, 它没有任何调用点,
+//  循环体里又只有一份已废弃的第二套点加实现, 属于只会在同步时出错、不会
+//  被任何测试覆盖的死代码。基准里的 W=1 基线改由 fun_add_w<1> 承担, 这样
+//  基线与生产核走的是同一份代码。
+//
+//  它体内那段被注掉的共享内存实验一并记在这里, 是 Q1 "生产代码要不要用共享
+//  内存"的历史依据之一: 当时实测"共享内存优化微乎其微, 2% 左右, 但会多占
+//  10 个寄存器"。现在的实测结论更强 —— 见 perf_test_gpu_kernel 上方的
+//  [共享内存结论] 注释。)
 
 // ================== 多 walker 内核 ==================
 //
@@ -1159,7 +1659,7 @@ __global__ void rho_w()
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
     while (true) {
-        fun_add_w<W>(s);
+        fun_add_w<W>(s, adds_pub_dev);
         count_rho ++;
 #pragma unroll
         for (int k = 0; k < W; ++k) {
@@ -1171,15 +1671,17 @@ __global__ void rho_w()
         }
         // 周期性返回, 让 rho_play 能定期落盘 (意外关机最多丢这一段):
         //   每 2^18 批 poll 一次外部 break_flag;
-        //   第 2^23 批无条件返回 (W=8 时 = 2^26 点/线程)。
-        // 时长对齐: 2^26 点/线程 与 CPU 侧 play() 的保存周期 (2^31 点 ≈ 30 分钟)
-        //           量级相当, 两边落盘间隔不再差一个数量级。
-        // 注意: 内层判断被外层 (count_rho & 0x3FFFF) == 0 短路, 所以 2^23 必须
-        //       是 2^18 的整数倍 (当前成立), 否则这一支永远不会被求值。
+        //   第 2^24 批无条件返回 (W=4 时 = 2^26 = 67,108,864 点/线程)。
+        // 时长对齐: 时间目标取 CPU 侧 play() 同一件事的周期 —— 0 号线程 (W0=2)
+        //   在 count_try = 2^30 批 (= 2^31 点) 时 pause 落盘 (blockchain.cpp),
+        //   按其 ~1.29M pts/s 约 30 分钟。GPU 侧 2^24 批 x 4 = 2^26 点/线程,
+        //   生产几何 (grid 92 = 8 warps/SM) 实测 37,499 pts/s => 1789 s = 29.8 分钟,
+        //   两边落盘间隔对齐到同一档 (改成 2^23 批时只有 14.9 分钟, 差一倍)。
+        // 注意: 内层判断被外层 (count_rho & 0x3FFFF) == 0 短路, 所以 2^24 必须
+        //       是 2^18 的整数倍 (2^24 = 64 x 2^18, 成立), 否则这一支永远不会被求值。
         // 注意: count_rho 是批数, 而 printf 打的是点数, 两套单位不要混。
-        // 注意: 改这里时 rho() 的掩码要跟着改, rho() 掩码 = 本掩码 × W。
         if ((count_rho & 0x3FFFF) == 0) {
-            if (*break_flag_dev || (count_rho & 0x7FFFFF) == 0) break;
+            if (*break_flag_dev || (count_rho & 0xFFFFFF) == 0) break;
         }
     }
 #pragma unroll
@@ -1202,7 +1704,7 @@ __global__ void perf_rho_w_kernel(int batches, unsigned long long* cycles_out, u
     unsigned int dp = 0;
     long long t0 = clock64();
     for (int i = 0; i < batches; ++i) {
-        fun_add_w<W>(s);
+        fun_add_w<W>(s, adds_pub_dev);
 #pragma unroll
         for (int k = 0; k < W; ++k) {
             if (distinguishable(s[k].x.x) != 0) dp++;
@@ -1228,12 +1730,151 @@ void get_optimal_block_size(int& grid_size, int& block_size)
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
 
     // 每 SM 驻留的线程数：调小单线程更快，调大吞吐更高，256 (8 warp) 是折中起点
-    const int threadsPerSM = 256;
+    // 允许用 RHO_THREADS_PER_SM 覆盖, 这样几何 A/B 不必重新编译。
+    int threadsPerSM = 128;
+    if (const char* env = std::getenv("RHO_THREADS_PER_SM")) {
+        int v = std::atoi(env);
+        if (v >= 32 && v <= 1024) threadsPerSM = v;
+    }
+    // grid 默认只发 multiProcessorCount 个 block, 也就是每 SM 一个。块内线程
+    // 少于驻留上限时, SM 上的 warp 数 = block/32, 剩下的发射槽位全空转 ——
+    // 实测 block=128 只有 4 warp/SM, 而寄存器允许 16 warp/SM。
+    // RHO_GRID_MULT 用来把 grid 放大到 k 倍 SM 数, 让多出来的 block 填满驻留额度。
+    int gridMult = 1;
+    if (const char* env = std::getenv("RHO_GRID_MULT")) {
+        int v = std::atoi(env);
+        if (v >= 1 && v <= 64) gridMult = v;
+    }
     block_size = std::min(threadsPerSM, (int)prop.maxThreadsPerBlock);
-    grid_size = prop.multiProcessorCount;
+    grid_size = prop.multiProcessorCount * gridMult;   // 旧口径, 生产已不用 (见下)
 
-    std::cout << get_time() << " : GPU " << prop.name << " grid " << grid_size
-              << " x block " << block_size << std::endl;
+    // 这里**不再打印 grid**: 上面的 SM x gridMult 只是旧口径, 生产实际发射的 grid
+    // 由 rho_play() 决定 —— 先 grid_to_fill_sm() 取生产核 rho_w<W> 的真实驻留额度,
+    // 再用 warps_per_sm_cap() 夹到每 SM warp 上限。rho_w<4> 在默认档 (8 warps/SM)
+    // 是 grid=92 而不是 46, 打印旧值会与生产几何自相矛盾 (由 rho_play 打印真值)。
+    // 因此 (*out) grid_size 与 RHO_GRID_MULT 对生产发射**已无影响**, 调用方只应
+    // 使用 block_size; 每次运行的真实几何在 rho_play() 的日志行里。
+    std::cout << get_time() << " : GPU " << prop.name << " block " << block_size
+              << std::endl;
+}
+
+// 按内核的真实驻留额度算 grid。
+//
+// 原先 grid = multiProcessorCount, 即每 SM 只发一个 block。这是致命的: 每 SM 上
+// 的 warp 数就等于 block/32, 与寄存器允许的驻留量无关。block=128 时每 SM 只有
+// 4 个 warp (每个发射槽 1 个), 任何一次长延迟都直接浪费一个发射槽。
+// 实测 (RTX 3070 Ti Laptop, 46 SM, W=32):
+//     46x128 = 522M points/s   ->  92x128 = 719M points/s   (+38%)
+//   W=1 更夸张: 46x128 = 89M   ->  184x128 = 234M            (+163%)
+// 所以 grid 必须由 cudaOccupancyMaxActiveBlocksPerMultiprocessor 决定。
+//
+// block_size 会先被夹到内核自身的 maxThreadsPerBlock (W>=8 时 ptxas 因 255
+// 寄存器上限把它压到 256), 否则 occupancy 查询会返回 cudaErrorInvalidValue。
+template <typename K>
+static int grid_to_fill_sm(K kernel, int& block_size)
+{
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    cudaFuncAttributes attr;
+    CHECK_CUDA(cudaFuncGetAttributes(&attr, (const void*)kernel));
+    if (block_size > attr.maxThreadsPerBlock) block_size = attr.maxThreadsPerBlock;
+    int occ = 0;
+    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, (const void*)kernel, block_size, 0));
+    if (occ < 1) occ = 1;
+    return prop.multiProcessorCount * occ;
+}
+
+// 生产几何: 每 SM 驻留多少 warp —— 把 "单线程速度" 与 "总吞吐" 的交换写成显式判据。
+//
+// 判据来自 perf_prod_rho_w_throughput 的 [prod] step 表 (同一个 rho_w<4>、同一段
+// poll 掩码, 只改 grid):
+//     交换比 = log(总吞吐(k)/总吞吐(k-1)) / log(每线程(k-1)/每线程(k))
+// 交换比 >= 1: 加这一档 warp 买回的总吞吐 >= 它吃掉的单线程速度 -> 值得;
+// 交换比 <  1: 净亏, 拐点在这里。它等价于最大化 "总吞吐 x 每线程速度"
+// (两量等权, 且对两者的量纲/绝对量级都不敏感 —— 不需要人为给权重)。
+//
+// 实测 W=4 / block=128 / SM=46 (RTX 3070 Ti Laptop, perf_wbal.log, 2 遍交错取均值,
+// k=0 = 1 块 x 1 线程 = 本进程内的单线程参照 93,459 pts/s, 单档 spread <= 1.9%):
+//     warps/SM   grid    总吞吐     每线程吞吐   占 1x1   总吞吐x每线程   交换比
+//        1        1      93,459     93,459     100%         -            -
+//        4       46    274.4M      46,598      49.9%      1.278e13        -
+//        8       92    436.0M      37,025      39.6%      1.614e13      2.01  值得
+//       12      138    532.3M      30,136      32.2%      1.604e13      0.97  拐点
+//       16      184    593.6M      25,202      27.0%      1.496e13      0.61  亏
+//       20      230    610.9M      20,752      22.2%      1.268e13      0.15  亏
+//       24      276    619.8M      17,545      18.8%      1.088e13      0.09  亏
+// 峰很平 (8 与 12 差 0.6%), 两侧都明显下坡, 所以取 8: 拿到峰值乘积, 且每线程
+// 速度是填满驻留额度时的 2.11x (37,025 / 17,545)。
+//
+// 注: 24 warps/SM (= occ*block/32) 就是本次改动之前的几何 —— grid_to_fill_sm 取满
+// 驻留额度。改成 8 的代价是总吞吐 -29.7% (619.8M -> 436.0M), 换来每线程 +111%;
+// 单轮内核段 59.6 s -> 28.1 s。DP 产出与总吞吐同比例 (每步命中概率相同), 所以
+// "总吞吐" 就是搜索速度。若只看搜索速度, RHO_WARPS_PER_SM=0 取回旧行为。
+//
+// 注意 k=1 (4 warp/SM) 是"还能让整块 GPU 干活"的下界 —— k=0 只有一个 block,
+// 46 个 SM 只用了 1 个, 不能作为生产档位, 只能作为单线程参照。所以 4 warp/SM
+// 就是生产可用的最高单线程速度, 上表的百分比以它为 100%。
+//
+// RHO_WARPS_PER_SM: 不设 = 8 (上表拐点); 0 = 不夹 (填满驻留额度, 纯吞吐优先,
+// 即本次改动之前的行为); 其它正整数 = 指定每 SM warp 上限。
+static int warps_per_sm_cap()
+{
+    const char* env = std::getenv("RHO_WARPS_PER_SM");
+    if (env == nullptr) return 8;
+    int v = std::atoi(env);
+    if (v <= 0) return 0;       // 不夹
+    if (v > 1024) v = 1024;
+    return v;
+}
+
+// 按每 SM warp 上限夹 grid。cap <= 0 表示不夹。
+// 每 SM 实际 warps = ceil(cap / (block/32)) * (block/32), 即可能略微超过 cap,
+// 因为 grid 的粒度是整块。打印出来的 warps/SM 是实际值而不是 cap。
+static int cap_grid_by_warps(int grid, int block_size, int cap, int sm)
+{
+    if (cap <= 0) return grid;
+    const int wpb = std::max(1, block_size / 32);       // 每块提供的 warp 数
+    const int blocks = std::max(1, (cap + wpb - 1) / wpb);
+    const int g = sm * blocks;
+    return std::min(grid, g);
+}
+
+// 一次性把生产核 rho_w<W> 在所有候选 W 下的真实资源占用/grid 打出来。
+// 为什么要这么干: 生产核和基准核 perf_rho_w_kernel<W> 是两份独立编译产物,
+// 寄存器数差一倍 (78~80 vs 168), 驻留线程数也差一倍 (24 vs 12 warps/SM),
+// 所以必须先看到生产核自己的 grid/驻留额度, 不能照抄基准 sweep 的几何。
+// 注: "排名不能外推" 这个更早的说法**被实测否掉了** —— RHO_CONC_CURVE 在
+// 同 warps/SM 下对拍 (4 warps: 44,763 vs 45,068; 12 warps: 28,554 vs 29,590),
+// 每线程吞吐差 <3.5%, 所以 W 排名是可以从基准 sweep 外推到生产核的。
+// 这个函数只做属性查询 + 打印, 不发射任何内核; 用 RHO_PROD_ATTRS=1 触发。
+static void print_prod_kernel_attrs()
+{
+    const int block = 128;
+#define RHO_PROD_ATTR_ROW(WV)                                                          \
+    do {                                                                               \
+        cudaFuncAttributes a;                                                          \
+        CHECK_CUDA(cudaFuncGetAttributes(&a, rho_w<WV>));                              \
+        int occ = 0;                                                                   \
+        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, rho_w<WV>, block, 0)); \
+        int b = block;                                                                 \
+        const int grid = grid_to_fill_sm(rho_w<WV>, b);                                \
+        printf("  [prod] W=%-3d regs=%-4d local=%-6zuB maxThreads=%-4d occBlocks=%d "   \
+               "grid=%d block=%d threads=%d states=%d -> %d warps/SM\n",               \
+               WV, a.numRegs, a.localSizeBytes, a.maxThreadsPerBlock, occ, grid, b,    \
+               grid * b, grid * b * WV, occ * b / 32);                                 \
+    } while (0)
+
+    RHO_PROD_ATTR_ROW(1);
+    RHO_PROD_ATTR_ROW(2);
+    RHO_PROD_ATTR_ROW(4);
+    RHO_PROD_ATTR_ROW(5);
+    RHO_PROD_ATTR_ROW(6);
+    RHO_PROD_ATTR_ROW(7);
+    RHO_PROD_ATTR_ROW(8);
+    RHO_PROD_ATTR_ROW(16);
+    RHO_PROD_ATTR_ROW(32);
+#undef RHO_PROD_ATTR_ROW
 }
 
 extern RhoPoint adds_pub[2][256];
@@ -1266,21 +1907,201 @@ void init_RhoStates_dev(int total_points, const std::string& name)
     //分配设备内存并复制初始状态 (批量传输, 逐条 cudaMemcpy 在万级条目下不可接受)
     CHECK_CUDA(cudaMalloc(&RhoStates_host, total_points * sizeof(RhoPoint_dev)));
     CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_dev, &RhoStates_host, sizeof(RhoPoint_dev*)));
-    std::vector<RhoState> rsv;
-    rsv.resize(total_points);
-    int num = loadRhoState(rsv.data(), total_points, name);
     static std::vector<RhoPoint_dev> staging;
     staging.resize(total_points);
-    for (int i = 0; i < total_points; i++) {
-        if (i < num) {
-            staging[i].from(rsv[i]);
-        } else {
-            RhoPoint r;
-            r.rand();
-            staging[i].from(r);
+
+    // RHO_PERF_NOLOAD=1: 只用于性能对拍 —— 跳过那个 49MB 文本状态文件的加载 +
+    // 缺口填充, 改用确定性伪随机填充。要点:
+    //   * 同样的 total_points 每次得到完全相同的输入 -> A/B 两臂输入严格一致;
+    //   * 坐标强制 < 2^255 < p, 保证域运算的前提 (操作数 < p) 成立, 且非 0;
+    //   * 不调用 create()/ECMult, 启动开销为 0。
+    // 代价: 走步数据与真实状态不同, 所以这些点数**只能在同一份日志内部前后对比**,
+    // 历史日志里的绝对值不可与之比较。
+    // ⚠ 这些点**不在曲线上**, 任何 check()/对拍都会全失败。所以 validate_test()
+    //   开头会主动拒绝在这个开关打开时运行 —— 否则会报成一个莫名其妙的
+    //   HOST_ASSERT (就这么白查了半天)。用完记得 unset。
+    if (const char* nl = std::getenv("RHO_PERF_NOLOAD"); nl && *nl && *nl != '0') {
+        printf("[RHO_PERF_NOLOAD] init_RhoStates_dev: synthetic NON-curve points in use "
+               "(perf A/B only)\n");
+        uint64_t s = 0x9E3779B97F4A7C15ull ^ ((uint64_t)total_points * 0xD1B54A32D192ED03ull);
+        auto next = [&s]() -> uint32_t {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            return (uint32_t)(s >> 32);
+        };
+        for (int i = 0; i < total_points; i++) {
+            RhoPoint_dev& d = staging[i];
+            for (int k = 0; k < 8; ++k) d.m.limb[k] = next();
+            for (int k = 0; k < 8; ++k) d.n.limb[k] = next();
+            for (int k = 0; k < 8; ++k) d.x.x.limb[k] = next();
+            for (int k = 0; k < 8; ++k) d.x.y.limb[k] = next();
+            d.x.x.limb[7] &= 0x7FFFFFFFu; // 强制 < 2^255 < p
+            d.x.y.limb[7] &= 0x7FFFFFFFu;
+            if (is_zero(d.x.x)) d.x.x.limb[0] = 1;
+            if (is_zero(d.x.y)) d.x.y.limb[0] = 1;
+            d.x.infinity = false;
+        }
+        CHECK_CUDA(cudaMemcpy(RhoStates_host, staging.data(), total_points * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+        return;
+    }
+
+    std::vector<RhoState> rsv;
+    rsv.resize(total_points);
+    auto t_phase = std::chrono::steady_clock::now();
+    int num = loadRhoState(rsv.data(), total_points, name);
+    if (num < 0) num = 0;
+    if (num > total_points) num = total_points;
+    const double parse_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_phase).count();
+
+    // ---------------- 缺口补点 ----------------
+    // 缺口槽位各造一条独立记录 (RhoPoint::rand()): ρ 走步的步长下标
+    // idx = (unsigned char)s.x.limb[0] 由点自身的 x 决定, 所以起点必须逐点不同。
+    // 成本: rand() 单线程 0.385 ms/点 (2x MakeNewKey + 2x ecmult), 942,080 个缺口
+    // 串行要 363 s; 这里唯一能做的就是并行 (16 核 ~50 s), 数学上与串行等价。
+    // 缺口是一次性的: 本轮 save_RhoStates_dev() 会整体写回, 下一轮缺口为 0。
+    for (int i = 0; i < num; i++) {
+        staging[i].from(rsv[i]);
+    }
+
+    double fill_s = 0.0;
+    const int shortfall = total_points - num;
+    if (shortfall > 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 1;
+        if ((unsigned)shortfall < hw) hw = (unsigned)shortfall;
+
+        std::cout << "[RHO_INIT] shortfall " << shortfall << " pts, filling with " << hw
+                  << " CPU threads via RhoPoint::rand() (0.385 ms/pt single-threaded -> "
+                  << (shortfall * 0.385 / 1000.0) << " s serial) ..." << std::endl;
+
+        const auto t_fill = std::chrono::steady_clock::now();
+        std::atomic<int> next_idx{num};
+        std::atomic<int> n_done{0};
+        auto fill_worker = [&]() {
+            for (;;) {
+                const int i = next_idx.fetch_add(1, std::memory_order_relaxed);
+                if (i >= total_points) break;
+                RhoPoint r;
+                r.rand();
+                staging[i].from(r); // 每个 i 只被一个线程写 -> 无数据竞争
+                const int done_n = n_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((done_n % 100000) == 0) {
+                    const double el = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_fill).count();
+                    std::cout << "[RHO_INIT]   " << done_n << " / " << shortfall << "  "
+                              << el << " s  (" << (el * 1000.0 / done_n) << " ms/pt)"
+                              << std::endl;
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        pool.reserve(hw > 1 ? hw - 1 : 0);
+        for (unsigned t = 1; t < hw; ++t) pool.emplace_back(fill_worker);
+        fill_worker();
+        for (std::thread& th : pool) th.join();
+        fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fill).count();
+    }
+
+    std::cout << "[RHO_INIT] total_points=" << total_points << " loaded=" << num
+              << ": parse " << parse_s << " s + fill " << fill_s << " s" << std::endl;
+
+    t_phase = std::chrono::steady_clock::now();
+    CHECK_CUDA(cudaMemcpy(RhoStates_host, staging.data(), total_points * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+    std::cout << "[RHO_INIT] H2D " << total_points * sizeof(RhoPoint_dev) / (1024.0 * 1024.0)
+              << " MiB in "
+              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_phase).count()
+              << " ms" << std::endl;
+}
+
+static inline void hex_encode(char* dst, const unsigned char* src, int n)
+{
+    static const char D[] = "0123456789abcdef";
+    for (int i = 0; i < n; ++i) {
+        *dst++ = D[src[i] >> 4];
+        *dst++ = D[src[i] & 0x0F];
+    }
+}
+
+// GPU 侧状态存盘。与 saveRhoState 的文本格式**逐字节相同**, 但为百万级记录重写。
+//
+// 为什么不能用 saveRhoState: 实测 1,130,496 条 (299 MB 文本) 要 24.7 秒, 全程阻塞
+// 在两次 kernel 之间。三个热点 (见 build/save_bench1/2.log):
+//   1. 每行一次 std::endl -> 4,521,984 次 flush / 写系统调用;
+//   2. 每行一次 HexStr  -> 4,521,984 次 std::string 堆分配;
+//   3. 回读整个旧文件构造 tail -> 4,521,984 行全塞进 vector<std::string> (250 MB
+//      的多读实测要 5.1 秒, 而且稳态下 tail 恒为空, 纯属白读)。
+// 这里: 每个线程把自己那段并行格式化成一个大缓冲, 然后顺序大块 write(); tail 只
+// 扫描不存储; 文件以二进制打开并显式写 \r\n, 避开 CRT 文本模式逐字节翻译。
+// 单条记录布局 (times=0 时恰好 265 字节):
+//   x(64B)->128 hex + \r\n, m(32B)->64 hex + \r\n, n(32B)->64 hex + \r\n, times + \r\n
+static void save_RhoStates_dev_fast(const RhoState* s, int num, const std::string& name)
+{
+    // 1) 保留 num*4 行之后的 tail, 语义与 saveRhoState 一致, 但不再把前面的行存下来
+    std::string tail;
+    {
+        std::ifstream in(name); // 文本模式: \r\n -> \n, getline 拿到的行是干净的
+        if (in.is_open()) {
+            std::string line;
+            const size_t skip = (size_t)num * 4;
+            for (size_t i = 0; i < skip; ++i) {
+                if (!std::getline(in, line)) break;
+            }
+            std::string t;
+            t.reserve(1 << 20);
+            while (std::getline(in, line)) { t += line; t += '\n'; }
+            tail.swap(t);
         }
     }
-    CHECK_CUDA(cudaMemcpy(RhoStates_host, staging.data(), total_points * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+
+    // 2) 并行格式化 (rand/hex 转换之间无依赖)
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    if ((int)hw > num) hw = (unsigned)num;
+    if (hw > 64) hw = 64; // 再多的线程只会抢内存带宽
+
+    std::vector<std::string> chunks(hw);
+    auto fmt = [&](unsigned t) {
+        const int begin = (int)((long long)num * t / hw);
+        const int end = (int)((long long)num * (t + 1) / hw);
+        std::string& out = chunks[t];
+        out.reserve((size_t)(end - begin) * 272 + 128);
+        char h[128];
+        char numbuf[24];
+        for (int i = begin; i < end; ++i) {
+            const RhoState& r = s[i];
+            hex_encode(h, r.x.data, 64);
+            out.append(h, 128).append("\r\n", 2);
+            hex_encode(h, r.m, 32);
+            out.append(h, 64).append("\r\n", 2);
+            hex_encode(h, r.n, 32);
+            out.append(h, 64).append("\r\n", 2);
+            const int nd = std::snprintf(numbuf, sizeof(numbuf), "%llu", (unsigned long long)r.times);
+            out.append(numbuf, nd).append("\r\n", 2);
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(hw > 1 ? hw - 1 : 0);
+    for (unsigned t = 1; t < hw; ++t) pool.emplace_back(fmt, t);
+    fmt(0);
+    for (std::thread& th : pool) th.join();
+
+    // 3) 顺序大块写盘
+    std::ofstream file(name, std::ios::binary | std::ios::trunc);
+    for (unsigned t = 0; t < hw; ++t) {
+        if (!chunks[t].empty()) {
+            file.write(chunks[t].data(), (std::streamsize)chunks[t].size());
+        }
+    }
+    if (!tail.empty()) {
+        // tail 来自文本模式读取 (只有 \n), 这里补成 \r\n 以保持一致
+        std::string t2;
+        t2.reserve(tail.size() + 64);
+        for (char c : tail) {
+            if (c == '\n') t2 += '\r';
+            t2 += c;
+        }
+        file.write(t2.data(), (std::streamsize)t2.size());
+    }
+    file.close();
 }
 
 void save_RhoStates_dev(int total_points, const std::string& name)
@@ -1289,12 +2110,16 @@ void save_RhoStates_dev(int total_points, const std::string& name)
     rsv.resize(total_points);
     static std::vector<RhoPoint_dev> staging;
     staging.resize(total_points);
+
     CHECK_CUDA(cudaMemcpy(staging.data(), RhoStates_host, total_points * sizeof(RhoPoint_dev), cudaMemcpyDeviceToHost));
+
     for (int i = 0; i < total_points; i++) {
         staging[i].to(rsv[i]);
         rsv[i].times = 0;
     }
-    saveRhoState(rsv.data(), total_points, name);
+
+    save_RhoStates_dev_fast(rsv.data(), total_points, name);
+
     std::cout << get_time() << " : save_RhoStates_dev. " << std::endl;
 }
 
@@ -1338,7 +2163,15 @@ void init_RhoStates_test(int total_points)
 }
 
 void rho_play() {
-    enable_blocking_sync(); // 必须最先调用：避免 cudaDeviceSynchronize 自旋空转占满一个核
+    // 必须最先调用：避免 cudaDeviceSynchronize 自旋空转占满一个核
+    const bool blocking_ok = enable_blocking_sync();
+    // 把等待策略打进日志, 便于核对"多出来的那个核"到底是谁
+    printf("[rho_play] wait=%s blocking-sync=%s\n", gpu_wait_mode(),
+           blocking_ok ? "ok" : "not-applied");
+    if (!gpu_wait_is_sync() && !blocking_ok) {
+        printf("[rho_play] note: blocking-sync flag not applied; poll+sleep wait is used "
+               "so no extra CPU core is consumed\n");
+    }
     // 创建 DP 管理器
     DpManager dp_manager(dp_buffer_size);
     int gridSize = 0;
@@ -1346,8 +2179,42 @@ void rho_play() {
     get_optimal_block_size(gridSize, blockSize);
     // 每线程 W 个 walker, 状态总数 = 线程数 * W
     constexpr int W = RHO_GPU_WALKERS;
+    // 单发一块/SM 只能跑到驻留额度的 1/2~1/4, 必须按实际驻留算 grid;
+    // 但"填满驻留额度"是纯吞吐优先, 会把每线程速度压到 1/3 左右, 所以再按
+    // 每 SM warp 上限夹一下 —— 判据与实测见 warps_per_sm_cap() 上方的交换比表。
+    int sm_count = 0;
+    char gpu_name[256] = {0};
+    {
+        cudaDeviceProp prop;
+        CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+        sm_count = prop.multiProcessorCount;
+        std::snprintf(gpu_name, sizeof(gpu_name), "%s", prop.name);
+    }
+    const int fill_grid = grid_to_fill_sm(rho_w<W>, blockSize);
+    const int warp_cap = warps_per_sm_cap();
+    gridSize = cap_grid_by_warps(fill_grid, blockSize, warp_cap, sm_count);
     int threads = gridSize * blockSize;
     int total_points = threads * W;
+    // 生产几何真值 (最终 grid, 不是旧公式的 SM x 1)
+    std::cout << get_time() << " : GPU " << gpu_name << " grid " << gridSize
+              << " x block " << blockSize << " (production: W=" << W
+              << ", fill_grid=" << fill_grid << ", warps/SM cap=" << warp_cap
+              << ", SM=" << sm_count << ")" << std::endl;
+    // 生产核 rho_w<W> 的实际资源占用 (与 perf_rho_w_kernel<W> 是两份独立编译,
+    // 寄存器/局部内存不一定相同, 所以这里必须实测打印而不是照抄基准数据)
+    {
+        cudaFuncAttributes attr;
+        CHECK_CUDA(cudaFuncGetAttributes(&attr, rho_w<W>));
+        int occ = 0;
+        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, rho_w<W>, blockSize, 0));
+        printf("[rho_play] GPU %s W=%d grid=%d block=%d threads=%d states=%d "
+               "regs=%d local=%zuB maxThreads=%d occBlocks=%d -> %d warps/SM "
+               "(fill_grid=%d = %d warps/SM, RHO_WARPS_PER_SM=%d)\n",
+               gpu_name, W, gridSize, blockSize, threads, total_points,
+               attr.numRegs, attr.localSizeBytes, attr.maxThreadsPerBlock, occ,
+               gridSize * blockSize / 32 / (sm_count ? sm_count : 1),
+               fill_grid, occ * blockSize / 32, warp_cap);
+    }
     init_RhoStates_dev(total_points, _RSFile2_name);
     init_adds_pub_dev();
     // 初始化break_flag
@@ -1356,8 +2223,8 @@ void rho_play() {
         break_rho(false);
         init_RhoStates_rand();
         rho_w<W><<<gridSize, blockSize>>>();
-        // 等待核函数完成
-        CHECK_CUDA(cudaDeviceSynchronize());
+        // 等待核函数完成 (默认 poll+sleep, 不自旋; 见 wait_kernel_done)
+        wait_kernel_done();
         dp_manager.save_dps();
         save_RhoStates_dev(total_points, _RSFile2_name);
     }
@@ -1392,7 +2259,7 @@ __global__ void validate_multi_w()
         RhoPoint_dev s[W];
 #pragma unroll
         for (int k = 0; k < W; ++k) s[k] = RhoStates_dev[base + k];
-        fun_add_w<W>(s);
+        fun_add_w<W>(s, adds_pub_dev);
 #pragma unroll
         for (int k = 0; k < W; ++k) {
             if (!(s[k] == RhoStates_dev[base + k + 1])) {
@@ -1423,7 +2290,16 @@ __global__ void validate_safegcd()
     }
 }
 
-__global__ void validate_1()
+// 多 walker 点加核心 (step_prepare / step_apply) 的三个分支 + DP 判据。
+//
+// 以前这里测的是单点函数 point_add; 那个函数和 fun_add_w 里的分支判定是两份
+// 逐字重复的代码, 已删除。现在测的就是生产核跑的那一套核心: 三个分支的触发
+// 条件由具体操作数决定 (倍点要 Px==Qx, 无穷远要有一只点在无穷远), 没法用
+// 步进表的索引构造, 所以直接用 point_step 喂 (P, Q):
+//     mode 3 = G + ∞          mode 2 = G + (-G)
+//     mode 1 = G + G (倍点)   mode 0 = G + 2G
+// 最后再用 fun_add_w<4> 对同一组起点做一次批量求逆, 与 point_step 逐位对拍。
+__global__ void validate_point_add()
 {
     // 测试1：G + ∞ = G
     AffinePoint inf;
@@ -1431,7 +2307,7 @@ __global__ void validate_1()
     inf.y = {{0}};
     inf.infinity = true;
 
-    AffinePoint res1G = point_add(G, inf);
+    AffinePoint res1G = point_step(G, inf);
     DEV_ASSERT(!res1G.infinity);
     for (int i = 0; i < 8; ++i) {
         DEV_ASSERT(res1G.x.limb[i] == G.x.limb[i]);
@@ -1444,20 +2320,49 @@ __global__ void validate_1()
     res_1G.x = G.x;
     res_1G.y = _y;
     res_1G.infinity = false;
-    AffinePoint res0G = point_add(G, res_1G);
+    AffinePoint res0G = point_step(G, res_1G);
     DEV_ASSERT(res0G.infinity);
+    DEV_ASSERT(is_zero(res0G.x));
+    DEV_ASSERT(is_zero(res0G.y));
 
     // 测试2：G + G的有效性
-    AffinePoint res2G = point_add(G, G);
+    AffinePoint res2G = point_step(G, G);
     DEV_ASSERT(!res2G.infinity);
     DEV_ASSERT(res2G.x.limb[7] == 0xC6047F94); // 2G的x坐标高位
     DEV_ASSERT(res2G.y.limb[7] == 0x1ae168fe); // 2G的y坐标高位
         
     // 测试3：G + 2G的有效性
-    AffinePoint res3G = point_add(G, res2G);
+    AffinePoint res3G = point_step(G, res2G);
     DEV_ASSERT(!res3G.infinity);
     DEV_ASSERT(res3G.x.limb[7] == 0xf9308a01); // 3G的x坐标高位
     DEV_ASSERT(res3G.y.limb[7] == 0x388f7b0f); // 3G的y坐标高位
+
+    // 测试4: 批量路径 vs 逐点路径逐位对拍。
+    // 同一组起点, fun_add_w<4> 一次批量求逆的结果必须与 point_step 各自求
+    // 一次逆的结果完全一样 (mod_inv_p 和批量回代都返回 p 内的标准代表,
+    // 两边后续的域运算序列也逐字相同, 所以应当逐字节相等)。
+    // validate_multi_w 是对测试链的端到端对拍, 这里是对退化的"批量 == 逐个"
+    // 本身的直接验证 —— 批量求逆不改变结果, 不是只碰巧在链上成立。
+    {
+        constexpr int W = 4;
+        RhoPoint_dev expect[W];
+        RhoPoint_dev got[W];
+        for (int k = 0; k < W; ++k) {
+            // 取测试链上 4 个真实状态, 保证 4 个分母互不相同 (非退化)
+            got[k] = RhoStates_dev[k * 977 + 13];
+            expect[k] = got[k];
+            const RhoPoint_dev& a = adds_pub_dev[(unsigned char)got[k].x.x.limb[0]];
+            expect[k].x = point_step(got[k].x, a.x);
+            expect[k].m = mod_add(got[k].m, a.m, N);
+            expect[k].n = mod_add(got[k].n, a.n, N);
+        }
+        fun_add_w<W>(got, adds_pub_dev);
+        for (int k = 0; k < W; ++k) DEV_ASSERT(got[k] == expect[k]);
+        // 4 个起点必须互不相同, 否则上面的对拍退化成同一个分母重复 4 次
+        for (int i = 0; i < W; ++i)
+            for (int j = i + 1; j < W; ++j)
+                DEV_ASSERT(!u256_equal(expect[i].x.x, expect[j].x.x));
+    }
 
     //测试 distinguishable: 低 40 位全 0 才构成 DP, 索引取随后的 64 位 (bit 40..103)。
     // 构造值先卡住索引拼接的三段边界: bit 40..63 (limb[1]>>8),
@@ -1488,16 +2393,16 @@ __global__ void validate_multi()
     for (int i = 0; i < RHOSTATES_TEST_NUM / (blockDim.x * gridDim.x); i++) {
         int index = i * blockDim.x * gridDim.x + blockDim.x * blockIdx.x + threadIdx.x;
         RhoPoint_dev rs = RhoStates_dev[index];
-        auto t = (unsigned char)rs.x.x.limb[0];
-        fun_add(rs, adds_pub_dev[t]);
+        // W=1 实例: 这一步就是生产核 fun_add_w<1> 对第 0 个 walker 做的事
+        fun_add_w<1>(&rs, adds_pub_dev);
         DEV_ASSERT((rs == RhoStates_dev[index + 1]));
     }
 
     // DP 缓冲测试: 往缓冲区写 RHODP_TEST_NUM 条记录以验证溢出/break 路径。
     // 索引用尾点的真实索引 (RHO_DP_TEST_IDX), 与尾点自洽。
     // 必须传尾点的**局部副本**: add_dp_to_buffer 会把传入的点换成 RhoStates_rand,
-    // 直接传 RhoStates_dev[RHOSTATES_TEST_NUM] 会把尾点改掉, 而 validate_1
-    // 还要用尾点做 DP 判据检查 (本内核排在 validate_1 之前跑)。
+    // 直接传 RhoStates_dev[RHOSTATES_TEST_NUM] 会把尾点改掉, 而 validate_point_add
+    // 还要用尾点做 DP 判据检查 (本内核排在 validate_point_add 之前跑)。
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx < RHODP_TEST_NUM) {
         RhoPoint_dev tail = RhoStates_dev[RHOSTATES_TEST_NUM];
@@ -1505,77 +2410,216 @@ __global__ void validate_multi()
     }
 }
 
-__host__ __device__ uint64_t perf_fun(RhoPoint_dev& s, const RhoPoint_dev* adds)
+// 点加基准循环。与 rho.cpp 的 perf_test_rho_affine / perf_test_rho_affine_walkers
+// 同口径: 推 batches*W 个点, 数 DP 命中 (命中率 2^-40, 不影响指令构成)。
+//
+// **必须走 fun_add_w<W>** —— 生产核 rho_w<W> 跑的就是这条批量求逆路径。
+// 如果这两个基准改用别的单点实现, 就成了拿两套不同的点加算法
+// 在比效率, 数字没有意义。
+template <int W>
+__host__ __device__ uint64_t perf_fun_w(RhoPoint_dev* s, const RhoPoint_dev* adds,
+                                        uint64_t batches, uint32_t* count_dp_out)
 {
-    uint64_t count_rho = 0;
     uint32_t count_dp = 0;
-    while (count_rho < 800000) {
-        fun_add(s, adds[(unsigned char)s.x.x.limb[0]]);
-        count_rho++;
-        // 检查是否可区分
-        uint64_t d = distinguishable(s.x.x);
-        if (d != 0) {
-            count_dp++;
+    for (uint64_t i = 0; i < batches; ++i) {
+        fun_add_w<W>(s, adds);
+        for (int k = 0; k < W; ++k) {
+            if (distinguishable(s[k].x.x) != 0) count_dp++;
         }
     }
-    return count_rho;
+    if (count_dp_out) *count_dp_out = count_dp;
+    return batches * (uint64_t)W;
 }
 
+// CPU 基准: 在 CPU 上跑**与 GPU 生产核完全相同**的批量求逆算法 (fun_add_w<W>,
+// W = RHO_GPU_WALKERS), 用来和 rho.cpp 的实现对照。
+// 与 perf_test_rho_affine 同口径 (800000 点), 所以:
+//   perf_test_rho_affine          -> rho.cpp 的单 walker 算法 (每步一次模逆)
+//   perf_test_rho_affine_walkers  -> rho.cpp 的批量求逆算法
+//   perf_test_cpu                 -> cuda.cu 的批量求逆算法, 同样 800000 点
+// 三者两两相比就是"同一副算法在不同实现上"或"同一实现上不同算法"的差。
 void perf_test_cpu() {
+    constexpr int W = RHO_GPU_WALKERS;
     RhoPoint_dev adds_pub_tmp[256];
     for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_dev); i++) {
         adds_pub_tmp[i].from(adds_pub[0][i]);
     }
-    RhoPoint_dev s = adds_pub_tmp[0];
+    // 起点与 rho.cpp 的 bench_rho_walkers 一致: 第 k 个 walker 取表项 k
+    RhoPoint_dev s[W];
+    for (int k = 0; k < W; ++k) s[k] = adds_pub_tmp[k];
+    const uint64_t batches = 800000 / W;
+    uint32_t count_dp = 0;
     const auto start = std::chrono::steady_clock::now();
-    uint64_t count_rho = perf_fun(s, adds_pub_tmp);
+    uint64_t count_rho = perf_fun_w<W>(s, adds_pub_tmp, batches, &count_dp);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
     double sec = elapsed.count() / 1000.0;
-    std::cout << "cpu test elapsed: " << elapsed.count() << " ms, with " << count_rho
-              << " RhoPoint, avg " << (uint64_t)(count_rho / sec) << " points/s." << std::endl;
+    std::cout << "cpu test (W=" << W << ", 批量求逆, 同 GPU 生产核 fun_add_w) elapsed: "
+              << elapsed.count() << " ms, with " << count_rho << " RhoPoint (" << count_dp
+              << " dp), avg " << (uint64_t)(count_rho / sec) << " points/s." << std::endl;
 }
 
-__global__ void perf_test_gpu_kernel()
+// 单线程 GPU 基准内核: **1 block x 1 thread**, 走的就是生产核的 fun_add_w<W>。
+//
+// 用途: 给出"该算法在 GPU 单线程上到底能跑多快"的参照值, 和生产并发时的
+// **每线程**吞吐 (= 总吞吐 / 线程数) 对比。生产 grid/block 的并发每线程吞吐
+// 不应该比这个 1 线程值低太多 —— 低太多说明是并发本身 (降频/带宽/调度)
+// 把单线程拖慢了, 而不是算法慢; 这时该调的是 grid/block, 不是算法。
+// 注意: 内核体内用共享内存暂存步进表, 这只是为了与"表放在哪"的历史实验保持
+//       可比 (见下面 [共享内存结论]), 不代表生产路径该这么做。
+// ================== 共享内存结论: 生产代码不用 ==================
+//
+// Q: 生产代码要不要把步进表 adds_pub_dev (256 * 144B = 36 KB) 搬到共享内存?
+// A: 不要。
+//
+// 【方法学】结论**只能**由单变量 A/B 得出: 同一个 __global__ 函数
+//   perf_test_gpu_kernel<W, SHMEM> 实例化两次, 除步进表的地址空间外逐字相同,
+//   同进程内交错发射。命令: RHO_SHMEM_AB=1 -> perf_shared_vs_global()。
+//   历史上一度拿 perf_test_gpu_kernel (表在 shared) 去比 perf_rho_w_kernel (表在
+//   global), 那是**两个不同的内核** (外壳 count_rho 循环 vs perf_fun_w, 寄存器数
+//   不同), 混了不止一个变量; 那个结论 (shared 慢 3.4~4.5%) 已作废, 不再引用。
+//   "两个不同内核比出来的差异" 不能归因到某一个变量上。
+//
+// 【编译产物核对】同一个源模板的两个实例 (cuobjdump -sass):
+//   SHARED: 总指令 5045;  STS.128 = 288 (整表拷贝) + LDG.E.128 = 324 (s 初值 36 +
+//           拷表读 288) + LDS.* 存在 (walker 取表项) + STG 0
+//   GLOBAL: 总指令 4440;  STS 0 / LDS 0;  LDG 49 = s 初值 36 + walker 取表 13; STG 0
+//   5045 - 605(拷表循环) = 4440 -> **两个实例的 walker 部分指令数完全相同**, 差别
+//   只有取表项那条指令走 LDS 还是走 LDG。所以这个 A/B 是干净的。
+//   (两者 local=928B / LDL 83 / STL 81 也一样 —— walker 状态都溢出到 local,
+//    这一项不构成偏差, 但它说明该内核本身是 local-memory 受限的。)
+//
+// 【占用差异】cudaFuncGetAttributes @block=128 (W=4):
+//   shared-table:  regs=164  staticShared=36864B  occBlocks=2 ->  8 warps/SM
+//   global-table:  regs=150  staticShared=0        occBlocks=3 -> 12 warps/SM
+//   即"把表搬进共享内存"顺带把寄存器从 150 抬到 164 (拷表循环的地址运算), 占用
+//   因此掉一档。这是共享内存方案真正的代价来源, 不是 LDS 比 LDG 慢。
+//
+// 【实测】RHO_SHMEM_AB=1, 3 次独立进程 x 每次 rep=4, W=4, block=128, SM=46,
+//        batches=20000 (格子档 batches/8)。cyc/pt = clock64 差 / 点数 (对降频免疫);
+//        M pts/s = 事件计时 (含共享内存版每 block 的拷表 + __syncthreads 启动代价)。
+//
+//   形态                   shared cyc/pt   global cyc/pt   cyc/pt 差   shared Mpts/s  global Mpts/s   吞吐差
+//   --------------------   -------------   -------------   ---------   -------------  --------------   --------
+//   1x1 (1 block x 1 thr)      19293           17874        +7.9%         --             --             --
+//   grid=SM*occS (92x128)      27700           26196        +5.7%        603.9          617.0             -2.1%
+//   grid=SM*occG (138x128)     27017           31738       -14.9%        488.7          726.5            -32.7%
+//
+//   三次运行的 spread 很小 (1x1: +7.65 / +7.71 / +8.46%; occS: +5.46 / +5.79 / +5.97%;
+//   occG: -14.23 ~ -15.36%), 结论可复现。
+//
+// 【怎么读这张表】
+//   (1) 1x1 是**唯一没有占用干扰**的一档: 单线程, 无 bank conflict, 36 KB 远没顶到
+//       容量上限 —— 对共享内存最有利的形态。它稳定慢 7.9%。也就是说 LDS 取表项
+//       并没有比 LDG (L1 命中) 更便宜, 这是本机上的硬事实。
+//   (2) grid=SM*occG 那一行看起来"共享内存单点更快"(-14.9% cyc/pt), 但这是
+//       **占用不等**造成的假象: shared 占 occBlocks=2, 138 个 block 要跑 1.5 波,
+//       每线程的循环反而因为排队更密而更短; 真正决定收益的吞吐差是 -32.7%。
+//       这一行不是"共享内存赢了", 而是在同一 grid 下比较两个不同占用的内核。
+//   (3) grid=SM*occS 是**占用对齐**的一档 (shared 发到自己的满额 92 个 block),
+//       cyc/pt 与吞吐**同时**偏慢 (-5.7% / -2.1%)。共享内存没有任何一档在吞吐上赢。
+//       注: 92x128 = 8 warps/SM 恰好就是 run-17 之后生产路径的几何
+//       (RHO_WARPS_PER_SM 默认 8), 所以这条"占用对齐、仍输"的证据正对着生产档位。
+//
+// 【机制】步进表是只读的、且每个 block 完全相同。放全局内存时, 同一 SM 上所有常驻
+//   block **共用 L1 里的同一份 36 KB**; 放共享内存时每个 block 必须私下拷一份 36 KB
+//   (36864 B/block, 拷表带宽白付 + 占用掉一档 + 每次 __syncthreads)。共享内存只在
+//   "表内容每 block 不同" 或 "表大到 L1 放不下" 时才可能赢 —— 这两条在这里都不成立。
+//
+// 因此生产核 rho_w<W> 保留 __device__ 全局数组 (表读到 L1), 生产路径不碰共享内存。
+// ===============================================================
+
+// 单线程 GPU 参照内核。SHMEM 是这里**唯一**的自变量, 它只决定步进表放在
+// 哪个地址空间:
+//     SHMEM = true   表拷进 __shared__ (LDS)
+//     SHMEM = false  直接用 __global__ adds_pub_dev (LDG, 靠 L1 命中)
+// 除这一项外两个实例逐字相同 (同 s[W] 初值、同 perf_fun_w<W> 调用、同计时
+// 位置、同 grid/block)。这才是能把 "表放在哪" 单独隔离出来的 A/B。
+// 生产路径用的就是 SHMEM=false, 所以 perf_test_gpu() 也走 false —— 参照值
+// 必须和生产核是同一套访存路径, 否则参照值本身带了偏差。
+//
+// 为什么不能拿它和 perf_rho_w_kernel<W> 直接比出 "shared 更慢/更快":
+// 那是两个不同的内核 (外层壳 count_rho 循环 vs perf_fun_w、寄存器数不同),
+// 混了不止一个变量, 差异里分不出哪部分是 LDS 哪部分是 codegen。
+// 正确的量法是 perf_shared_vs_global() (RHO_SHMEM_AB=1), 它在同进程内交错
+// 发射同一份代码的两个实例。
+template <int W, bool SHMEM>
+__global__ void perf_test_gpu_kernel(int batches, unsigned long long* cycles_out,
+                                     unsigned int* dp_out)
 {
-    RhoPoint_dev s = adds_pub_dev[threadIdx.x % 256];
-    __shared__ RhoPoint_dev adds_pub[256];
-    // 从全局内存复制adds_pub到共享内存
-    for (int i = 0; i < 256; i++)
-        adds_pub[i] = adds_pub_dev[i];
-    perf_fun(s, adds_pub);
+    RhoPoint_dev s[W];
+    for (int k = 0; k < W; ++k) s[k] = adds_pub_dev[k];
+
+    // 共享内存表必须整表拷进来, 这是每个 block 一次的启动代价:
+    // 256 项 x 144 B = 36864 B。拷贝本身不计入 cycles (t0 在 __syncthreads 之后),
+    // 但它是 shared 方案独有的、生产核不需要付的钱。
+    // SHMEM=false 时数组退化成 1 项 (16 B), 不占共享内存、不影响 occupancy。
+    __shared__ RhoPoint_dev sh_adds[SHMEM ? 256 : 1];
+    if (SHMEM) {
+        for (int i = 0; i < 256; i++) sh_adds[i] = adds_pub_dev[i];
+        __syncthreads();
+    }
+
+    long long t0 = clock64();
+    // 两个分支都写成直接调用 (而不是先选一个指针再传): 让地址空间在编译期
+    // 就是常量, ptxas 才会分别生成 LDS / LDG, 而不是保守地走通用寻址。
+    if (SHMEM) perf_fun_w<W>(s, sh_adds, batches, dp_out);
+    else       perf_fun_w<W>(s, adds_pub_dev, batches, dp_out);
+    long long t1 = clock64();
+    if (cycles_out) atomicAdd(cycles_out, (unsigned long long)(t1 - t0));
 }
 
 void perf_test_gpu()
 {
+    constexpr int W = RHO_GPU_WALKERS;
+    const uint64_t batches = 800000 / W;
+    const uint64_t kPoints = batches * (uint64_t)W;
+    unsigned long long* d_cycles;
+    unsigned int* d_dp;
+    CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMalloc(&d_dp, sizeof(unsigned int)));
+    CHECK_CUDA(cudaMemset(d_cycles, 0, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMemset(d_dp, 0, sizeof(unsigned int)));
     cudaEvent_t start;
     cudaEvent_t stop;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
     CHECK_CUDA(cudaEventRecord(start));
-    perf_test_gpu_kernel<<<1, 1>>>();
+    // SHMEM=false: 与生产核 rho_w<W> 同一套访存路径 (全局表 + L1), 参照值才有意义
+    perf_test_gpu_kernel<W, false><<<1, 1>>>(batches, d_cycles, d_dp);
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
     CHECK_CUDA(cudaDeviceSynchronize());
+    unsigned long long cycles = 0;
+    unsigned int dp = 0;
+    CHECK_CUDA(cudaMemcpy(&cycles, d_cycles, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&dp, d_dp, sizeof(unsigned int), cudaMemcpyDeviceToHost));
     float elapsed_ms = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
+    CHECK_CUDA(cudaFree(d_cycles));
+    CHECK_CUDA(cudaFree(d_dp));
     double sec = elapsed_ms / 1000.0;
-    std::cout << "gpu test elapsed: " << elapsed_ms << " ms, with 800000 RhoPoint, avg "
-              << (uint64_t)(800000 / sec) << " points/s." << std::endl;
+    std::cout << "gpu test (W=" << W << ", 1 block x 1 thread, 同生产核 fun_add_w, 全局步进表) elapsed: "
+              << elapsed_ms << " ms, with " << kPoints << " RhoPoint, avg "
+              << (uint64_t)(kPoints / sec) << " points/s, "
+              << (uint64_t)((double)cycles / (double)kPoints) << " cycles/point."
+              << std::endl;
 }
 
 // ================== GPU 多 walker 基准 ==================
 //
 // 同进程 A/B: 生产形态 (46x256 线程) 下跑不同 W 的组合, 每组合固定批次数,
-// 用 cudaEvent 计时 + clock64 累计周期 (对 GPU 降频免疫), W=1 走原单
-// walker 路径作基线与漂移对照。
+// 用 cudaEvent 计时 + clock64 累计周期 (对 GPU 降频免疫), W=1 作基线与漂移对照。
+//
+// W=1 基线走的就是 fun_add_w<1> —— 同一份批量求逆代码的退化情形, 与生产核
+// rho_w<W> 逐字同一套点加, 不存在"两套算法"的可比性问题。
 //
 // 仅保留 device-table 方案: 步进表统一存放在 adds_pub_dev, 不再保留 GM
 // 常量表/全局表分支。
 
-// 基线内核: 原 rho 生产路径的循环体 (fun_add 一次一模逆), 固定步数
+// 基线内核: 每点一次模逆, 即批量求逆宽度 W=1 的生产形态, 固定步数
 __global__ void perf_rho_single_kernel(int steps, unsigned long long* cycles_out, unsigned int* dp_out)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1583,7 +2627,8 @@ __global__ void perf_rho_single_kernel(int steps, unsigned long long* cycles_out
     unsigned int dp = 0;
     long long t0 = clock64();
     for (int i = 0; i < steps; ++i) {
-        fun_add(s, adds_pub_dev[(unsigned char)s.x.x.limb[0]]);
+        // 与生产核同一份代码: 宽度 1 的批量求逆 = 每点一次 mod_inv_p
+        fun_add_w<1>(&s, adds_pub_dev);
         if (distinguishable(s.x.x) != 0) dp++;
     }
     long long t1 = clock64();
@@ -1592,15 +2637,140 @@ __global__ void perf_rho_single_kernel(int steps, unsigned long long* cycles_out
     RhoStates_dev[idx] = s;
 }
 
-template <int W>
-static void run_perf_rho_w(int grid, int block, int batches)
+// ================== 微基准: 单个基础操作的代价 ==================
+//
+// 为什么要这个: 光看 W 扫描得到的是 *组合* 结果 (每点成本 ≈ E + M/W + L(W)),
+// E=一次点加的算术, M=一次模逆, L=批量数组的开销)。三者混在一起, 没法判断
+// 下一步该优化谁。这里把每个基础操作单独拿出来量:
+//   每线程跑一条 *串行依赖链* x = op(x, c), 用 clock64 量总周期。
+// 串行依赖链量到的是延迟 (latency), 正是热路径实际承受的量 (walker 状态
+// 一步步相互依赖), 不是吞吐。
+// grid 取 1xSM 与 4xSM 两档: 前者接近纯延迟, 后者是生产占用 (16 warps/SM)
+// 下每个操作实际摊到的周期。
+template <int MODE>
+__global__ void micro_kernel(int iters, uint256_t seed, unsigned long long* cycles_out,
+                             unsigned int* sink)
 {
+    uint256_t x = seed;
+    x.limb[0] |= 1u; // 非零, 否则模逆链会坍缩到 0 后一直是 0
+    const uint256_t c = uint256_t{{0x03D1u, 0x7u, 0, 0, 0, 0, 0, 0}};
+    long long t0 = clock64();
+    for (int i = 0; i < iters; ++i) {
+        if (MODE == 0)      x = mul_mod(x, c);
+        else if (MODE == 1) x = mod_inv_p(x);
+        else if (MODE == 2) x = mod_sub(x, c);
+        else if (MODE == 3) x = mod_add(x, c, p);
+        else                x = mul_mod(x, x);
+    }
+    long long t1 = clock64();
+    atomicAdd(cycles_out, (unsigned long long)(t1 - t0));
+    // 编译器和 ptxas 都证不出这个分支不可能成立, 于是整条链必须被保留
+    if (x.limb[0] == 0xFFFFFFFEu) *sink = 1u;
+}
+
+static void micro_bench_one(int mode, const char* name, int grid, int block, int iters, int sm)
+{
+    unsigned long long* d_cyc = nullptr;
+    unsigned int* d_sink = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_cyc, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMalloc(&d_sink, sizeof(unsigned int)));
+    CHECK_CUDA(cudaMemset(d_cyc, 0, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMemset(d_sink, 0, sizeof(unsigned int)));
+    uint256_t seed;
+    for (int i = 0; i < 8; ++i) seed.limb[i] = 0x12345678u + (uint32_t)i * 0x01010101u;
+    switch (mode) {
+    case 0: micro_kernel<0><<<grid, block>>>(iters, seed, d_cyc, d_sink); break;
+    case 1: micro_kernel<1><<<grid, block>>>(iters, seed, d_cyc, d_sink); break;
+    case 2: micro_kernel<2><<<grid, block>>>(iters, seed, d_cyc, d_sink); break;
+    case 3: micro_kernel<3><<<grid, block>>>(iters, seed, d_cyc, d_sink); break;
+    default: micro_kernel<4><<<grid, block>>>(iters, seed, d_cyc, d_sink); break;
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+    unsigned long long c = 0;
+    CHECK_CUDA(cudaMemcpy(&c, d_cyc, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    double per_op = (double)c / ((double)grid * block * iters);
+    printf("  [micro] %-12s grid=%3dx%-3d (%2d warps/SM) -> %8.2f cycles/op\n",
+           name, grid, block, grid / sm * block / 32, per_op);
+    cudaFree(d_cyc);
+    cudaFree(d_sink);
+}
+
+void perf_micro()
+{
+    enable_blocking_sync();
+    init_adds_pub_dev();
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    const int sm = prop.multiProcessorCount;
+    const int block = 128;
+    const int iters = 100000;
+    const char* names[5] = {"mul_mod", "mod_inv_p", "mod_sub", "mod_add", "mul_mod(sq)"};
+    printf("  [micro] block=%d iters=%d sm=%d  (cycles/op = cycles per op per thread)\n",
+           block, iters, sm);
+    for (int mult = 1; mult <= 4; mult *= 4) {
+        for (int mode = 0; mode < 5; ++mode) {
+            micro_bench_one(mode, names[mode], sm * mult, block, iters, sm);
+        }
+        printf("\n");
+    }
+}
+
+template <int W>
+static int perf_grid_for(int& block)
+{
+    if (W == 1) return grid_to_fill_sm(perf_rho_single_kernel, block);
+    return grid_to_fill_sm(perf_rho_w_kernel<W>, block);
+}
+
+template <int W>
+static void run_perf_rho_w(int block, int batches, int force_grid = 0)
+{
+    // grid 由该 W 的真实驻留额度决定 (不同 W 寄存器数不同, 驻留额度也不同),
+    // 不再由调用方传固定值 —— 固定值就是原来"每 SM 一个 block"那个 bug。
+    int grid = perf_grid_for<W>(block);
+    // 强制 grid 的用途是把"驻留线程数"这一个变量单独量出来 —— 同一份二进制、
+    // 同一轮运行里只改 grid, 就能判定某个 W 的吞吐差异到底来自代码本身还是来自
+    // concurrency (例: 合并点加后 W=1 的 grid 从 138 变 184, 对拍即可把因果钉死)。
+    //   RHO_PERF_GRID=<n>        整个进程的默认强制 grid
+    //   RHO_PERF_WS=1:138,1:184  按项强制 (优先级更高, 可交错 A/B)
+    // 交错 A/B 比两次独立运行可靠得多: W=1 这一档的机器态漂移可达 ±10% (见
+    // 点运算小节的口径警告), 只有同一轮内交错才能把 1~2% 级的差异读出来。
+    if (force_grid > 0) {
+        grid = force_grid;
+    } else if (const char* g = std::getenv("RHO_PERF_GRID")) {
+        const int forced = std::atoi(g);
+        if (forced > 0) grid = forced;
+    }
+
     unsigned long long* d_cycles;
     unsigned int* d_dp;
     CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(unsigned long long)));
     CHECK_CUDA(cudaMalloc(&d_dp, sizeof(unsigned int)));
     CHECK_CUDA(cudaMemset(d_cycles, 0, sizeof(unsigned long long)));
     CHECK_CUDA(cudaMemset(d_dp, 0, sizeof(unsigned int)));
+
+    // 每次基准都打印一次内核资源画像: 寄存器 / 本地内存(栈+溢出) / 驻留块数。
+    // 本地内存字节数是这里最关键的一列 —— s[W] 太大放不进寄存器, 只能落在
+    // 本地内存, 所以它的字节数直接决定每批的 LDL/STL 指令数。
+    {
+        cudaFuncAttributes attr;
+        int occ_blocks = 0;
+        if (W == 1) {
+            CHECK_CUDA(cudaFuncGetAttributes(&attr, (const void*)perf_rho_single_kernel));
+            CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ_blocks, (const void*)perf_rho_single_kernel, block, 0));
+        } else {
+            CHECK_CUDA(cudaFuncGetAttributes(&attr, (const void*)perf_rho_w_kernel<W>));
+            CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occ_blocks, (const void*)perf_rho_w_kernel<W>, block, 0));
+        }
+        int sm_threads = occ_blocks * block;
+        int warps_per_sm = sm_threads / 32;
+        printf("  [res] W=%d regs=%d local=%zuB maxThreads=%d grid=%d block=%d "
+               "occBlocks=%d -> %d threads/SM (%d warps/SM)\n",
+               W, attr.numRegs, attr.localSizeBytes, attr.maxThreadsPerBlock,
+               grid, block, occ_blocks, sm_threads, warps_per_sm);
+    }
 
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
@@ -1633,29 +2803,630 @@ static void run_perf_rho_w(int grid, int block, int batches)
               << " cycles/point(sum), dp=" << dp << std::endl;
 }
 
+// 并发-单线程吞吐曲线 (RHO_CONC_CURVE=1)。
+//
+// 为什么要单独测: grid_to_fill_sm 把 grid 顶到最大驻留额度 (每 SM 塞满 block),
+// 这是在赌"吞吐优先"。但并发一上来, 每线程分到的发射槽和 L1/L2 带宽就变少,
+// 单线程吞吐必然掉。掉多少必须实测, 不能假设。
+// 注意 (run-17 之后): 生产路径已改为**不**取满驻留额度 —— 按每 SM warp 上限
+// (RHO_WARPS_PER_SM, 默认 8) 夹 grid, 判据是 [prod] 的交换比表。本函数仍扫满
+// 1..occ 全档, 因为它就是那张判据表的原始数据源; 哪一档是生产档由
+// perf_prod_rho_w_throughput 的 "POLICY" 标记指出。
+//
+// 口径: 把 W=RHO_GPU_WALKERS 的基准核按"每 SM 1..occ 个 block"逐档发一遍, 每档
+// 报三个数 —— 总吞吐 / 每线程吞吐 / 每点周期。每线程吞吐就是该 <grid,block> 下
+// 并发时单个线程的速度, 直接和 perf_test_gpu() 的 "1 block x 1 thread" 参照值对比:
+//   * 若每线程吞吐随 k 平缓下降, 总吞吐还在涨 -> 当前取最大 k 是对的;
+//   * 若每线程吞吐在某一档断崖, 而总吞吐已不再涨 -> 拐点就是该档, 再加 block 纯亏。
+//
+// 另外加 k=0 的三行对照, 都是 1 block x 1 thread、算法都是 fun_add_w<W>:
+//   行1  perf_test_gpu_kernel<W, true>   表在 shared
+//   行2  perf_test_gpu_kernel<W, false>  表在 global   <- 生产路径的取表方式
+//   行3  perf_rho_w_kernel<W>            表在 global, 但外壳是 count_rho 循环
+// 行1/行2 是同一个内核的两个实例, 逐字相同, **唯一**变量是步进表的地址空间 ->
+// 干净的单变量 A/B (结论见 [共享内存结论])。行3 用来单独量外壳差异 (count_rho
+// 循环 vs perf_fun_w), 不要拿它和行1/行2 比出 "LDS 快还是 LDG 快"。
+// 如果行3 与行2 的 cyc/pt 差得远, 说明"单线程参照值"里混进了外壳那一项, 不能
+// 直接当算法的单线程速度。
+using PerfKernelFn = void (*)(int, unsigned long long*, unsigned int*);
+
+static void conc_run_one(PerfKernelFn kern, const char* tag, int grid, int block,
+                         int warps_per_sm, int batches, int W)
+{
+    unsigned long long* d_cycles;
+    unsigned int* d_dp;
+    CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMalloc(&d_dp, sizeof(unsigned int)));
+    CHECK_CUDA(cudaMemset(d_cycles, 0, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMemset(d_dp, 0, sizeof(unsigned int)));
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+    CHECK_CUDA(cudaEventRecord(start));
+    kern<<<grid, block>>>(batches, d_cycles, d_dp);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    unsigned long long cycles = 0;
+    unsigned int dp = 0;
+    CHECK_CUDA(cudaMemcpy(&cycles, d_cycles, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&dp, d_dp, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    float ms = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    CHECK_CUDA(cudaFree(d_cycles));
+    CHECK_CUDA(cudaFree(d_dp));
+
+    const uint64_t threads = (uint64_t)grid * block;
+    const uint64_t points = threads * (uint64_t)W * batches;
+    const double sec = ms / 1000.0;
+    const uint64_t total = (uint64_t)(points / sec);
+    printf("  [conc] %-24s grid=%-4d block=%-4d threads=%-6d warps/SM=%-2d: "
+           "%11llu pts/s total, %8llu pts/s per-thread, %6.0f cyc/pt\n",
+           tag, grid, block, (int)threads, warps_per_sm, total,
+           total / threads, (double)cycles / (double)points);
+}
+
+static void perf_concurrency_curve(int block, int batches)
+{
+    constexpr int W = RHO_GPU_WALKERS;
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    const int sm = prop.multiProcessorCount;
+    int occ = 0;
+    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, (const void*)perf_rho_w_kernel<W>, block, 0));
+    if (occ < 1) occ = 1;
+
+    printf("  [conc] W=%d block=%d SM=%d maxBlocksPerSM=%d batches=%d\n",
+           W, block, sm, occ, batches);
+
+    // k=0 对照: 1 block x 1 thread。前两行是同一个内核 (perf_test_gpu_kernel)
+    // 的两个实例, 差别**只有**步进表的内存空间 —— 这是干净的单变量 A/B;
+    // 第三行是另一个内核 (perf_rho_w_kernel), 用来量外壳差异 (count_rho 循环
+    // vs perf_fun_w)。三者算法都是 fun_add_w<W>, 都是一次一个点。
+    conc_run_one((PerfKernelFn)perf_test_gpu_kernel<W, true>, "k=0 shmem(same shell)",
+                 1, 1, 1, batches, W);
+    conc_run_one((PerfKernelFn)perf_test_gpu_kernel<W, false>, "k=0 gmem(same shell)",
+                 1, 1, 1, batches, W);
+    conc_run_one((PerfKernelFn)perf_rho_w_kernel<W>, "k=0 gmem(rho_w shell)",
+                 1, 1, 1, batches, W);
+
+    for (int k = 1; k <= occ; ++k) {
+        char tag[32];
+        snprintf(tag, sizeof(tag), "k=%d occ=%d/%d", k, k * block, occ * block);
+        conc_run_one((PerfKernelFn)perf_rho_w_kernel<W>, tag,
+                     sm * k, block, k * block / 32, batches, W);
+    }
+}
+
+// ================== 共享内存 vs 全局表: 单一变量 A/B (RHO_SHMEM_AB=1) ==================
+//
+// 问的问题: 步进表 (256 x 144 B = 36864 B) 放 __shared__ 还是留在 __device__
+// 全局数组 (靠 L1)? 因为生产核 rho_w<W> 走的是全局表, 这个问题的答案决定
+// perf_test_gpu_kernel (单线程参照值) 该不该跟着用共享内存。
+//
+// 方法学 (这一步比数字本身重要): 唯一变量必须是"表的内存空间"。
+//   * 拿 perf_test_gpu_kernel (shared) 和 perf_rho_w_kernel (global) 互比是
+//     **错的** —— 那是两个不同的内核: 外层壳 (perf_fun_w vs count_rho 循环)、
+//     寄存器画像、循环结构都不同, 差里分不出哪部分是 LDS/LDG。
+//   * 正确做法: 同一个 __global__ 的两个实例 (perf_test_gpu_kernel<W,true/false>),
+//     逐字相同, 只换地址空间。
+//   * 再叠一层: 同进程内**交错**发射 shared / global / shared / global ... 各 REP
+//     次, 用 cyc/pt (对降频免疫) 看均值。跨运行比绝对值会被 ~10% 的机器态漂移
+//     吃掉 (GPU 时钟 1410~1785 MHz), 交错 A/B 是对这个漂移免疫的唯一手法。
+//
+// 两种形态各测一遍:
+//   1x1       1 block x 1 thread —— 零竞争, 共享内存**最有利**的形态
+//             (warp 里只有一个活跃 lane, 不可能有 bank conflict; 36864 B 也
+//              远没顶到每 SM 的容量上限)。这一档赢不了, 后面就不用看了。
+//   full      grid = SM * occ, block=128 —— 生产形态。这一档会同时暴露
+//             (a) 索引发散下的 bank conflict, (b) 36864 B/block 的容量代价。
+//             两版各按自己的 occupancy 发满, 所以顺便把容量代价量出来。
+template <int W, bool SHMEM>
+static double shmem_ab_launch(int grid, int block, int batches, double* ms_out)
+{
+    unsigned long long* d_cycles;
+    unsigned int* d_dp;
+    CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMalloc(&d_dp, sizeof(unsigned int)));
+    CHECK_CUDA(cudaMemset(d_cycles, 0, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMemset(d_dp, 0, sizeof(unsigned int)));
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+    CHECK_CUDA(cudaEventRecord(start));
+    perf_test_gpu_kernel<W, SHMEM><<<grid, block>>>(batches, d_cycles, d_dp);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    unsigned long long cycles = 0;
+    unsigned int dp = 0;
+    CHECK_CUDA(cudaMemcpy(&cycles, d_cycles, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&dp, d_dp, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    float ms = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    CHECK_CUDA(cudaFree(d_cycles));
+    CHECK_CUDA(cudaFree(d_dp));
+    const uint64_t points = (uint64_t)grid * block * W * batches;
+    (void)dp;
+    if (ms_out) *ms_out = ms;
+    return (double)cycles / (double)points;   // cyc/pt: 对降频免疫
+}
+
+template <int W, bool SHMEM>
+static int shmem_ab_attrs(int block, const char* tag)
+{
+    cudaFuncAttributes attr{};
+    CHECK_CUDA(cudaFuncGetAttributes(&attr, (const void*)perf_test_gpu_kernel<W, SHMEM>));
+    int occ = 0;
+    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, (const void*)perf_test_gpu_kernel<W, SHMEM>, block, 0));
+    if (occ < 1) occ = 1;
+    printf("  [shmem] %-22s regs=%-4d local=%-6zuB staticShared=%-6zuB "
+           "maxThreads=%-5d occBlocks=%-2d (%d warps/SM @block=%d)\n",
+           tag, attr.numRegs, attr.localSizeBytes, attr.sharedSizeBytes,
+           attr.maxThreadsPerBlock, occ, occ * block / 32, block);
+    return occ;
+}
+
+template <int W>
+static void shmem_ab_shape(const char* shape, int grid, int block, int batches, int rep)
+{
+    const double pts = (double)grid * block * W * batches;
+    double sum_s = 0.0, sum_g = 0.0;
+    for (int r = 0; r < rep; ++r) {
+        double ms_s = 0, ms_g = 0;
+        const double cs = shmem_ab_launch<W, true>(grid, block, batches, &ms_s);
+        const double cg = shmem_ab_launch<W, false>(grid, block, batches, &ms_g);
+        sum_s += cs;
+        sum_g += cg;
+        printf("  [shmem] %-10s r%d  shared %8.1f cyc/pt (%6.1f M pts/s)   "
+               "global %8.1f cyc/pt (%6.1f M pts/s)   shared/global = %+6.2f%%\n",
+               shape, r, cs, pts / (ms_s * 1e3), cg, pts / (ms_g * 1e3),
+               (cs / cg - 1.0) * 100.0);
+    }
+    printf("  [shmem] %-10s MEAN shared %8.1f cyc/pt   global %8.1f cyc/pt   "
+           "shared/global = %+6.2f%%\n",
+           shape, sum_s / rep, sum_g / rep, ((sum_s / sum_g) - 1.0) * 100.0);
+}
+
+static void perf_shared_vs_global(int block, int batches)
+{
+    constexpr int W = RHO_GPU_WALKERS;
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    const int sm = prop.multiProcessorCount;
+    const int rep = 4;
+
+    printf("  [shmem] A/B: 唯一变量 = 步进表地址空间 (perf_test_gpu_kernel<W,SHMEM>), "
+           "W=%d block=%d SM=%d batches=%d rep=%d\n", W, block, sm, batches, rep);
+
+    const int occ_s = shmem_ab_attrs<W, true>(block, "shared-table");
+    const int occ_g = shmem_ab_attrs<W, false>(block, "global-table");
+
+    // 0) 形态最有利于 shared 的一档: 零竞争, 单线程
+    shmem_ab_shape<W>("1x1", 1, 1, batches, rep);
+
+    // 1) 同一并发度下比 (各自发到 global 版的 occ, 一个变量都不多)
+    shmem_ab_shape<W>("grid=SM*occG", sm * occ_g, block, batches / 8, rep);
+
+    // 2) 各自发满自己的额度: 这里会把 36864 B/block 的容量代价一并量出来
+    shmem_ab_shape<W>("grid=SM*occS", sm * occ_s, block, batches / 8, rep);
+    shmem_ab_shape<W>("grid=SM*occG", sm * occ_g, block, batches / 8, rep);
+}
+
+// ================== 生产核真实吞吐 ==================
+//
+// 为什么必须单独测: 生产核 rho_w<W> 和基准核 perf_rho_w_kernel<W> 是两份独立编译,
+// 资源画像完全不同 ——
+//     基准核 perf_rho_w_kernel: 168 regs -> 3 block/SM -> grid 138 ->  12 warps/SM
+//     生产核 rho_w           :  78 regs -> 6 block/SM -> grid 276 ->  24 warps/SM
+// RHO_CONC_CURVE 已经测出基准核在 12 warps/SM 时每点周期就压到 144 (≈ SM 发射上限
+// 4 指令/周期), 也就是说 12 个 warp 已经把发射槽占满了。那生产核多出来的那 12 个
+// warp/SM 到底换来了什么? 如果什么都没换来, 那就是白烧电 —— 在 -pl 受限的笔记本上
+// 还可能触到功耗墙把频率压下去, 总吞吐反而更低。这个账从来没有测过, 现在测。
+//
+// 测法: 生产核是 while(true) 长跑, 但它在 (count_rho & 0x3FFFF) == 0 时轮询
+// break_flag。所以预先置 break_flag = true, 内核跑满 2^18 批 (= 每线程 2^18 * W 点)
+// 就返回。这一段就是纯生产循环的稳态时间 (不含补点, 不含落盘)。
+//
+// 口径 (回答"每 SM 该驻留多少 warp"):
+//   k=0        1 block x 1 thread —— 同一个内核、同一段 poll 掩码, 就是本进程内的
+//              "单线程参照值"。每线程吞吐的百分比直接除以它, 不吃跨运行的机器态漂移。
+//   k=1..occ   grid = SM*k, block=128, 即每 SM 驻留 k 个 block (= k*4 个 warp)。
+//   报三个数: 总吞吐 / 每线程吞吐 (= 该并发下单个线程的速度) / 单轮秒数。
+//   再做一张"交换比"表, 见下面 [prod] step 行的算法。
+//
+// 重复性: RHO_PROD_REPS (默认 2) 遍, 每遍都是 k=0..occ 走一圈 —— 交错重复,
+// 慢漂移 (温度/频率在分钟尺度上单调变化) 对各档影响近似相同, 比跨进程比绝对值可靠。
+static void perf_prod_rho_w_throughput(int block)
+{
+    constexpr int W = RHO_GPU_WALKERS;
+    const int prod_batches = 1 << 18;   // rho_w 的 poll 掩码, 内核最少要跑这么多批
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    const int sm = prop.multiProcessorCount;
+    int occ = 0;
+    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, (const void*)rho_w<W>, block, 0));
+    if (occ < 1) occ = 1;
+
+    int reps = 2;
+    if (const char* e = std::getenv("RHO_PROD_REPS")) {
+        int v = std::atoi(e);
+        if (v >= 1 && v <= 8) reps = v;
+    }
+
+    // rho_w 在 DP 命中时会调 add_dp_to_buffer(..., dp_device_buffer, ...),
+    // 生产路径靠 DpManager 把这个设备指针填进 __device__ 符号。基准路径从没走过
+    // 这一步, 所以这里必须自己建一个, 否则 2^-40 的命中率撞上一次就是空指针解引用。
+    DpManager dp_manager(dp_buffer_size);
+
+    const bool own_flag = (break_flag_host == nullptr);
+    if (own_flag) init_break_flag();
+    break_rho(true);    // 内核跑完第一个 poll 段就返回
+
+    const int nrow = occ + 1;                      // 行 0 = k=0 的单线程参照
+    std::vector<double> sum_tot(nrow, 0.0), sum_pt(nrow, 0.0), last_sec(nrow, 0.0);
+    std::vector<double> lo_pt(nrow, 1e300), hi_pt(nrow, 0.0);
+
+    printf("  [prod] W=%d block=%d SM=%d maxBlocksPerSM=%d points/thread=%d reps=%d\n",
+           W, block, sm, occ, prod_batches * W, reps);
+
+    for (int r = 0; r < reps; ++r) {
+        for (int row = 0; row < nrow; ++row) {
+            const int k = row;
+            const int grid = (k == 0) ? 1 : sm * k;
+            const int blk = (k == 0) ? 1 : block;
+            const uint64_t threads = (uint64_t)grid * blk;
+            const uint64_t points = threads * (uint64_t)W * prod_batches;
+            cudaEvent_t start, stop;
+            CHECK_CUDA(cudaEventCreate(&start));
+            CHECK_CUDA(cudaEventCreate(&stop));
+            CHECK_CUDA(cudaEventRecord(start));
+            rho_w<W><<<grid, blk>>>();
+            CHECK_CUDA(cudaEventRecord(stop));
+            CHECK_CUDA(cudaEventSynchronize(stop));
+            CHECK_CUDA(cudaDeviceSynchronize());
+            float ms = 0;
+            CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            const double sec = ms / 1000.0;
+            const double total = (double)points / sec;
+            const double pt = total / (double)threads;
+            sum_tot[row] += total;
+            sum_pt[row] += pt;
+            last_sec[row] = sec;
+            lo_pt[row] = std::min(lo_pt[row], pt);
+            hi_pt[row] = std::max(hi_pt[row], pt);
+            printf("  [prod] r%d k=%-2d grid=%-4d block=%-4d threads=%-6d warps/SM=%-2d: "
+                   "%11.0f pts/s total, %8.0f pts/s per-thread, %6.1f s/round\n",
+                   r, k, grid, blk, (int)threads, (k == 0) ? 1 : k * blk / 32,
+                   total, pt, sec);
+        }
+    }
+
+    // 均值表: 每线程吞吐同时给出 "占 1x1 参照的百分比" 和 reps 间的极差。
+    // 后者是噪声底 —— 判断某一档的增益是否真实, 要和它比。
+    // k_pol 是 warps_per_sm_cap() 选中的档位, 会被标成 POLICY: 生产实际跑的就是
+    // 这一行的几何 (grid = SM*k_pol, block), 所以这一行就是"改动后"的预期值。
+    const int warp_cap = warps_per_sm_cap();
+    int k_pol = occ;
+    if (warp_cap > 0) {
+        const int wpb = std::max(1, block / 32);
+        k_pol = std::min(occ, std::max(1, (warp_cap + wpb - 1) / wpb));
+    }
+    double p0 = sum_pt[0] / reps;
+    if (p0 <= 0) p0 = 1.0;
+    for (int row = 0; row < nrow; ++row) {
+        const int k = row;
+        const int grid = (k == 0) ? 1 : sm * k;
+        const int blk = (k == 0) ? 1 : block;
+        const uint64_t threads = (uint64_t)grid * blk;
+        const double tot = sum_tot[row] / reps;
+        const double pt = sum_pt[row] / reps;
+        printf("  [prod] MEAN k=%-2d grid=%-4d threads=%-6d warps/SM=%-2d: "
+               "%11.0f pts/s total, %8.0f pts/s per-thread (%5.1f%% of 1x1), "
+               "spread %.1f%%, %6.1f s/round%s\n",
+               k, grid, (int)threads, (k == 0) ? 1 : k * blk / 32, tot, pt,
+               100.0 * pt / p0,
+               (reps > 1 && lo_pt[row] > 0) ? (hi_pt[row] / lo_pt[row] - 1.0) * 100.0 : 0.0,
+               last_sec[row],
+               (row == k_pol) ? "   <- POLICY (production geometry)" : "");
+    }
+
+    // 交换比表 —— 这就是选 warps/SM 的判据本身, 不是事后解释。
+    //   交换比 = 相对总吞吐增益 / 相对每线程损失 = log(T(k)/T(k-1)) / log(P(k-1)/P(k))
+    // 交换比 >= 1: 这一档"加 warp"买回来的总吞吐, 比它吃掉的每线程速度还多 -> 值得。
+    // 交换比 <  1: 加这一档纯亏 (总吞吐涨得少, 每线程掉得多) -> 拐点在这里, 到此为止。
+    // 等价的连续形式: 交换比 = 1 就是 T*P 的极值点 —— 也就是"总吞吐 x 单线程速度"
+    // 这个乘积极大化, 两个量等权, 且对两者的量纲/量级都不敏感。
+    for (int row = 1; row < nrow; ++row) {
+        const double t0 = sum_tot[row - 1] / reps, t1 = sum_tot[row] / reps;
+        const double q0 = sum_pt[row - 1] / reps, q1 = sum_pt[row] / reps;
+        const double dT = std::log(t1 / t0);
+        const double dP = std::log(q0 / q1);
+        const double rate = (dP > 1e-9) ? dT / dP : 0.0;
+        printf("  [prod] step k=%d->%d: total %+6.1f%%  per-thread %+6.1f%%  "
+               "warps/SM %d->%d  exchange %.2f%s\n",
+               row - 1, row, (t1 / t0 - 1.0) * 100.0, (q1 / q0 - 1.0) * 100.0,
+               (row - 1 == 0) ? 1 : (row - 1) * block / 32, row * block / 32,
+               rate, (rate >= 1.0) ? "  <- worth it" : "  <- net loss, knee");
+    }
+
+    break_rho(false);
+    if (own_flag) free_break_flag();
+}
+
+// ============ block 尺寸 A/B: 92x128 vs 46x256 (同线程数, 同 warps/SM) ============
+//
+// 92x128 与 46x256 的**线程总数完全相同** (92*128 = 46*256 = 11776), 每 SM warp 数也
+// 相同 (8), 所以这是一个**只变块形**的单变量对照。可能产生差异的机制:
+//   - 块级调度粒度: 每 SM 上 2 个 128 块的块可以互相填发射槽 vs 1 个 256 块内部 8 个
+//     warp 覆盖 4 个发射槽 —— 两者都是 8 warp, 但"能重排的粒度"不同;
+//   - 每 SM 尾延迟: 块内最后一个 warp 拖尾时, 2 块可以拿另一块顶上, 1 块不行;
+//   - 寄存器/局部内存: 每线程相同 (块大小不改变每线程分配), 只有 occBlocks 从 6 变 3。
+// 结论必须是**实测**的: 跨进程漂移 ±10% 会把这点差异完全淹没, 所以本函数在**同一进程内
+// 交错**发射 A/B/A/B (run-16 的教训: 拿两个不同实例化之外的差异归因都是无效证据)。
+//
+// 用法: RHO_BLOCK_AB=1 (默认扫 128,256) 或 RHO_BLOCK_AB=32,64,128,256 (自定义块大小列表,
+// 逗号分隔, 最多 8 项), 配 RHO_PROD_REPS (默认 2)。
+// 注: 列表里每个 block 都会被折成"每 SM warp 上限 cap"对应的 grid，所以只有当
+//     block 能整除 32*cap*SM(=总线程数) 时各档线程数才严格相等。默认档 (cap=8) 下
+//     32/64/128/256 -> grid 368/184/92/46 都是 11776 线程 = 8 warps/SM，可严格对比。
+static void perf_block_ab()
+{
+    constexpr int W = RHO_GPU_WALKERS;
+    const int prod_batches = 1 << 18;   // rho_w 的 poll 掩码: 内核最少跑这么多批
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    const int sm = prop.multiProcessorCount;
+    const int cap = warps_per_sm_cap();
+
+    int reps = 2;
+    if (const char* e = std::getenv("RHO_PROD_REPS")) {
+        int v = std::atoi(e);
+        if (v >= 1 && v <= 8) reps = v;
+    }
+
+    cudaFuncAttributes fa;
+    CHECK_CUDA(cudaFuncGetAttributes(&fa, rho_w<W>));
+
+    // 候选块大小列表: RHO_BLOCK_AB 里带数字就用它, 否则默认 128,256
+    std::vector<int> cand;
+    {
+        const char* e = std::getenv("RHO_BLOCK_AB");
+        if (e != nullptr) {
+            std::string s = e;
+            for (size_t pos = 0; pos < s.size() && cand.size() < 8;) {
+                size_t comma = s.find(',', pos);
+                if (comma == std::string::npos) comma = s.size();
+                const int v = std::atoi(s.substr(pos, comma - pos).c_str());
+                if (v >= 32) cand.push_back(v);
+                pos = comma + 1;
+            }
+        }
+        if (cand.empty()) { cand.push_back(128); cand.push_back(256); }
+    }
+
+    // 每个块形按"每 SM warp 上限 cap"折算出等 warp 的 grid (cap=0 时用满驻留额度)。
+    const size_t n = cand.size();
+    std::vector<int> blk(n), grid(n), occ(n);
+    for (size_t i = 0; i < n; ++i) {
+        int b = std::min(cand[i], fa.maxThreadsPerBlock);
+        int o = 0;
+        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &o, (const void*)rho_w<W>, b, 0));
+        if (o < 1) o = 1;
+        int k = o;
+        if (cap > 0) {
+            const int wpb = std::max(1, b / 32);
+            k = std::min(o, std::max(1, (cap + wpb - 1) / wpb));
+        }
+        blk[i] = b; occ[i] = o; grid[i] = sm * k;
+    }
+
+    DpManager dp_manager(dp_buffer_size);
+    const bool own_flag = (break_flag_host == nullptr);
+    if (own_flag) init_break_flag();
+    break_rho(true);    // 内核跑完第一个 poll 段就返回
+
+    printf("  [blkab] W=%d SM=%d regs=%d local=%zuB maxThreads=%d cap=%d warps/SM "
+           "points/thread=%d reps=%d\n",
+           W, sm, fa.numRegs, fa.localSizeBytes, fa.maxThreadsPerBlock, cap,
+           prod_batches * W, reps);
+    for (size_t i = 0; i < n; ++i) {
+        const int threads = grid[i] * blk[i];
+        printf("  [blkab] %c: block=%-4d grid=%-4d threads=%-6d occBlocks=%-2d "
+               "warps/SM=%d\n",
+               'A' + (int)i, blk[i], grid[i], threads, occ[i],
+               threads / 32 / (sm ? sm : 1));
+    }
+
+    std::vector<double> sum_tot(n, 0.0), sum_pt(n, 0.0);
+    std::vector<double> lo(n, 1e300), hi(n, 0.0);
+    for (int r = 0; r < reps; ++r) {
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t threads = (uint64_t)grid[i] * blk[i];
+            const uint64_t points = threads * (uint64_t)W * prod_batches;
+            cudaEvent_t start, stop;
+            CHECK_CUDA(cudaEventCreate(&start));
+            CHECK_CUDA(cudaEventCreate(&stop));
+            CHECK_CUDA(cudaEventRecord(start));
+            rho_w<W><<<grid[i], blk[i]>>>();
+            CHECK_CUDA(cudaEventRecord(stop));
+            CHECK_CUDA(cudaEventSynchronize(stop));
+            CHECK_CUDA(cudaDeviceSynchronize());
+            float ms = 0;
+            CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            const double sec = ms / 1000.0;
+            const double total = (double)points / sec;
+            const double pt = total / (double)threads;
+            sum_tot[i] += total;
+            sum_pt[i] += pt;
+            lo[i] = std::min(lo[i], pt);
+            hi[i] = std::max(hi[i], pt);
+            printf("  [blkab] r%d %c block=%-4d grid=%-4d: %11.0f pts/s total, "
+                   "%8.0f pts/s per-thread, %6.2f s\n",
+                   r, 'A' + (int)i, blk[i], grid[i], total, pt, sec);
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        sum_tot[i] /= reps;
+        sum_pt[i] /= reps;
+        printf("  [blkab] MEAN %c block=%-4d grid=%-4d warps/SM=%d: %11.0f pts/s total, "
+               "%8.0f pts/s per-thread, spread %.1f%%\n",
+               'A' + (int)i, blk[i], grid[i], grid[i] * blk[i] / 32 / (sm ? sm : 1),
+               sum_tot[i], sum_pt[i],
+               (reps > 1 && lo[i] > 0) ? (hi[i] / lo[i] - 1.0) * 100.0 : 0.0);
+    }
+    {
+        // 相对第一档 (默认 128) 的差 —— 与上面 spread 比较, 小于噪声底就是没有差别
+        const size_t base = 0;
+        for (size_t i = 0; i < n; ++i) {
+            printf("  [blkab] %c/A: total %+6.2f%%   per-thread %+6.2f%%\n",
+                   'A' + (int)i,
+                   (sum_tot[i] / sum_tot[base] - 1.0) * 100.0,
+                   (sum_pt[i] / sum_pt[base] - 1.0) * 100.0);
+        }
+    }
+
+    break_rho(false);
+    if (own_flag) free_break_flag();
+}
+
 void perf_test_rho_gpu_walkers()
 {
     enable_blocking_sync();
     init_adds_pub_dev();
 
+    printf("  [layout] RhoPoint_dev=%zu B (align %zu) AffinePoint=%zu B uint256_t=%zu B\n",
+           sizeof(RhoPoint_dev), alignof(RhoPoint_dev), sizeof(AffinePoint), sizeof(uint256_t));
+
     int gridSize = 0, blockSize = 0;
     get_optimal_block_size(gridSize, blockSize);
-    int threads = gridSize * blockSize;
+    const int block = blockSize;
 
-    // 状态数组按最大 W 预留: 每线程 W_BENCH_MAX 个 walker
-    constexpr int W_BENCH_MAX = 32;
-    int total_max = threads * W_BENCH_MAX;
+    // 各 W 的寄存器数不同 -> 驻留额度不同 -> grid 不同, 所以状态数组要按
+    // "所有 W 里最大的 grid*block*W" 预留, 而不是按某一个固定 grid 算。
+    int total_max = 0;
+    {
+        int b = block;
+        total_max = std::max(total_max, perf_grid_for<1>(b) * b * 1);
+        b = block; total_max = std::max(total_max, perf_grid_for<2>(b) * b * 2);
+        b = block; total_max = std::max(total_max, perf_grid_for<4>(b) * b * 4);
+        b = block; total_max = std::max(total_max, perf_grid_for<5>(b) * b * 5);
+        b = block; total_max = std::max(total_max, perf_grid_for<6>(b) * b * 6);
+        b = block; total_max = std::max(total_max, perf_grid_for<7>(b) * b * 7);
+        b = block; total_max = std::max(total_max, perf_grid_for<8>(b) * b * 8);
+        b = block; total_max = std::max(total_max, perf_grid_for<16>(b) * b * 16);
+        b = block; total_max = std::max(total_max, perf_grid_for<32>(b) * b * 32);
+        b = block; total_max = std::max(total_max, perf_grid_for<64>(b) * b * 64);
+    }
+    printf("  [res] bench block=%d total_states=%d\n", block, total_max);
     init_RhoStates_dev(total_max, _RSFile2_name);
 
-    const int batches = 20000;
+    // 只打印生产核的资源占用, 不跑基准 (RHO_PROD_ATTRS=1)
+    if (const char* pa = std::getenv("RHO_PROD_ATTRS")) {
+        if (*pa && *pa != '0') {
+            printf("  [prod] 生产核 rho_w<W> 资源占用 (block=128):\n");
+            print_prod_kernel_attrs();
+            CHECK_CUDA(cudaFree(RhoStates_host));
+            RhoStates_host = nullptr;
+            return;
+        }
+    }
+
+    const int batches = [] {
+        const char* e = std::getenv("RHO_PERF_BATCHES");
+        if (e) { int v = std::atoi(e); if (v > 0) return v; }
+        return 20000;
+    }();
+    // 只测并发-单线程吞吐曲线 (RHO_CONC_CURVE=1), 不跑完整 W 扫描
+    if (const char* cc = std::getenv("RHO_CONC_CURVE")) {
+        if (*cc && *cc != '0') {
+            perf_concurrency_curve(block, batches);
+            perf_prod_rho_w_throughput(block);
+            CHECK_CUDA(cudaFree(RhoStates_host));
+            RhoStates_host = nullptr;
+            return;
+        }
+    }
+    // 只测共享内存 vs 全局表的单一变量 A/B (RHO_SHMEM_AB=1)
+    if (const char* sa = std::getenv("RHO_SHMEM_AB")) {
+        if (*sa && *sa != '0') {
+            perf_shared_vs_global(block, batches);
+            CHECK_CUDA(cudaFree(RhoStates_host));
+            RhoStates_host = nullptr;
+            return;
+        }
+    }
+    // 只测 block 尺寸 A/B: same threads (92x128 vs 46x256), RHO_BLOCK_AB=1
+    if (const char* ba = std::getenv("RHO_BLOCK_AB")) {
+        if (*ba && *ba != '0') {
+            perf_block_ab();
+            CHECK_CUDA(cudaFree(RhoStates_host));
+            RhoStates_host = nullptr;
+            return;
+        }
+    }
+    // 只跑指定的 W (逗号分隔), 便于 ncu 只 profile 一个内核 / 快速回归。
+    // 例: RHO_PERF_WS=8  -> 只跑 W=8。
+    // 也支持 "W:grid" 逐项强制 grid, 用来交错 A/B 同一个 W 的不同并发度:
+    //   RHO_PERF_WS=1:138,1:184,1:138,1:184,1:138,1:184
+    // 交错比对比两次独立运行可靠 —— 见 run_perf_rho_w 里关于漂移的说明。
+    {
+        const char* e = std::getenv("RHO_PERF_WS");
+        if (e && *e) {
+            std::string want = e;
+            for (size_t pos = 0; pos < want.size();) {
+                size_t comma = want.find(',', pos);
+                if (comma == std::string::npos) comma = want.size();
+                const std::string tok = want.substr(pos, comma - pos);
+                pos = comma + 1;
+                const size_t colon = tok.find(':');
+                const std::string ws = (colon == std::string::npos) ? tok : tok.substr(0, colon);
+                const int fg = (colon == std::string::npos) ? 0
+                                                            : std::atoi(tok.substr(colon + 1).c_str());
+                const int w = std::atoi(ws.c_str());
+                switch (w) {
+                    case 1:  run_perf_rho_w<1>(block, batches, fg); break;
+                    case 2:  run_perf_rho_w<2>(block, batches, fg); break;
+                    case 4:  run_perf_rho_w<4>(block, batches, fg); break;
+                    case 5:  run_perf_rho_w<5>(block, batches, fg); break;
+                    case 6:  run_perf_rho_w<6>(block, batches, fg); break;
+                    case 7:  run_perf_rho_w<7>(block, batches, fg); break;
+                    case 8:  run_perf_rho_w<8>(block, batches, fg); break;
+                    case 16: run_perf_rho_w<16>(block, batches, fg); break;
+                    case 32: run_perf_rho_w<32>(block, batches, fg); break;
+                    case 64: run_perf_rho_w<64>(block, batches, fg); break;
+                    default: printf("  [warn] RHO_PERF_WS has unsupported W=%d\n", w); break;
+                }
+            }
+            CHECK_CUDA(cudaFree(RhoStates_host));
+            RhoStates_host = nullptr;
+            return;
+        }
+    }
     // 首尾各跑一次 W=1 基线作漂移对照
-    run_perf_rho_w<1>(gridSize, blockSize, batches);
-    run_perf_rho_w<2>(gridSize, blockSize, batches);
-    run_perf_rho_w<4>(gridSize, blockSize, batches);
-    run_perf_rho_w<8>(gridSize, blockSize, batches);
-    run_perf_rho_w<16>(gridSize, blockSize, batches);
-    run_perf_rho_w<32>(gridSize, blockSize, batches);
-    run_perf_rho_w<1>(gridSize, blockSize, batches);
+    run_perf_rho_w<1>(block, batches);
+    run_perf_rho_w<2>(block, batches);
+    run_perf_rho_w<4>(block, batches);
+    run_perf_rho_w<5>(block, batches);
+    run_perf_rho_w<6>(block, batches);
+    run_perf_rho_w<7>(block, batches);
+    run_perf_rho_w<8>(block, batches);
+    run_perf_rho_w<16>(block, batches);
+    run_perf_rho_w<32>(block, batches);
+    run_perf_rho_w<64>(block, batches);
+    run_perf_rho_w<1>(block, batches);
 
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
@@ -1692,6 +3463,130 @@ static bool validate_ok(const char* stage)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// [仅 validate 用] 归约 (reduce_product) 对拍
+//
+// 参考实现故意**不复用生产代码里的 fold256**, 而是独立写一遍教科书算法 (两边
+// 同时错的概率极低)。512 位从高位到低位每步 r = 2r + bit, 与 p 比较后最多减
+// 一次 p。慢 (512 次迭代) 但显然正确。注意比较必须是**三态**的 (见下面 cmp),
+// 早期版本写成 "判到小于还继续往下比", 低位会把 ge 翻回 true, 于是多减一次 p
+// 并让 r[8] 下溢 —— 那才是当时 A/B 报 1024 个 failed 的真凶 (生产代码没错)。
+//
+// 为什么需要构造用例: 随机 512 位乘积下折叠链的进位远达不到上界, 只有构造出的
+// 极端输入才会把进位链推到最满 (a[9] != 0), 从而使折叠的边界逻辑真正被执行。
+//
+// 测试输入:
+//   (a) 随机 512 位乘积             -> 常规路径
+//   (b) prod[0..15] 全 0xFFFFFFFF   -> V 最大, 进位链最满, 解析解 M^2 - 1
+//   (c) hi 全 1 / lo 全 0           -> V = 2^512 - 2^256, 解析解 M^2 - M
+//   (d) hi 全 0 / lo 全 1           -> H == 0, 只有 lo 参与, 解析解 M - 1
+//   (e) 全 0                        -> 0
+// ---------------------------------------------------------------------------
+__host__ __device__ static void ref_mod_p(const uint32_t* v, uint32_t* out)
+{
+    uint32_t r[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}; // 多留一个肢体给 carry
+    for (int bit = 511; bit >= 0; --bit) {
+        uint32_t carry = (v[bit >> 5] >> (bit & 31)) & 1u;
+        for (int i = 0; i < 9; ++i) {
+            uint32_t nc = r[i] >> 31;
+            r[i] = (r[i] << 1) | carry;
+            carry = nc;
+        }
+        // 不变式: 每步 r <= p-1 (r' = 2r + bit <= 2p-1, 至多减一次 p 即回到 < p),
+        // 所以 r[8] 恒为 0; 这里三态比较必须"一旦判定小于就停", 否则低位会把
+        // ge 又翻回 true 从而多减一次 p (早期版本就踩了这个坑)。
+        bool ge;
+        if (r[8] != 0) {
+            ge = true;
+        } else {
+            int cmp = 0;
+            for (int i = 7; i >= 0 && cmp == 0; --i) {
+                if (r[i] > p.limb[i]) cmp = 1;
+                else if (r[i] < p.limb[i]) cmp = -1;
+            }
+            ge = (cmp >= 0);
+        }
+        if (ge) {
+            uint64_t borrow = 0;
+            for (int i = 0; i < 8; ++i) {
+                uint64_t cur = (uint64_t)r[i] - p.limb[i] - borrow;
+                r[i] = (uint32_t)cur;
+                borrow = (cur >> 32) ? 1 : 0;
+            }
+            r[8] = (uint32_t)((uint64_t)r[8] - borrow);
+        }
+    }
+    for (int i = 0; i < 8; ++i) out[i] = r[i];
+}
+
+// 填第 k 类测试输入 (k <= 4 为构造用例, k >= 5 为随机)
+__host__ __device__ static void make_test_product(uint32_t* prod, unsigned int k, unsigned int tid)
+{
+    if (k == 0) {
+        for (int i = 0; i < 16; ++i) prod[i] = 0xFFFFFFFFu;
+    } else if (k == 1) {
+        for (int i = 0; i < 8; ++i) prod[i] = 0u;
+        for (int i = 8; i < 16; ++i) prod[i] = 0xFFFFFFFFu;
+    } else if (k == 2) {
+        for (int i = 0; i < 8; ++i) prod[i] = 0xFFFFFFFFu;
+        for (int i = 8; i < 16; ++i) prod[i] = 0u;
+    } else if (k == 3) {
+        for (int i = 0; i < 16; ++i) prod[i] = 0u;
+    } else {
+        unsigned long long s =
+            0x9E3779B97F4A7C15ull ^ ((unsigned long long)tid * 0xD1B54A32D192ED03ull);
+        for (int i = 0; i < 16; ++i) {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            prod[i] = (uint32_t)s;
+        }
+    }
+}
+
+__global__ void validate_reduce_product()
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t prod[16];
+    // 奇数线程走随机输入 (常态路径), 偶数线程轮流走 4 个构造用例
+    make_test_product(prod, (tid & 1u) ? 5u : ((tid >> 1) & 3u), tid);
+
+    const uint256_t got = reduce_product(prod);
+    uint32_t want[8];
+    ref_mod_p(prod, want);
+
+    // 逐肢体断言, 这样 DEV_ASSERT 打印出来的条件能直接指出是哪个肢体错了
+    for (int i = 0; i < 8; ++i) DEV_ASSERT(got.limb[i] == want[i]);
+    DEV_ASSERT(!is_ge(got, p)); // 归约结果必须 < p
+}
+
+// host 侧对拍 + 差异打印 (设备端 printf 会互相交错, 不适合诊断)
+static bool host_check_reduce_product()
+{
+    bool all_ok = true;
+    for (unsigned int k = 0; k < 6; ++k) {
+        uint32_t prod[16];
+        make_test_product(prod, k, 12345u + k);
+        const uint256_t got = reduce_product(prod);
+        uint32_t want[8];
+        ref_mod_p(prod, want);
+        bool ok = true;
+        for (int i = 0; i < 8; ++i)
+            if (got.limb[i] != want[i]) ok = false;
+        if (is_ge(got, p)) ok = false;
+        if (!ok) all_ok = false;
+
+        printf("  [case %u]%s  prod=", k, ok ? " ok  " : " BAD ");
+        for (int i = 15; i >= 0; --i) printf("%08x", prod[i]);
+        printf("\n           new  =");
+        for (int i = 7; i >= 0; --i) printf("%08x", got.limb[i]);
+        printf("\n           want =");
+        for (int i = 7; i >= 0; --i) printf("%08x", want[i]);
+        printf("\n");
+    }
+    return all_ok;
+}
+
 void validate_test()
 {
     enable_blocking_sync();
@@ -1707,6 +3602,16 @@ void validate_test()
         if (!validate_ok(name)) exit(EXIT_FAILURE);
     };
 
+    // 归约 (reduce_product) 与独立教科书参考对拍, 含 4 个构造极端输入。
+    // host 侧先跑, 这样失败时能打印完整诊断 (设备端 printf 会交错)。
+    if (!host_check_reduce_product()) {
+        printf("validate FAILED: host_check_reduce_product\n");
+        exit(EXIT_FAILURE);
+    }
+    validate_reduce_product<<<8, 256>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    stage_ok("validate_reduce_product");
+
     // 单 walker 步进 vs 链后继对拍 + DP 缓冲写入/溢出路径
     validate_multi<<<10, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -1717,11 +3622,11 @@ void validate_test()
     CHECK_CUDA(cudaDeviceSynchronize());
     stage_ok("validate_safegcd");
 
-    // 仿射点加 (G / G+G / G+2G / G+(-G)) 与 distinguishable 判据
-    // (含测试链尾槽那个真实 DP 样点的索引核对)
-    validate_1<<<1, 1>>>();
+    // 多 walker 点加核心 (三个分支: 一般加法 / 倍点 / 无穷远) + 批量求逆与逐点
+    // 对拍 + distinguishable 判据 (含测试链尾槽那个真实 DP 样点的索引核对)
+    validate_point_add<<<1, 1>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
-    stage_ok("validate_1");
+    stage_ok("validate_point_add");
 
     // 多 walker 批量求逆对拍: 沿同一测试链, 连续 W 个状态批量步进一步,
     // 逐个与单 walker 后继对拍
@@ -1744,6 +3649,8 @@ void validate_test()
     for (int i = 0; i < 4096; i++) {
         RhoPoint r, r2;
         r.rand();
+        // 诊断: rand() 造出来的 (x,m,n) 三元组是否自洽
+        HOST_ASSERT(check(ctx, &r.x, r.m, r.n));
         RhoPoint_dev t;
         t.from(r);
         DpBuffer buffer;
@@ -1762,18 +3669,30 @@ void validate_test()
     int points = 100 * 960;
     const std::string fn_ = "D:\\test_rs.txt";
     const std::string fn2_ = "D:\\test_rs2.txt";
+    // ⚠ 先挡掉 RHO_PERF_NOLOAD。那个开关让 init_RhoStates_dev 走"合成点"快路,
+    //   合成出来的 (m,n,x) 不是 m*G+n*MVP, 于是下面的 check() 会 100% 失败,
+    //   报出来却是 cuda.cu 的一个 HOST_ASSERT —— 排查这个假故障花掉的时间,
+    //   全部是因为某个 shell 里残留了 RHO_PERF_NOLOAD=1。宁可直接拒绝跑。
+    if (const char* nl = std::getenv("RHO_PERF_NOLOAD"); nl && *nl && *nl != '0') {
+        printf("[validate] RHO_PERF_NOLOAD is set: init_RhoStates_dev will produce synthetic\n"
+               "[validate] points that are NOT on the curve, so every check() below must fail.\n"
+               "[validate] unset it and rerun (cmd: 'set RHO_PERF_NOLOAD=').\n");
+        exit(EXIT_FAILURE);
+    }
     init_RhoStates_dev(points, fn_);
     save_RhoStates_dev(points, fn_);
     std::vector<RhoState> rsv, rsv2;
     rsv.resize(points);
     rsv2.resize(points);
-    bool b = loadRhoState(rsv.data(), points, fn_);
+    int n1 = loadRhoState(rsv.data(), points, fn_);
+    HOST_ASSERT(n1 == points);
     // 清理资源
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
     init_RhoStates_dev(points, fn_);
     save_RhoStates_dev(points, fn2_);
-    loadRhoState(rsv2.data(), points, fn2_);
+    int n2 = loadRhoState(rsv2.data(), points, fn2_);
+    HOST_ASSERT(n2 == points);
     for (int i = 0; i < points; i++) {
         HOST_ASSERT(check(ctx, &rsv[i].x, rsv[i].m, rsv[i].n));
         HOST_ASSERT(memcmp(&rsv[i], &rsv2[i], sizeof(rsv[i])) == 0);
