@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -1763,106 +1762,29 @@ void init_RhoStates_dev(int total_points, const std::string& name)
     static std::vector<RhoPoint_dev> staging;
     staging.resize(total_points);
 
-    // RHO_PERF_NOLOAD=1: 只用于性能对拍 —— 跳过那个 49MB 文本状态文件的加载 +
-    // 缺口填充, 改用确定性伪随机填充。要点:
-    //   * 同样的 total_points 每次得到完全相同的输入 -> A/B 两臂输入严格一致;
-    //   * 坐标强制 < 2^255 < p, 保证域运算的前提 (操作数 < p) 成立, 且非 0;
-    //   * 不调用 create()/ECMult, 启动开销为 0。
-    // 代价: 走步数据与真实状态不同, 所以这些点数**只能在同一份日志内部前后对比**,
-    // 历史日志里的绝对值不可与之比较。
-    // ⚠ 这些点**不在曲线上**, 任何 check()/对拍都会全失败。所以 validate_test()
-    //   开头会主动拒绝在这个开关打开时运行 —— 否则会报成一个莫名其妙的
-    //   HOST_ASSERT (就这么白查了半天)。用完记得 unset。
-    if (const char* nl = std::getenv("RHO_PERF_NOLOAD"); nl && *nl && *nl != '0') {
-        printf("[RHO_PERF_NOLOAD] init_RhoStates_dev: synthetic NON-curve points in use "
-               "(perf A/B only)\n");
-        uint64_t s = 0x9E3779B97F4A7C15ull ^ ((uint64_t)total_points * 0xD1B54A32D192ED03ull);
-        auto next = [&s]() -> uint32_t {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            return (uint32_t)(s >> 32);
-        };
-        for (int i = 0; i < total_points; i++) {
-            RhoPoint_dev& d = staging[i];
-            for (int k = 0; k < 8; ++k) d.m.limb[k] = next();
-            for (int k = 0; k < 8; ++k) d.n.limb[k] = next();
-            for (int k = 0; k < 8; ++k) d.x.x.limb[k] = next();
-            for (int k = 0; k < 8; ++k) d.x.y.limb[k] = next();
-            d.x.x.limb[7] &= 0x7FFFFFFFu; // 强制 < 2^255 < p
-            d.x.y.limb[7] &= 0x7FFFFFFFu;
-            if (is_zero(d.x.x)) d.x.x.limb[0] = 1;
-            if (is_zero(d.x.y)) d.x.y.limb[0] = 1;
-            d.x.infinity = false;
-        }
-        CHECK_CUDA(cudaMemcpy(RhoStates_host, staging.data(), total_points * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
-        return;
-    }
-
     std::vector<RhoState> rsv;
     rsv.resize(total_points);
-    auto t_phase = std::chrono::steady_clock::now();
     int num = loadRhoState(rsv.data(), total_points, name);
     if (num < 0) num = 0;
-    if (num > total_points) num = total_points;
-    const double parse_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_phase).count();
 
     // ---------------- 缺口补点 ----------------
     // 缺口槽位各造一条独立记录 (RhoPoint::rand()): ρ 走步的步长下标
-    // idx = (unsigned char)s.x.limb[0] 由点自身的 x 决定, 所以起点必须逐点不同。
-    // 成本: rand() 单线程 0.385 ms/点 (2x MakeNewKey + 2x ecmult), 942,080 个缺口
-    // 串行要 363 s; 这里唯一能做的就是并行 (16 核 ~50 s), 数学上与串行等价。
+    // idx = (unsigned char)s.x.limb[0] 由点自身的 x 决定, 所以起点必须逐点不同,
+    // 绝不能复用已加载的点 (起点相同 => 轨迹逐点重合 => 产出记录完全相同)。
     // 缺口是一次性的: 本轮 save_RhoStates_dev() 会整体写回, 下一轮缺口为 0。
-    for (int i = 0; i < num; i++) {
-        staging[i].from(rsv[i]);
+    for (int i = 0; i < total_points; i++) {
+        if (i < num) {
+            staging[i].from(rsv[i]);
+        } else {
+            RhoPoint r;
+            r.rand();
+            staging[i].from(r);
+        }
     }
 
-    double fill_s = 0.0;
-    const int shortfall = total_points - num;
-    if (shortfall > 0) {
-        unsigned hw = std::thread::hardware_concurrency();
-        if (hw == 0) hw = 1;
-        if ((unsigned)shortfall < hw) hw = (unsigned)shortfall;
+    std::cout << "[RHO_INIT] total_points=" << total_points << " loaded=" << num << std::endl;
 
-        std::cout << "[RHO_INIT] shortfall " << shortfall << " pts, filling with " << hw
-                  << " CPU threads via RhoPoint::rand() (0.385 ms/pt single-threaded -> "
-                  << (shortfall * 0.385 / 1000.0) << " s serial) ..." << std::endl;
-
-        const auto t_fill = std::chrono::steady_clock::now();
-        std::atomic<int> next_idx{num};
-        std::atomic<int> n_done{0};
-        auto fill_worker = [&]() {
-            for (;;) {
-                const int i = next_idx.fetch_add(1, std::memory_order_relaxed);
-                if (i >= total_points) break;
-                RhoPoint r;
-                r.rand();
-                staging[i].from(r); // 每个 i 只被一个线程写 -> 无数据竞争
-                const int done_n = n_done.fetch_add(1, std::memory_order_relaxed) + 1;
-                if ((done_n % 100000) == 0) {
-                    const double el = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - t_fill).count();
-                    std::cout << "[RHO_INIT]   " << done_n << " / " << shortfall << "  "
-                              << el << " s  (" << (el * 1000.0 / done_n) << " ms/pt)"
-                              << std::endl;
-                }
-            }
-        };
-        std::vector<std::thread> pool;
-        pool.reserve(hw > 1 ? hw - 1 : 0);
-        for (unsigned t = 1; t < hw; ++t) pool.emplace_back(fill_worker);
-        fill_worker();
-        for (std::thread& th : pool) th.join();
-        fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fill).count();
-    }
-
-    std::cout << "[RHO_INIT] total_points=" << total_points << " loaded=" << num
-              << ": parse " << parse_s << " s + fill " << fill_s << " s" << std::endl;
-
-    t_phase = std::chrono::steady_clock::now();
     CHECK_CUDA(cudaMemcpy(RhoStates_host, staging.data(), total_points * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
-    std::cout << "[RHO_INIT] H2D " << total_points * sizeof(RhoPoint_dev) / (1024.0 * 1024.0)
-              << " MiB in "
-              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_phase).count()
-              << " ms" << std::endl;
 }
 
 static inline void hex_encode(char* dst, const unsigned char* src, int n)
@@ -3268,15 +3190,6 @@ void validate_test()
     int points = 100 * 960;
     const std::string fn_ = "D:\\test_rs.txt";
     const std::string fn2_ = "D:\\test_rs2.txt";
-    // ⚠ 先挡掉 RHO_PERF_NOLOAD: 它让 init_RhoStates_dev 走"合成点"快路, 那些点
-    //   不在曲线上, 下面每个 check() 都必然失败, 报出来却是本文件的 HOST_ASSERT。
-    //   宁可直接拒绝跑, 也不留一个要被当成 cuda.cu 的 bug 去排查的假故障。
-    if (const char* nl = std::getenv("RHO_PERF_NOLOAD"); nl && *nl && *nl != '0') {
-        printf("[validate] RHO_PERF_NOLOAD is set: init_RhoStates_dev will produce synthetic\n"
-               "[validate] points that are NOT on the curve, so every check() below must fail.\n"
-               "[validate] unset it and rerun (cmd: 'set RHO_PERF_NOLOAD=').\n");
-        exit(EXIT_FAILURE);
-    }
     init_RhoStates_dev(points, fn_);
     save_RhoStates_dev(points, fn_);
     std::vector<RhoState> rsv, rsv2;
