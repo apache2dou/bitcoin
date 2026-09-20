@@ -1586,7 +1586,7 @@ void perf_test();
 int main(int argc, char* argv[])
 {
     // 运行模式：1=仅CPU单线程(无CUDA) 2=multiple=1,CPU 1/4核 3=multiple=2,CPU 1/2核(默认)
-    //           4=blockSize用cudaOccupancyMaxPotentialBlockSize,CPU 核数-2
+    //           4=CPU 核数-2 线程(blockSize 与模式无关, 见 cuda.cu 的 get_optimal_block_size)
     // 用法: test_bitcoin 3  或  test_bitcoin.exe -m 4
     for (int i = 1; i < argc; ++i) {
         int m = 0;

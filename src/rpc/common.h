@@ -31,7 +31,8 @@ public:
 // 1 = 仅CPU单线程，不启动CUDA
 // 2 = CUDA启动，每核心1线程(multiple=1)，CPU启动 1/4 核数线程
 // 3 = CUDA启动，每核心2线程(multiple=2)，CPU启动 1/2 核数线程（默认）
-// 4 = CUDA启动，blockSize 用 cudaOccupancyMaxPotentialBlockSize 结果，CPU启动 核数-2 线程
+// 4 = CUDA启动，CPU启动 核数-2 线程（blockSize 与运行模式无关, 见 cuda.cu 的
+//     get_optimal_block_size）
 extern int g_run_mode;
 
 bool rho_F(secp256k1_context* ctx, RhoState& s);
