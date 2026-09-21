@@ -16,6 +16,7 @@
 //        - m/n 标量的 大端 <-> 肢体 转换与清零
 //        - pubkey_combine 从无穷远点开始的第一次冗余点加
 //      并且每个 walker 每步只做 3 次域乘, 模逆由整批平摊 (每点 1/W 次)。
+//      点倍 (A.x == X) 只出现在整批求逆失败后退回的逐点路径里, 见 rho_affine_add。
 //
 // 说明: libsecp256k1 内部头文件里的所有函数都是 static/inline, 会被直接内联
 //       进本翻译单元, 不会与已链接的 libsecp256k1 静态库产生符号冲突。
@@ -400,6 +401,16 @@ struct RhoAffineState {
 //   x3 = λ² - X - A.x
 //   y3 = λ(X - x3) - Y
 //
+// A.x == X 时上式分母为 0 (概率约 2^-256), 必须换成点倍公式:
+//
+//   λ  = 3X² / (2Y)
+//   x3 = λ² - 2X
+//   y3 = λ(X - x3) - Y
+//
+// 批量路径按一般加法展开 (热路径上不做这个判定), 所以只在 A.x != X 时成立;
+// 一旦某个分母是 0, fe_batch_inv 让整批失效, 由 rho_affine_add 逐点重算, 点倍
+// 补在那里。
+//
 // 入参 X, Y 必须已是 magnitude 1。
 // 步进结束时 X 全规约 (X < p), 所以 X.n[0] 的低 32 位就是 x mod 2^32, 可直接
 // 用于下一轮的索引; Y 只做 normalize_weak (mag 1), 足够满足下一轮的约束。
@@ -407,6 +418,82 @@ struct RhoAffineState {
 // 总计: 3 次 fe_mul/sqr + 1 次 modinv64_var (批量路径里整批共用 1 次) + 若干
 //       fe_add/negate/normalize。
 // ---------------------------------------------------------------------------
+
+// 单点仿射点加, 自己求一次逆:
+//   A.x != X -> 一般加法 (上面的公式)
+//   A.x == X -> 点倍
+// 只服务于 rho_affine_step_batch 的零分母兜底 (见那里); 热路径走批量求逆,
+// 不做这个判定, 所以这里的分支不影响每点成本。
+inline void rho_affine_add(secp256k1_fe& X, secp256k1_fe& Y, const RhoAffineAdd& A)
+{
+    secp256k1_fe dx;
+
+    // dx = A.x - X, magnitude 1 + 1 -> 3
+    secp256k1_fe_negate(&dx, &X, 1);
+    secp256k1_fe_add(&dx, &A.x);
+
+    if (secp256k1_fe_normalizes_to_zero_var(&dx)) {
+        // 概率约 2^-256: A.x == X, 必须走点倍分支
+        // (若再发生 Y == -A.y 则结果应为无穷远点; 在 rho 中这同样不可达,
+        //  此处按点倍公式处理, 不做额外特判)
+        secp256k1_fe inv, lam, t, nx, ny;
+
+        secp256k1_fe two_y = Y;
+        secp256k1_fe_add(&two_y, &Y);           // 2Y            (mag 2)
+        secp256k1_fe_inv_var(&inv, &two_y);     // 1/(2Y)        (mag 1)
+        secp256k1_fe_sqr(&lam, &X);             // X²            (mag 1)
+        secp256k1_fe_mul_int(&lam, 3);          // 3X²           (mag 3)
+        secp256k1_fe_mul(&lam, &lam, &inv);     // λ = 3X²/(2Y)  (mag 1)
+
+        // x3 = λ² - 2X
+        secp256k1_fe_negate(&t, &X, 1);         // -X            (mag 2)
+        secp256k1_fe_add(&t, &t);               // -2X           (mag 4)
+        secp256k1_fe_sqr(&nx, &lam);            // λ²            (mag 1)
+        secp256k1_fe_add(&nx, &t);              // λ² - 2X       (mag 5)
+        secp256k1_fe_normalize_var(&nx);
+
+        // y3 = λ(X - x3) - Y
+        secp256k1_fe_negate(&t, &nx, 1);        // -x3           (mag 2)
+        secp256k1_fe_add(&t, &X);               // X - x3        (mag 3)
+        secp256k1_fe_mul(&ny, &t, &lam);        // λ(X - x3)     (mag 1)
+        secp256k1_fe_negate(&t, &Y, 1);         // -Y            (mag 2)
+        secp256k1_fe_add(&ny, &t);              // y3            (mag 3)
+        secp256k1_fe_normalize_weak(&ny);
+
+        X = nx;
+        Y = ny;
+        return;
+    }
+
+    secp256k1_fe dy;
+    // dy = A.y - Y, magnitude 1 + 1 -> 3
+    secp256k1_fe_negate(&dy, &Y, 1);
+    secp256k1_fe_add(&dy, &A.y);
+
+    secp256k1_fe inv, lam, nx, ny, t;
+
+    secp256k1_fe_inv_var(&inv, &dx);            // 1/(A.x - X)   (mag 1)
+    secp256k1_fe_mul(&lam, &dy, &inv);          // λ             (mag 1)
+
+    // x3 = λ² - X - A.x
+    secp256k1_fe_sqr(&nx, &lam);                // λ²            (mag 1)
+    secp256k1_fe_negate(&t, &X, 1);             // -X            (mag 2)
+    secp256k1_fe_add(&nx, &t);                  //               (mag 3)
+    secp256k1_fe_negate(&t, &A.x, 1);           // -A.x          (mag 2)
+    secp256k1_fe_add(&nx, &t);                  // x3            (mag 5)
+    secp256k1_fe_normalize_var(&nx);
+
+    // y3 = λ(X - x3) - Y
+    secp256k1_fe_negate(&t, &nx, 1);            // -x3           (mag 2)
+    secp256k1_fe_add(&t, &X);                   // X - x3        (mag 3)
+    secp256k1_fe_mul(&ny, &t, &lam);            // λ(X - x3)     (mag 1)
+    secp256k1_fe_negate(&t, &Y, 1);             // -Y            (mag 2)
+    secp256k1_fe_add(&ny, &t);                  // y3            (mag 3)
+    secp256k1_fe_normalize_weak(&ny);
+
+    X = nx;
+    Y = ny;
+}
 
 // 一次性把 adds_pub[0][*] 转换成普通域 + 肢体形式
 void rho_affine_init_adds()
@@ -489,8 +576,8 @@ inline uint64_t rho_affine_dp(const RhoAffineState& s)
 // W == 1 时就是一次普通求逆。
 //
 // 某个 d[i] == 0 时整条前缀积为 0 (域无零因子), 返回 false。这样 W 次零检查
-// 合并成了整批一次 (对积检查), 概率仍约 W * 2^-256; 调用方不再为它保留逐点
-// 回退路径 (见 rho_affine_step_batch)。
+// 合并成了整批一次 (对积检查), 概率仍约 W * 2^-256; 调用方此时退回逐点路径
+// (见 rho_affine_step_batch), 点倍分支在那条路上。
 template <int W>
 bool fe_batch_inv(secp256k1_fe (&inv)[W], const secp256k1_fe (&d)[W])
 {
@@ -518,9 +605,9 @@ bool fe_batch_inv(secp256k1_fe (&inv)[W], const secp256k1_fe (&d)[W])
 // rs 的 136 字节 —— rs 只有 DP 判定 (概率 2^-40) 和存档 (每 2^30 步) 才需要,
 // 每步全量写回是纯浪费 (实测占每点成本的 1/3)。
 //
-// 零分母 (概率约 W * 2^-256) 由 fe_batch_inv 对整批一次检出。该情形不可达,
-// 不再为它维护一条逐点回退路径 (原来会退到单 walker 的点倍分支), 检出即放弃
-// 本步。
+// 零分母 (概率约 W * 2^-256) 由 fe_batch_inv 对整批一次检出: 那是 A.x == X 的
+// walker, 该按点倍算, 整批共用一个分母的前提不成立。这一批改走逐点路径
+// (rho_affine_add 各自求逆, 点倍分支在那里), 代价只落在这一批上, 热路径无分支。
 template <int W>
 inline uint32_t rho_affine_step_batch(RhoAffineState (&st)[W])
 {
@@ -538,34 +625,42 @@ inline uint32_t rho_affine_step_batch(RhoAffineState (&st)[W])
     }
 
     secp256k1_fe inv[W];
-    if (!fe_batch_inv<W>(inv, dx)) {
-        // dx 里有 0 (A.x == X, 概率约 W * 2^-256): inv[] 未写出, 直接放弃本步
-        // (状态不动, 也不报 DP)。该情形不可达, 不再为它保留逐点回退路径。
-        return 0;
-    }
+    if (fe_batch_inv<W>(inv, dx)) {
+        // 常规路径: 整批只求一次逆, 逐 walker 套一般加法公式
+        for (int i = 0; i < W; ++i) {
+            const RhoAffineAdd& A = g_affine_adds[t[i]];
+            secp256k1_fe lam, nx, ny, tt;
 
-    for (int i = 0; i < W; ++i) {
-        const RhoAffineAdd& A = g_affine_adds[t[i]];
-        secp256k1_fe lam, nx, ny, tt;
+            secp256k1_fe_mul(&lam, &dy[i], &inv[i]);    // λ             (mag 1)
+            secp256k1_fe_sqr(&nx, &lam);                // λ²            (mag 1)
+            secp256k1_fe_negate(&tt, &st[i].X, 1);
+            secp256k1_fe_add(&nx, &tt);                 //               (mag 3)
+            secp256k1_fe_negate(&tt, &A.x, 1);
+            secp256k1_fe_add(&nx, &tt);                 // x3            (mag 5)
+            secp256k1_fe_normalize_var(&nx);
+            secp256k1_fe_negate(&tt, &nx, 1);
+            secp256k1_fe_add(&tt, &st[i].X);            // X - x3        (mag 3)
+            secp256k1_fe_mul(&ny, &tt, &lam);           // λ(X - x3)     (mag 1)
+            secp256k1_fe_negate(&tt, &st[i].Y, 1);
+            secp256k1_fe_add(&ny, &tt);                 // y3            (mag 3)
+            secp256k1_fe_normalize_weak(&ny);
 
-        secp256k1_fe_mul(&lam, &dy[i], &inv[i]);    // λ             (mag 1)
-        secp256k1_fe_sqr(&nx, &lam);                // λ²            (mag 1)
-        secp256k1_fe_negate(&tt, &st[i].X, 1);
-        secp256k1_fe_add(&nx, &tt);                 //               (mag 3)
-        secp256k1_fe_negate(&tt, &A.x, 1);
-        secp256k1_fe_add(&nx, &tt);                 // x3            (mag 5)
-        secp256k1_fe_normalize_var(&nx);
-        secp256k1_fe_negate(&tt, &nx, 1);
-        secp256k1_fe_add(&tt, &st[i].X);            // X - x3        (mag 3)
-        secp256k1_fe_mul(&ny, &tt, &lam);           // λ(X - x3)     (mag 1)
-        secp256k1_fe_negate(&tt, &st[i].Y, 1);
-        secp256k1_fe_add(&ny, &tt);                 // y3            (mag 3)
-        secp256k1_fe_normalize_weak(&ny);
-
-        st[i].X = nx;
-        st[i].Y = ny;
-        add_mod_N(st[i].m, A.m);
-        add_mod_N(st[i].n, A.n);
+            st[i].X = nx;
+            st[i].Y = ny;
+            add_mod_N(st[i].m, A.m);
+            add_mod_N(st[i].n, A.n);
+        }
+    } else {
+        // dx 里有 0 (A.x == X, 概率约 W * 2^-256): 那个 walker 该按点倍算, 整批
+        // 共用分母的前提不成立, inv[] 也没写出 —— 整批退回逐点路径, 每个 walker
+        // 自己求一次逆 (点倍分支在 rho_affine_add 里)。
+        // 这条路径同样逐点维护 X 全规约, 后面的 DP 判定照常可用。
+        for (int i = 0; i < W; ++i) {
+            const RhoAffineAdd& A = g_affine_adds[t[i]];
+            rho_affine_add(st[i].X, st[i].Y, A);
+            add_mod_N(st[i].m, A.m);
+            add_mod_N(st[i].n, A.n);
+        }
     }
 
     // DP 判定在 fe 域做 (rho_affine_dp 已与 distinguishable 对拍过), 不再经过
@@ -855,6 +950,119 @@ void validate_rho_affine()
     std::cout << "rho-affine batch selfcheck (W=2/4/8/16/32 vs lib public API): "
               << (batch_ok ? "PASS" : "FAIL") << std::endl;
     if (!batch_ok) exit(EXIT_FAILURE);
+
+    // 点倍分支 (A.x == X) 的构造测试。
+    //
+    // 随机游走命中它的概率约 2^-256, 逐步自检不可能触发, 所以手工构造:
+    //
+    //   (a) 直接喂 rho_affine_add: X, Y 取表项 j 的点, A 也取表项 j 的点 (P + P),
+    //       期望 2P。库公开 API 的 combine 走 Brier-Joye 统一公式, 支持倍点。
+    //
+    //   (b) 端到端喂 rho_affine_step_batch<2>: walker 的加数表项由 X 的首字节决定,
+    //       所以先把槽位 k = P.x 首字节 的 x 换成 P.x (用完立即还原), 那个 walker
+    //       选中的 A 就满足 A.x == X —— 分母为 0, 整批求逆失败, 走进逐点兜底路径。
+    //       同批的第二个 walker 是普通加法, 用来验证兜底路径对非退化 walker 也
+    //       算对, 而不是靠 "整批跳过" 蒙过去。
+    //
+    //   m/n 一律从 0 起, 所以期望值就是各自加数表项的一次累加, 不必做 mod N 参考运算。
+    bool doubling_ok = true;
+    {
+        constexpr int kJ = 7;   // 倍点用的表项: P = 表项 j 的点
+        // P 会选中的槽位, 也是 (b) 里要被覆盖的那一项
+        const unsigned k = (unsigned)(g_affine_adds[kJ].x.n[0] & 0xFF);
+
+        // (a) 单点: P + P = 2P
+        {
+            secp256k1_fe X = g_affine_adds[kJ].x;
+            secp256k1_fe Y = g_affine_adds[kJ].y;
+            rho_affine_add(X, Y, g_affine_adds[kJ]);
+
+            RhoAffineState s;
+            s.X = X;
+            s.Y = Y;
+            memset(s.m, 0, sizeof(s.m));
+            memset(s.n, 0, sizeof(s.n));
+            RhoPoint rp;
+            rho_affine_store(s, rp);
+
+            // combine 会先 memset 输出, 所以输出不能是输入之一
+            secp256k1_pubkey p = adds_pub[0][kJ].x, q = p, want;
+            secp256k1_pubkey* ins[2] = {&p, &q};
+            if (!secp256k1_ec_pubkey_combine(ctx, &want, ins, 2) ||
+                memcmp(rp.x.data, want.data, sizeof(want.data)) != 0) {
+                std::cout << "rho-affine doubling: P + P mismatch" << std::endl;
+                doubling_ok = false;
+            }
+        }
+
+        // (b) 端到端: 覆盖槽位 k 的 x, 让 walker 0 的 dx 为 0
+        const RhoAffineAdd saved_k = g_affine_adds[k];
+        g_affine_adds[k].x = g_affine_adds[kJ].x;   // A.x == X; A.y / A.m / A.n 不动
+
+        // 普通 walker 的起点: 表项 j1, 要求它的槽位既不是 k (否则加数也被覆盖),
+        // 也不是 j1 自己 (否则它也变成倍点)
+        int j1 = 0;
+        while (j1 < 256) {
+            const unsigned s = (unsigned)(g_affine_adds[j1].x.n[0] & 0xFF);
+            if (s != k && s != (unsigned)j1) break;
+            ++j1;
+        }
+
+        if (j1 == 256) {
+            g_affine_adds[k] = saved_k;
+            std::cout << "rho-affine doubling: 找不到可用的普通表项" << std::endl;
+            doubling_ok = false;
+        } else {
+            const unsigned t1 = (unsigned)(g_affine_adds[j1].x.n[0] & 0xFF);
+
+            RhoAffineState st[2];
+            st[0].X = g_affine_adds[kJ].x;      // A.x == X -> 倍点
+            st[0].Y = g_affine_adds[kJ].y;
+            st[1].X = g_affine_adds[j1].x;      // 普通加法
+            st[1].Y = g_affine_adds[j1].y;
+            for (int i = 0; i < 2; ++i) {
+                memset(st[i].m, 0, sizeof(st[i].m));
+                memset(st[i].n, 0, sizeof(st[i].n));
+            }
+
+            rho_affine_step_batch<2>(st);
+            g_affine_adds[k] = saved_k;         // 立即还原
+
+            // 期望: walker 0 = 2P, 标量取槽位 k 的 (覆盖只动了 x);
+            //       walker 1 = 表项 j1 的点 + 表项 t1 的点, 标量取表项 t1 的
+            secp256k1_pubkey p0 = adds_pub[0][kJ].x, q0 = p0, want0;
+            secp256k1_pubkey p1 = adds_pub[0][j1].x, want1;
+            secp256k1_pubkey* ins0[2] = {&p0, &q0};
+            secp256k1_pubkey* ins1[2] = {&p1, &adds_pub[0][t1].x};
+            const unsigned tidx[2] = {k, t1};
+            const secp256k1_pubkey* want[2] = {&want0, &want1};
+            if (!secp256k1_ec_pubkey_combine(ctx, &want0, ins0, 2) ||
+                !secp256k1_ec_pubkey_combine(ctx, &want1, ins1, 2)) {
+                std::cout << "rho-affine doubling: lib reference failed" << std::endl;
+                doubling_ok = false;
+            }
+
+            for (int i = 0; i < 2 && doubling_ok; ++i) {
+                RhoPoint rp;
+                rho_affine_store(st[i], rp);
+                unsigned char be_m[32], be_n[32];
+                limbs_to_be32(be_m, st[i].m);
+                limbs_to_be32(be_n, st[i].n);
+                const bool x_ok = memcmp(rp.x.data, want[i]->data, sizeof(want[i]->data)) == 0;
+                const bool m_ok = memcmp(be_m, adds_pub[0][tidx[i]].m, sizeof(be_m)) == 0;
+                const bool n_ok = memcmp(be_n, adds_pub[0][tidx[i]].n, sizeof(be_n)) == 0;
+                if (!x_ok || !m_ok || !n_ok) {
+                    std::cout << "rho-affine doubling: walker " << i << " mismatch"
+                              << " (x/m/n ok = " << x_ok << "/" << m_ok << "/" << n_ok << ")"
+                              << std::endl;
+                    doubling_ok = false;
+                }
+            }
+        }
+    }
+    std::cout << "rho-affine doubling (P+P; batch fallback vs lib public API): "
+              << (doubling_ok ? "PASS" : "FAIL") << std::endl;
+    if (!doubling_ok) exit(EXIT_FAILURE);
 }
 
 // ---------------------------------------------------------------------------
