@@ -7,15 +7,15 @@
 //      secp256k1_ec_seckey_tweak_add) 做点加的性能基准, 与 cuda.cu 中的
 //      perf_test_cpu / perf_test_gpu 对照。
 //
-//   2) rho_affine_add / rho_affine_step / perf_test_rho_affine
+//   2) rho_affine_FW<W> / rho_affine_step_batch<W> (同线程多 walker 批量求逆)
 //      直接使用 libsecp256k1【内部】的 5x52 域实现 (field_impl.h) 手写的
-//      "干净" 仿射点加。与公开 API 路径相比, 它去掉了:
+//      "干净" 仿射点加, 同一线程内 W 个 walker 的模逆凑成一批只求一次。
+//      与公开 API 路径相比, 它去掉了:
 //        - ge_storage(64B) <-> 5x52 的序列化往返
 //        - 常量时间的退化处理 (fe_half / cmov / 多次 negate)
 //        - m/n 标量的 大端 <-> 肢体 转换与清零
 //        - pubkey_combine 从无穷远点开始的第一次冗余点加
-//      并且每一步只做 3 次域乘 + 1 次 modinv64_var, 这正是 rho 随机游走的
-//      最小工作量。
+//      并且每个 walker 每步只做 3 次域乘, 模逆由整批平摊 (每点 1/W 次)。
 //
 // 说明: libsecp256k1 内部头文件里的所有函数都是 static/inline, 会被直接内联
 //       进本翻译单元, 不会与已链接的 libsecp256k1 静态库产生符号冲突。
@@ -394,89 +394,19 @@ struct RhoAffineState {
 };
 
 // ---------------------------------------------------------------------------
-// 核心: 仿射点加 (X, Y) += (A.x, A.y)
+// 仿射点加 (X, Y) += (A.x, A.y) 的公式 —— rho_affine_step_batch 里逐 walker 展开:
 //
 //   λ  = (A.y - Y) / (A.x - X)
 //   x3 = λ² - X - A.x
 //   y3 = λ(X - x3) - Y
 //
 // 入参 X, Y 必须已是 magnitude 1。
-// 返回时 X 全规约 (X < p), 所以 X.n[0] 的低 32 位就是 x mod 2^32, 可直接用于
-// 下一轮的索引; Y 只做 normalize_weak (mag 1), 足够满足下一轮的约束。
+// 步进结束时 X 全规约 (X < p), 所以 X.n[0] 的低 32 位就是 x mod 2^32, 可直接
+// 用于下一轮的索引; Y 只做 normalize_weak (mag 1), 足够满足下一轮的约束。
 //
-// 总计: 3 次 fe_mul/sqr + 1 次 modinv64_var + 若干 fe_add/negate/normalize。
+// 总计: 3 次 fe_mul/sqr + 1 次 modinv64_var (批量路径里整批共用 1 次) + 若干
+//       fe_add/negate/normalize。
 // ---------------------------------------------------------------------------
-inline void rho_affine_add(secp256k1_fe& X, secp256k1_fe& Y, const RhoAffineAdd& A)
-{
-    secp256k1_fe dx;
-
-    // dx = A.x - X, magnitude 1 + 1 -> 3
-    secp256k1_fe_negate(&dx, &X, 1);
-    secp256k1_fe_add(&dx, &A.x);
-
-    if (secp256k1_fe_normalizes_to_zero_var(&dx)) {
-        // 概率约 2^-256: A.x == X, 必须走点倍分支
-        // (若再发生 Y == -A.y 则结果应为无穷远点; 在 rho 中这同样不可达,
-        //  此处按点倍公式处理, 不做额外特判)
-        secp256k1_fe inv, lam, t, nx, ny;
-
-        secp256k1_fe two_y = Y;
-        secp256k1_fe_add(&two_y, &Y);           // 2Y            (mag 2)
-        secp256k1_fe_inv_var(&inv, &two_y);     // 1/(2Y)        (mag 1)
-        secp256k1_fe_sqr(&lam, &X);             // X²            (mag 1)
-        secp256k1_fe_add(&lam, &lam);           // 2X²           (mag 2)
-        secp256k1_fe_add(&lam, &X);             // 3X²           (mag 3)
-        secp256k1_fe_mul(&lam, &lam, &inv);     // λ = 3X²/(2Y)  (mag 1)
-
-        // x3 = λ² - 2X
-        secp256k1_fe_negate(&t, &X, 1);         // -X            (mag 2)
-        secp256k1_fe_add(&t, &t);               // -2X           (mag 4)
-        secp256k1_fe_sqr(&nx, &lam);            // λ²            (mag 1)
-        secp256k1_fe_add(&nx, &t);              // λ² - 2X       (mag 5)
-        secp256k1_fe_normalize_var(&nx);
-
-        // y3 = λ(X - x3) - Y
-        secp256k1_fe_negate(&t, &nx, 1);        // -x3           (mag 2)
-        secp256k1_fe_add(&t, &X);               // X - x3        (mag 3)
-        secp256k1_fe_mul(&ny, &t, &lam);        // λ(X - x3)     (mag 1)
-        secp256k1_fe_negate(&t, &Y, 1);         // -Y            (mag 2)
-        secp256k1_fe_add(&ny, &t);              // y3            (mag 3)
-        secp256k1_fe_normalize_weak(&ny);
-
-        X = nx;
-        Y = ny;
-        return;
-    }
-
-    secp256k1_fe dy;
-    // dy = A.y - Y, magnitude 1 + 1 -> 3
-    secp256k1_fe_negate(&dy, &Y, 1);
-    secp256k1_fe_add(&dy, &A.y);
-
-    secp256k1_fe inv, lam, nx, ny, t;
-
-    secp256k1_fe_inv_var(&inv, &dx);            // 1/(A.x - X)   (mag 1)
-    secp256k1_fe_mul(&lam, &dy, &inv);          // λ             (mag 1)
-
-    // x3 = λ² - X - A.x
-    secp256k1_fe_sqr(&nx, &lam);                // λ²            (mag 1)
-    secp256k1_fe_negate(&t, &X, 1);             // -X            (mag 2)
-    secp256k1_fe_add(&nx, &t);                  //               (mag 3)
-    secp256k1_fe_negate(&t, &A.x, 1);           // -A.x          (mag 2)
-    secp256k1_fe_add(&nx, &t);                  // x3            (mag 5)
-    secp256k1_fe_normalize_var(&nx);
-
-    // y3 = λ(X - x3) - Y
-    secp256k1_fe_negate(&t, &nx, 1);            // -x3           (mag 2)
-    secp256k1_fe_add(&t, &X);                   // X - x3        (mag 3)
-    secp256k1_fe_mul(&ny, &t, &lam);            // λ(X - x3)     (mag 1)
-    secp256k1_fe_negate(&t, &Y, 1);             // -Y            (mag 2)
-    secp256k1_fe_add(&ny, &t);                  // y3            (mag 3)
-    secp256k1_fe_normalize_weak(&ny);
-
-    X = nx;
-    Y = ny;
-}
 
 // 一次性把 adds_pub[0][*] 转换成普通域 + 肢体形式
 void rho_affine_init_adds()
@@ -493,17 +423,6 @@ void rho_affine_init_adds()
     g_affine_adds_ready = true;
 }
 
-// 用第 i 个加数作为随机游走起点
-void rho_affine_set_start(RhoAffineState& s, int i)
-{
-    RhoGeStorage st;
-    memcpy(&st, adds_pub[0][i].x.data, sizeof(st));
-    secp256k1_fe_from_storage(&s.X, &st.x);
-    secp256k1_fe_from_storage(&s.Y, &st.y);
-    memcpy(s.m, g_affine_adds[i].m, sizeof(s.m));
-    memcpy(s.n, g_affine_adds[i].n, sizeof(s.n));
-}
-
 // RhoPoint/存储形式 -> 优化状态
 // rp.x.data 就是 secp256k1_ge_storage (x||y 各 32 字节), 可直接 memcpy 后展开。
 void rho_affine_load(RhoAffineState& s, const RhoPoint& rp)
@@ -517,8 +436,8 @@ void rho_affine_load(RhoAffineState& s, const RhoPoint& rp)
 }
 
 // 优化状态 -> RhoPoint/存储形式 (供 distinguishable / saveDP / 存档使用)
-// X 在 rho_affine_add 结束时已全规约, Y 只做了 normalize_weak, 这里补一次全规约,
-// 保证打包出来的是 [0, p) 内的标准坐标 (pubkey 解析要求)。
+// X 在 rho_affine_step_batch 结束时已全规约, Y 只做了 normalize_weak, 这里补一次
+// 全规约, 保证打包出来的是 [0, p) 内的标准坐标 (pubkey 解析要求)。
 void rho_affine_store(const RhoAffineState& s, RhoPoint& rp)
 {
     secp256k1_fe x = s.X, y = s.Y;
@@ -532,18 +451,6 @@ void rho_affine_store(const RhoAffineState& s, RhoPoint& rp)
     limbs_to_be32(rp.n, s.n);
 }
 
-// 一次完整的 rho 步进: 用当前 x 的低字节选加数, 再做一次仿射点加
-// (与 blockchain.cpp 的 rho_F / cuda.cu 的 fun_add 语义一致)
-inline void rho_affine_step(RhoAffineState& s)
-{
-    // s.X 上一轮结尾已全规约, 所以 X.n[0] 的低 8 位就是 x mod 256
-    const unsigned t = (unsigned)(s.X.n[0] & 0xFF);
-    const RhoAffineAdd& A = g_affine_adds[t];
-    rho_affine_add(s.X, s.Y, A);
-    add_mod_N(s.m, A.m);
-    add_mod_N(s.n, A.n);
-}
-
 // 对应 distinguishable(): x 的 bit 0..39 全 0 时, 返回 x 的 bit 40..103 (连续 64 位)。
 //
 // distinguishable 是按字节读的: *(uint64_t*)(x.data + 5), 也就是 x 的 bit 40..103
@@ -553,8 +460,8 @@ inline void rho_affine_step(RhoAffineState& s)
 // 合并即 (X.n[0] >> 40) | (X.n[1] << 12): n[0] >> 40 只有 12 位有效,
 // n[1] 的 52 位整体左移 12 位后正好对接其上端, 合计 64 位。
 //
-// 注意: 这里假定 X 已全规约 (rho_affine_add 每步结尾保证), 否则 limb 与 x 的
-//       二进制位对不上。
+// 注意: 这里假定 X 已全规约 (rho_affine_step_batch 每步结尾保证), 否则 limb 与
+//       x 的二进制位对不上。
 inline uint64_t rho_affine_dp(const RhoAffineState& s)
 {
     // x bit 0..39 != 0 -> 不构成 DP (n[0] 的 bit 40..51 不参与判定)
@@ -579,10 +486,11 @@ inline uint64_t rho_affine_dp(const RhoAffineState& s)
 // ===========================================================================
 
 // Montgomery 批量求逆: inv[i] = 1 / d[i] (mod p)。
-// W == 1 时退化为一次普通求逆, 与单 walker 路径完全等价。
+// W == 1 时就是一次普通求逆。
 //
-// 某个 d[i] == 0 时整条前缀积为 0 (域无零因子), 返回 false 交调用方回退逐点
-// 路径。这样 W 次零检查合并成了整批一次 (对积检查), 概率仍约 W * 2^-256。
+// 某个 d[i] == 0 时整条前缀积为 0 (域无零因子), 返回 false。这样 W 次零检查
+// 合并成了整批一次 (对积检查), 概率仍约 W * 2^-256; 调用方不再为它保留逐点
+// 回退路径 (见 rho_affine_step_batch)。
 template <int W>
 bool fe_batch_inv(secp256k1_fe (&inv)[W], const secp256k1_fe (&d)[W])
 {
@@ -602,16 +510,17 @@ bool fe_batch_inv(secp256k1_fe (&inv)[W], const secp256k1_fe (&d)[W])
     return true;
 }
 
-// 一次推进 W 个 walker 各一步。仿射公式与 rho_affine_add 逐字相同, 区别只有
-// 一处: 分母 1/dx 不再各自求逆, 而是整批一次求出来。
+// 一次推进 W 个 walker 各一步。每个 walker 的仿射公式见上文, 区别只有一处:
+// 分母 1/dx 不再各自求逆, 而是整批一次求出来。
 //
 // 返回 DP 命中的 walker 掩码 (bit i = walker i 的 x 低 40 位全 0)。命中者由
 // rho_affine_FW 写回 rs 并按需重置; 未命中者 fe 状态留在 cache 里, 完全不碰
 // rs 的 136 字节 —— rs 只有 DP 判定 (概率 2^-40) 和存档 (每 2^30 步) 才需要,
 // 每步全量写回是纯浪费 (实测占每点成本的 1/3)。
 //
-// 零分母 (概率约 W * 2^-256) 由 fe_batch_inv 对整批一次检出, 整批回退逐点路径
-// (rho_affine_step -> rho_affine_add, 那条路径里有点倍分支)。
+// 零分母 (概率约 W * 2^-256) 由 fe_batch_inv 对整批一次检出。该情形不可达,
+// 不再为它维护一条逐点回退路径 (原来会退到单 walker 的点倍分支), 检出即放弃
+// 本步。
 template <int W>
 inline uint32_t rho_affine_step_batch(RhoAffineState (&st)[W])
 {
@@ -630,38 +539,37 @@ inline uint32_t rho_affine_step_batch(RhoAffineState (&st)[W])
 
     secp256k1_fe inv[W];
     if (!fe_batch_inv<W>(inv, dx)) {
-        for (int i = 0; i < W; ++i) {
-            rho_affine_step(st[i]);
-        }
-        // 回退路径各自维护 X 全规约, DP 判定照常可用
-    } else {
-        for (int i = 0; i < W; ++i) {
-            const RhoAffineAdd& A = g_affine_adds[t[i]];
-            secp256k1_fe lam, nx, ny, tt;
+        // dx 里有 0 (A.x == X, 概率约 W * 2^-256): inv[] 未写出, 直接放弃本步
+        // (状态不动, 也不报 DP)。该情形不可达, 不再为它保留逐点回退路径。
+        return 0;
+    }
 
-            secp256k1_fe_mul(&lam, &dy[i], &inv[i]);    // λ             (mag 1)
-            secp256k1_fe_sqr(&nx, &lam);                // λ²            (mag 1)
-            secp256k1_fe_negate(&tt, &st[i].X, 1);
-            secp256k1_fe_add(&nx, &tt);                 //               (mag 3)
-            secp256k1_fe_negate(&tt, &A.x, 1);
-            secp256k1_fe_add(&nx, &tt);                 // x3            (mag 5)
-            secp256k1_fe_normalize_var(&nx);
-            secp256k1_fe_negate(&tt, &nx, 1);
-            secp256k1_fe_add(&tt, &st[i].X);            // X - x3        (mag 3)
-            secp256k1_fe_mul(&ny, &tt, &lam);           // λ(X - x3)     (mag 1)
-            secp256k1_fe_negate(&tt, &st[i].Y, 1);
-            secp256k1_fe_add(&ny, &tt);                 // y3            (mag 3)
-            secp256k1_fe_normalize_weak(&ny);
+    for (int i = 0; i < W; ++i) {
+        const RhoAffineAdd& A = g_affine_adds[t[i]];
+        secp256k1_fe lam, nx, ny, tt;
 
-            st[i].X = nx;
-            st[i].Y = ny;
-            add_mod_N(st[i].m, A.m);
-            add_mod_N(st[i].n, A.n);
-        }
+        secp256k1_fe_mul(&lam, &dy[i], &inv[i]);    // λ             (mag 1)
+        secp256k1_fe_sqr(&nx, &lam);                // λ²            (mag 1)
+        secp256k1_fe_negate(&tt, &st[i].X, 1);
+        secp256k1_fe_add(&nx, &tt);                 //               (mag 3)
+        secp256k1_fe_negate(&tt, &A.x, 1);
+        secp256k1_fe_add(&nx, &tt);                 // x3            (mag 5)
+        secp256k1_fe_normalize_var(&nx);
+        secp256k1_fe_negate(&tt, &nx, 1);
+        secp256k1_fe_add(&tt, &st[i].X);            // X - x3        (mag 3)
+        secp256k1_fe_mul(&ny, &tt, &lam);           // λ(X - x3)     (mag 1)
+        secp256k1_fe_negate(&tt, &st[i].Y, 1);
+        secp256k1_fe_add(&ny, &tt);                 // y3            (mag 3)
+        secp256k1_fe_normalize_weak(&ny);
+
+        st[i].X = nx;
+        st[i].Y = ny;
+        add_mod_N(st[i].m, A.m);
+        add_mod_N(st[i].n, A.n);
     }
 
     // DP 判定在 fe 域做 (rho_affine_dp 已与 distinguishable 对拍过), 不再经过
-    // rs 的存储字节。X 此时全规约, 与单点路径口径一致。
+    // rs 的存储字节。X 此时全规约。
     uint32_t dp_mask = 0;
     for (int i = 0; i < W; ++i) {
         if (rho_affine_dp(st[i]) != 0) {
@@ -692,69 +600,18 @@ RhoCache<W>& rho_affine_cache()
     return cache;
 }
 
-// 正确性自检: 与库公开 API 路径逐步对拍 (点坐标 + m/n 标量)
-bool rho_affine_selfcheck(int steps)
-{
-    RhoState lib;
-    lib.x = adds_pub[0][0].x;
-    memcpy(lib.m, adds_pub[0][0].m, sizeof(lib.m));
-    memcpy(lib.n, adds_pub[0][0].n, sizeof(lib.n));
-    lib.times = 0;
-
-    RhoAffineState aff;
-    rho_affine_set_start(aff, 0);
-
-    for (int i = 0; i < steps; ++i) {
-        const unsigned t_lib = (unsigned)lib.x.data[0];
-        const unsigned t_aff = (unsigned)(aff.X.n[0] & 0xFF);
-        if (t_lib != t_aff) {
-            std::cout << "rho-affine selfcheck: 第 " << i << " 步索引不一致 ("
-                      << t_lib << " vs " << t_aff << ")" << std::endl;
-            return false;
-        }
-
-        secp256k1_pubkey pk = lib.x;
-        secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t_lib].x};
-        if (!secp256k1_ec_pubkey_combine(ctx, &lib.x, ins, 2) ||
-            !secp256k1_ec_seckey_tweak_add(ctx, lib.m, adds_pub[0][t_lib].m) ||
-            !secp256k1_ec_seckey_tweak_add(ctx, lib.n, adds_pub[0][t_lib].n)) {
-            std::cout << "rho-affine selfcheck: 库调用失败 @" << i << std::endl;
-            return false;
-        }
-
-        rho_affine_step(aff);
-
-        // 对比点坐标 + 标量: 直接走生产路径的 rho_affine_store, 顺带验证
-        // 打包出的字节与库的规范 ge_storage 一致 (affine 侧 Y 只做 normalize_weak,
-        // 与规范值存在差别的概率约 2^-224, 可忽略)。
-        RhoPoint rp;
-        rho_affine_store(aff, rp);
-        if (memcmp(rp.x.data, lib.x.data, sizeof(lib.x.data)) != 0) {
-            std::cout << "rho-affine selfcheck: 第 " << i << " 步点坐标不一致" << std::endl;
-            return false;
-        }
-
-        if (memcmp(rp.m, lib.m, sizeof(rp.m)) != 0 || memcmp(rp.n, lib.n, sizeof(rp.n)) != 0) {
-            std::cout << "rho-affine selfcheck: 第 " << i << " 步标量不一致" << std::endl;
-            return false;
-        }
-    }
-    return true;
-}
-
 // 批量路径自检: 同一批 W 个 walker, 一路用 rho_affine_FW<W> (批量求逆) 推进,
-// 另一路逐个用 rho_affine_step (单点求逆, 与 rho_affine_F 同一条路径) 推进,
-// 每步逐项对比四元组 (x 存储字节 / m / n / times)。
+// 另一路逐个用库公开 API 推进 (secp256k1_ec_pubkey_combine + seckey_tweak_add,
+// 与生产 rho_F 的 fun_add 同一条路径), 每步逐项对比
+// 四元组 (x 存储字节 / m / n / times)。
 //
-// 注意参考侧不能用 rho_affine_F: 它的线程局部缓存只按 times 判重, 天生假定
-// "一个线程只喂一个 rs"。同一个线程里轮流喂 W 个不同 rs 会让缓存串味。
-// 这里直接用 RhoAffineState 逐点推进, 与 rho_affine_F 内部的步进完全等价。
+// 参考侧直接在 RhoState 上步进 (每步一次库公开 API 点加), 与批量路径共用
+// 同一个 "以 x 首字节选加数" 的约定, 所以两边逐位可比。
 template <int W>
 bool rho_affine_batch_selfcheck(int steps)
 {
     RhoState batch[W] = {};
     RhoState ref[W] = {};
-    RhoAffineState single[W];
 
     for (int i = 0; i < W; ++i) {
         batch[i].x = adds_pub[0][i].x;
@@ -762,15 +619,23 @@ bool rho_affine_batch_selfcheck(int steps)
         memcpy(batch[i].n, adds_pub[0][i].n, sizeof(batch[i].n));
         batch[i].times = 0;
         ref[i] = batch[i];
-        rho_affine_set_start(single[i], i);
     }
 
     for (int s = 0; s < steps; ++s) {
         rho_affine_FW<W>(batch);
         rho_affine_flush<W>(batch);      // rs 平时只有 times 是新的, 对拍前写真
         for (int i = 0; i < W; ++i) {
-            rho_affine_step(single[i]);
-            rho_affine_store(single[i], ref[i]);
+            // 加数索引与生产路径同口径: data[0] 即 x mod 256 (fe_storage 首字节)
+            const unsigned t = (unsigned)ref[i].x.data[0];
+            secp256k1_pubkey pk = ref[i].x;
+            secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t].x};
+            if (!secp256k1_ec_pubkey_combine(ctx, &ref[i].x, ins, 2) ||
+                !secp256k1_ec_seckey_tweak_add(ctx, ref[i].m, adds_pub[0][t].m) ||
+                !secp256k1_ec_seckey_tweak_add(ctx, ref[i].n, adds_pub[0][t].n)) {
+                std::cout << "rho-affine batch selfcheck: W=" << W << " step " << s
+                          << " walker " << i << " lib call failed" << std::endl;
+                return false;
+            }
             ++ref[i].times;
 
             const char* what = nullptr;
@@ -800,7 +665,8 @@ bool rho_affine_batch_selfcheck(int steps)
 // ---------------------------------------------------------------------------
 
 // 一次推进同一线程内连续的 W 个 walker。每个 walker 走恰好一步, 语义与
-// rho_affine_F(RhoState&) 完全一致, 区别有两处:
+// blockchain.cpp 的 rho_F 一致 (以 x 首字节选加数, 做一次仿射点加, m/n 各累加
+// 一次并 mod N, times++)。与逐点实现相比有两处不同:
 //   1. W 个模逆被摊成了一次 (批量求逆);
 //   2. rs[i] 只在 DP 命中时写回 (概率 2^-40), 未命中步完全不碰那 136 字节 ——
 //      rs 的唯一消费者是 DP 判定和存档, 而存档走 flush 路径。
@@ -872,32 +738,6 @@ template void rho_affine_flush<8>(RhoState* rs);
 template void rho_affine_flush<16>(RhoState* rs);
 template void rho_affine_flush<32>(RhoState* rs);
 
-// 仿射点加的性能基准: 与 perf_test_libsecp256k1 / perf_test_cpu / perf_test_gpu 同样的
-// 80w 次点加 + DP 判定循环。
-void perf_test_rho_affine()
-{
-    rho_affine_init_adds();
-
-    RhoAffineState s;
-    rho_affine_set_start(s, 0);
-
-    const auto start = std::chrono::steady_clock::now();
-    uint64_t count_rho = 0;
-    uint32_t count_dp = 0;
-    while (count_rho < 800000) {
-        rho_affine_step(s);
-        count_rho++;
-        if (rho_affine_dp(s) != 0) {
-            count_dp++;
-        }
-    }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start);
-    const double sec = elapsed.count() / 1000.0;
-    std::cout << "rho-affine test elapsed: " << elapsed.count() << " ms, with " << count_rho
-              << " RhoPoint, avg " << (uint64_t)(count_rho / sec) << " points/s." << std::endl;
-}
-
 namespace {
 
 // 在同一个线程里跑 W 个 walker 的基准。走的是生产路径 rho_affine_FW<W>,
@@ -930,7 +770,8 @@ void bench_rho_walkers(uint64_t steps)
 }  // namespace
 
 // 扫描每个线程 1/2/4/8/16/32 个 walker 的吞吐, 用来选 common.h 里的 RHO_WALKERS。
-// 总点数固定, 与 perf_test_rho_affine 同口径, 可直接对比。
+// 总点数固定 (800000), 与 cuda.cu 的 perf_test_cpu (同样 800000 点) 同口径,
+// 可直接对比。
 // 最后一档 W=1 再跑一次作为漂移对照: 同一进程内的首尾两个 W=1 读数应该很接近。
 void perf_test_rho_affine_walkers()
 {
@@ -951,16 +792,9 @@ void validate_rho_affine()
 {
     rho_affine_init_adds();
 
-    // Release 构建带 -DNDEBUG, assert 会被编译掉, 这里必须显式判断后退出,
-    // 否则这个自检在 Release 下等于没跑。
-    const bool ok = rho_affine_selfcheck(2000);
-    std::cout << "rho-affine selfcheck (2000 steps vs libsecp256k1 public API): "
-              << (ok ? "PASS" : "FAIL") << std::endl;
-    if (!ok) exit(EXIT_FAILURE);
-
     // rho_affine_dp 与 distinguishable() 的对拍。
     //
-    // 随机游走中 x 低 40 位全 0 的概率约 2^-40, 2000 步自检基本不可能触发 DP
+    // 随机游走中 x 低 40 位全 0 的概率约 2^-40, 随机步进自检不可能触发 DP
     // 分支, 所以这里用构造值专门覆盖它。参考值走生产回写路径
     // (rho_affine_store -> rs.x.data), 再按 distinguishable 的读法取
     // x.data[5..13), 即 x 的 bit 40..103。
@@ -1010,15 +844,15 @@ void validate_rho_affine()
               << std::endl;
     if (!dp_ok) exit(EXIT_FAILURE);
 
-    // 同线程多 walker 的对拍: W 个 walker 交错推进 vs 逐个单点推进。
-    // 步数取得短, 因为两条路都跑 2000 步已经足够暴露批量求逆的任何下标错位。
+    // 同线程多 walker 的对拍: W 个 walker 交错推进 vs 库公开 API 逐点推进。
+    // 步数取得短, 但上千步已经足够暴露批量求逆的任何下标错位。
     bool batch_ok = true;
     batch_ok &= rho_affine_batch_selfcheck<2>(1000);
     batch_ok &= rho_affine_batch_selfcheck<4>(1000);
     batch_ok &= rho_affine_batch_selfcheck<8>(1000);
     batch_ok &= rho_affine_batch_selfcheck<16>(1000);
     batch_ok &= rho_affine_batch_selfcheck<32>(1000);
-    std::cout << "rho-affine batch selfcheck (W=2/4/8/16/32 vs single walker): "
+    std::cout << "rho-affine batch selfcheck (W=2/4/8/16/32 vs lib public API): "
               << (batch_ok ? "PASS" : "FAIL") << std::endl;
     if (!batch_ok) exit(EXIT_FAILURE);
 }
@@ -1032,34 +866,4 @@ void validate_rho_affine()
 void rho_affine_prepare()
 {
     rho_affine_init_adds();
-}
-
-// 仿射点加版的 rho_F: 语义与 blockchain.cpp 里的 rho_F 完全一致
-//   —— 以 x 的首字节选取加数, 做一次仿射点加, m/n 各累加一次并 mod N, times++。
-//
-// 区别只在于状态表示: rho_F 每步都把 secp256k1_pubkey 重新解析成内部表示,
-// 这里把 fe 形式的状态缓存在线程局部变量里, 每步只做 fe 运算 + 一次回写。
-//
-// 回写是必要的: distinguishable(rs.x) / saveDP / saveRhoState 都直接读 rs。
-// 回写开销 (两次 fe_normalize_var + 打包) 相对一次仿真点加里的模逆可以忽略。
-void rho_affine_F(RhoState& rs)
-{
-    assert(g_affine_adds_ready);
-
-    // 每线程一份 fe 状态。若 rs 被外部重置 (loadRhoState / rand 等), times 会对不上,
-    // 此时重新从 rs 同步一次。
-    static thread_local RhoAffineState st;
-    static thread_local bool inited = false;
-    static thread_local uint64_t synced_times = 0;
-
-    if (!inited || synced_times != rs.times) {
-        rho_affine_load(st, rs);
-        inited = true;
-    }
-
-    rho_affine_step(st);
-
-    rs.times++;
-    synced_times = rs.times;
-    rho_affine_store(st, rs);
 }

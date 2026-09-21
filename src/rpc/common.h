@@ -48,22 +48,13 @@ void perf_test();
 // 定义在 rpc/cuda.cu (BUILD_BITCOIN_CUDA) 或 rpc/cuda_stub.cpp: GPU 多 walker
 // 批量求逆的基准测试, 由 perf_test() 调用
 void perf_test_rho_gpu_walkers();
-// 定义在 rpc/cuda.cu (BUILD_BITCOIN_CUDA): 基础算子 (mul_mod / mod_inv_p /
-// mod_add / mod_sub) 的串行依赖链微基准, 用于把 "每点成本 = E + M/W + L(W)"
-// 拆成可分别归因的项
-void perf_micro();
 // 定义在 rpc/rho.cpp: libsecp256k1 版本的点加性能测试, 由 perf_test() 调用
 void perf_test_libsecp256k1();
-// 定义在 rpc/rho.cpp: 直接用 libsecp256k1 内部 5x52 域实现的仿射点加性能测试
-void perf_test_rho_affine();
 // 定义在 rpc/rho.cpp: 仿射点加的正确性验证 (与库公开 API 逐步对拍), 由 validate_test() 调用
 void validate_rho_affine();
 // 定义在 rpc/rho.cpp: 仿射点加 (libsecp256k1 内部 5x52 域) 的初始化,
 // 必须在启动 worker 线程之前调用一次
 void rho_affine_prepare();
-// 定义在 rpc/rho.cpp: 仿射点加版 rho_F (语义与 rho_F 一致) 的单 walker 版。
-// 现在只用作对照 / 基准, 生产路径走下面的 rho_affine_FW。
-void rho_affine_F(RhoState& rs);
 
 // ---------------------------------------------------------------------------
 // 同线程多 walker
@@ -114,7 +105,7 @@ static_assert(RHO_WALKERS >= 1 && RHO_WALKERS <= RHO_WALKERS_MAX, "RHO_WALKERS �
 constexpr int RHO_STATE_SLOTS = 1024;
 
 // 定义在 rpc/rho.cpp: 一次推进连续的 W 个 RhoState (同一线程独占的一段)。
-// 每个 walker 走恰好一步, 语义与 rho_affine_F(RhoState&) 完全一致。
+// 每个 walker 走恰好一步, 语义与 blockchain.cpp 的 rho_F 一致。
 //
 // 返回 dp_mask: 第 i 位为 1 表示第 i 个 walker 本步命中 DP 点, 此时 rs[i]
 // 已被写回最新状态, 调用方可立即读取/存档; 未命中位对应的 rs[i] 是陈旧的

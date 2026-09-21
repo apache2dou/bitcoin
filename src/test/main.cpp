@@ -1606,15 +1606,13 @@ int main(int argc, char* argv[])
     // 基准/验证的常驻入口, 免去"改代码 -> 跑 -> 还原"的循环:
     //   test_bitcoin.exe perf       跑 perf_test()
     //   test_bitcoin.exe rhoperf    只跑 perf_test_rho_gpu_walkers() (迭代用, 快)
-    //   test_bitcoin.exe micro      只跑 perf_micro() (基础算子串行链微基准)
     //   test_bitcoin.exe validate   跑 validate_test()
     // 不带参数时行为与以前完全一致 (走 work())。
-    bool run_perf = false, run_validate = false, run_rho_perf = false, run_micro = false;
+    bool run_perf = false, run_validate = false, run_rho_perf = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "perf") run_perf = true;
         else if (arg == "rhoperf") run_rho_perf = true;
-        else if (arg == "micro") run_micro = true;
         else if (arg == "validate") run_validate = true;
     }
     if (run_perf && run_validate) {
@@ -1630,8 +1628,6 @@ int main(int argc, char* argv[])
         perf_test();
     } else if (run_rho_perf) {
         perf_test_rho_gpu_walkers();
-    } else if (run_micro) {
-        perf_micro();
     } else if (run_validate) {
         validate_test();
     } else {
