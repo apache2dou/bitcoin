@@ -61,11 +61,80 @@
 
 #include <stdint.h>
 
+#include <cstdarg>
+#include <cstdio>
+
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <barrier>
+
+// ---------------------------------------------------------------------------
+// 控制台输出 (UTF-8 安全)。为什么需要这一层、怎么用, 见 common.h 的说明。
+// ---------------------------------------------------------------------------
+void cprint_write(const std::string& utf8)
+{
+#ifdef WIN32
+    // UTF-8 -> UTF-16。源串本来就是 UTF-8 (带 /utf-8 编出来的字面量), 这一步正常
+    // 不会失败; 真失败了就落到下面原样写, 至少不比从前更糟。
+    const int wlen = utf8.empty() ? 0 : MultiByteToWideChar(CP_UTF8, 0, utf8.data(),
+                                                            (int)utf8.size(), nullptr, 0);
+    if (wlen > 0) {
+        std::wstring w((size_t)wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), &w[0], wlen);
+
+        // 出口一: stdout 挂在真正的控制台上。WriteConsoleW 收 UTF-16, 与代码页无关,
+        // 中文/日文/emoji 都能出 (控制台代码页是 65001 也无所谓)。
+        const HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        if (h != nullptr && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+            std::fflush(stdout);   // 先让 std::cout/printf 压着的字节出去, 免得插队
+            DWORD written = 0;
+            ::WriteConsoleW(h, w.data(), (DWORD)w.size(), &written, nullptr);
+            return;
+        }
+
+        // 出口二: stdout 是管道或文件 (PowerShell 抓子进程输出就是这一种) —— 消费端
+        // 按**系统 OEM 代码页**解 (PS 5.1 的 [Console]::OutputEncoding 就是启动时
+        // 抓下的 OEM CP, 中文机 = 936)。所以这里按 OEM CP 转码再写, 中文就正常。
+        const UINT oem = GetOEMCP();
+        const int blen = WideCharToMultiByte(oem, 0, w.data(), (int)w.size(), nullptr, 0,
+                                             "\x01", nullptr);
+        if (blen > 0) {
+            std::string out((size_t)blen, '\0');
+            WideCharToMultiByte(oem, 0, w.data(), (int)w.size(), &out[0], blen, "\x01", nullptr);
+            // 转不出来的字会变成哨兵 '\x01' —— 说明这台机器的 OEM 代码页根本装不下中文
+            // (英文机的 437 之类)。那就别糟蹋, 原样写 UTF-8: 那种环境的消费端本来也是 UTF-8。
+            if (out.find('\x01') == std::string::npos) {
+                std::fwrite(out.data(), 1, out.size(), stdout);
+                std::fflush(stdout);
+                return;
+            }
+        }
+    }
+#endif
+    // 非 Windows, 或上面两步都没走通: 原样写 UTF-8。
+    std::fwrite(utf8.data(), 1, utf8.size(), stdout);
+    std::fflush(stdout);
+}
+
+void cprintf(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    const int n = std::vsnprintf(nullptr, 0, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        std::string buf((size_t)n + 1, '\0');
+        std::vsnprintf(&buf[0], buf.size(), fmt, ap2);
+        buf.resize((size_t)n);
+        cprint_write(buf);
+    }
+    va_end(ap2);
+}
 
 using kernel::CCoinsStats;
 using kernel::CoinStatsHashType;
@@ -2864,6 +2933,15 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
 secp256k1_context* ctx = nullptr;
 static iLog* g_log = nullptr;
 
+// 生产日志 (D:\iLog.txt) 追加一行, 给 rho.cpp 用 (那边拿不到 g_log)。
+// 日志文件里的文本一直是 UTF-8, 所以不走 cprint/cprintf 那一层 (那是控制台出口)。
+// 日志没开 (g_log == nullptr, 比如 validate 入口) 时静默 —— 自测不该污染生产日志。
+void ilog_line(const std::string& utf8)
+{
+    if (g_log == nullptr) return;
+    g_log->ofs << get_time() << " : " << utf8 << std::endl;
+}
+
 bool SecPair::rand()
 {
     CKey secret1, secret2;
@@ -3329,7 +3407,7 @@ void saveVectorToFile(const std::vector<T>& vec, const std::string& filename)
         outFile.write(reinterpret_cast<const char*>(vec.data()), size * sizeof(T));
         outFile.close();
     } else {
-        std::cerr << "无法打开文件: " << filename << std::endl;
+        cprintf("无法打开文件: %s\n", filename.c_str());
     }
 }
 
@@ -3351,7 +3429,7 @@ std::vector<T> loadVectorFromFile(const std::string& filename, uint64_t count = 
         inFile.read(reinterpret_cast<char*>(vec.data()), size * sizeof(T));
         inFile.close();
     } else {
-        std::cerr << "无法打开文件: " << filename << std::endl;
+        cprintf("无法打开文件: %s\n", filename.c_str());
     }
     return vec;
 }
@@ -3414,6 +3492,956 @@ void _saveDP(uint64_t index, const SecPair& sp)
 {
     iLog _dplog(_DPFile_name);
     saveDP(_dplog.ofs, index, sp);
+}
+
+// ---------------------------------------------------------------------------
+// 32 位可区分点 (DP) 源库 / 已征召库的整理 (格式见 common.h)
+//
+// data 目录下的 4 个 DistinguishablePoints*.txt 是 32 位 DP 语料: 首列索引 =
+// x 的 bit 32..95, 已离线复算核对 (890,271 条, 抽样全中)。其中约 1/256 同时满足
+// 40 位判据, 这类点本身就是现成的 40 位 DP —— 直接按 40 位判据归档到 _DPFile_name,
+// 并计入已征召库, 不进源库 (进了也是白占)。
+//
+// 源库按索引升序排列 (便于二分查找), 已征召库按征召顺序追加。征召 = 源库记录原地
+// 清零 (墓碑, 槽位不回收) + 追加到已征召库, 单次 O(1); 墓碑不移位 ⇒ 源库永远
+// 保持升序, 磁盘二分一直有效。
+// ---------------------------------------------------------------------------
+
+// 32 位判据: x 低 32 位全 0 时, index = x 的 bit 32..95
+// (x.data 按字节小端存坐标, 所以 bit 32 就是字节偏移 4)
+bool dp32_test(const secp256k1_pubkey& pk, uint64_t& index)
+{
+    if ((*(const uint64_t*)pk.data & 0xFFFFFFFFULL) != 0) return false;
+    index = *(const uint64_t*)(pk.data + 4);
+    return true;
+}
+
+// 40 位判据: x 低 40 位全 0
+bool dp40_test(const secp256k1_pubkey& pk)
+{
+    return (*(const uint64_t*)pk.data & 0xFFFFFFFFFFULL) == 0;
+}
+
+bool dp32_write_header(std::ofstream& ofs, const char* magic, uint64_t records)
+{
+    Dp32Header h = {};
+    memcpy(h.magic, magic, sizeof(h.magic));
+    h.version = DP32_VERSION;
+    h.record_size = (uint32_t)sizeof(Dp32Record);
+    h.records = records;
+    ofs.write((const char*)&h, sizeof(h));
+    return ofs.good();
+}
+
+// 头 + 条数一起校验: 与文件长度对不上就判假 (截断/写坏的文件不会冒充成好的)
+bool dp32_read_header(std::ifstream& ifs, const char* magic, uint64_t& records)
+{
+    records = 0;
+    Dp32Header h = {};
+    ifs.read((char*)&h, sizeof(h));
+    if (!ifs || memcmp(h.magic, magic, sizeof(h.magic)) != 0) return false;
+    if (h.version != DP32_VERSION) return false;
+    if (h.record_size != sizeof(Dp32Record)) return false;
+    ifs.clear();
+    ifs.seekg(0, std::ios::end);
+    const std::streamoff body = ifs.tellg() - (std::streamoff)sizeof(Dp32Header);
+    if (body < 0 || body % (std::streamoff)sizeof(Dp32Record) != 0) return false;
+    if ((uint64_t)(body / (std::streamoff)sizeof(Dp32Record)) != h.records) return false;
+    records = h.records;
+    return true;
+}
+
+// 读一条 3 行文本记录 (索引十进制 / m 十六进制 / n 十六进制); 文件尾或残缺返回 false
+bool dp32_read_text_record(std::ifstream& ifs, uint64_t& index, SecPair& sp)
+{
+    std::string line;
+    if (!std::getline(ifs, line)) return false;
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+        line.pop_back();
+    if (line.empty()) return false;
+    if (sscanf(line.c_str(), "%llu", (unsigned long long*)&index) != 1) return false;
+    if (!std::getline(ifs, line)) return false;
+    auto m = ParseHex(line);
+    if (m.size() != sizeof(sp.m)) return false;
+    memcpy(sp.m, m.data(), sizeof(sp.m));
+    if (!std::getline(ifs, line)) return false;
+    auto n = ParseHex(line);
+    if (n.size() != sizeof(sp.n)) return false;
+    memcpy(sp.n, n.data(), sizeof(sp.n));
+    return true;
+}
+
+struct Dp32ScanStats {
+    uint64_t files = 0;        // 扫到的语料文件数
+    uint64_t read = 0;         // 读到的记录数
+    uint64_t src = 0;          // 进源库的条数
+    uint64_t src_dup = 0;      // 索引重复被丢掉的条数
+    uint64_t drafted = 0;      // 因本身是 40 位 DP 而直接征召的条数
+    uint64_t dp40_new = 0;     // 其中新归档到 _DPFile_name 的
+    uint64_t dp40_dup = 0;     // 其中 _DPFile_name 里已有的
+    uint64_t bad = 0;          // 不是 32 位 DP / 格式不对
+    uint64_t idx_mismatch = 0; // 首列索引与复算不符 (以复算为准)
+};
+
+// 语料文件: data 目录下所有 DistinguishablePoints*.txt, 按文件名排序。扫描器与对账
+// 自测共用这一份清单 (两边各挑各的, 迟早会挑出不一样的集合)。
+static std::vector<fs::path> dp32_corpus_files(const std::string& dataDir)
+{
+    std::vector<fs::path> files;
+    const fs::path dir = fs::u8path(dataDir);
+    if (!fs::exists(dir)) return files;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        const std::string fname = entry.path().filename().string();
+        if (!fname.starts_with("DistinguishablePoints")) continue;
+        if (!fname.ends_with(".txt")) continue;
+        files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// data 目录: 绝对路径优先, 再按工作目录深度逐级回退 (跑法不同时都能命中)。返回第一个
+// 含语料文件的目录; 都找不到返回空串。
+static std::string dp32_find_data_dir()
+{
+    static const std::vector<std::string> candidates = {
+        "E:\\github\\bitcoin\\data\\",
+        "data\\",
+        "..\\data\\",
+        "..\\..\\data\\",
+        "..\\..\\..\\data\\",
+        "..\\..\\..\\..\\data\\",
+        "..\\..\\..\\..\\..\\data\\",
+    };
+    for (const auto& d : candidates) {
+        if (!dp32_corpus_files(d).empty()) return d;
+    }
+    return std::string();
+}
+
+// 扫一个目录下的语料, 写出源库 + 已征召库; 目录/文件不可用返回 false
+bool dp32_build_source(const std::string& dataDir, Dp32ScanStats& st)
+{
+    const std::vector<fs::path> files = dp32_corpus_files(dataDir);
+    st.files = files.size();
+    if (files.empty()) return false;
+    uint64_t text_bytes = 0;
+    for (const auto& f : files) {
+        std::error_code ec;
+        text_bytes += (uint64_t)fs::file_size(f, ec);
+    }
+    // 一条记录约 153 字节文本, 预留一次到位, 避免 64MB 级 vector 反复搬家
+    const size_t guess = (size_t)(text_bytes / 150 + 1024);
+
+    // 已归档的 40 位 DP: 先读进来做去重依据 —— _DPFile_name 是追加写的,
+    // 而 loadDP 里有 "同一索引只出现一次" 的断言, 重复索引会让下次加载直接断言失败。
+    std::map<uint64_t, SecPair> dp40_map;
+    {
+        std::ifstream ifs(_DPFile_name);
+        if (ifs.is_open()) loadDP(ifs, dp40_map);
+    }
+    iLog dp40_log(_DPFile_name);
+
+    std::vector<Dp32Record> src, drafted;
+    src.reserve(guess);
+    drafted.reserve(1024);
+
+    for (const auto& f : files) {
+        std::ifstream ifs(f);
+        if (!ifs.is_open()) {
+            ++st.bad;
+            continue;
+        }
+        uint64_t index = 0;
+        SecPair sp;
+        while (dp32_read_text_record(ifs, index, sp)) {
+            ++st.read;
+            secp256k1_pubkey x = {0};
+            create(ctx, &x, sp.m, sp.n);
+            uint64_t idx32 = 0;
+            if (!dp32_test(x, idx32)) {
+                ++st.bad;   // 语料里混进来的非 32 位点
+                continue;
+            }
+            if (idx32 != index) ++st.idx_mismatch;
+            Dp32Record r;
+            r.index = idx32;
+            memcpy(r.m, sp.m, sizeof(r.m));
+            memcpy(r.n, sp.n, sizeof(r.n));
+            if (dp40_test(x)) {
+                ++st.drafted;
+                const uint64_t idx40 = *(const uint64_t*)(x.data + 5);
+                if (dp40_map.find(idx40) == dp40_map.end()) {
+                    dp40_map[idx40] = sp;
+                    saveDP(dp40_log.ofs, idx40, sp);
+                    ++st.dp40_new;
+                } else {
+                    ++st.dp40_dup;
+                }
+                drafted.push_back(r);
+            } else {
+                src.push_back(r);
+            }
+        }
+    }
+    dp40_log.ofs.flush();
+
+    // 源库排序 + 按索引去重
+    std::sort(src.begin(), src.end(),
+              [](const Dp32Record& a, const Dp32Record& b) { return a.index < b.index; });
+    {
+        const auto it = std::unique(src.begin(), src.end(),
+                                    [](const Dp32Record& a, const Dp32Record& b) { return a.index == b.index; });
+        st.src_dup = (uint64_t)std::distance(it, src.end());
+        src.erase(it, src.end());
+    }
+    st.src = src.size();
+    // 已征召库也按索引去重 (同一个点被移动两次只留一份)
+    {
+        std::map<uint64_t, bool> seen;
+        std::vector<Dp32Record> uniq;
+        uniq.reserve(drafted.size());
+        for (const auto& r : drafted) {
+            if (seen.emplace(r.index, true).second) uniq.push_back(r);
+        }
+        drafted.swap(uniq);
+    }
+
+    {
+        std::ofstream ofs(DP32_SOURCE_FILE, std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) return false;
+        if (!dp32_write_header(ofs, DP32_SOURCE_MAGIC, src.size())) return false;
+        if (!src.empty()) {
+            ofs.write((const char*)src.data(), (std::streamsize)(src.size() * sizeof(Dp32Record)));
+        }
+        ofs.flush();
+        if (!ofs.good()) return false;
+    }
+    {
+        std::ofstream ofs(DP32_DRAFTED_FILE, std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) return false;
+        if (!dp32_write_header(ofs, DP32_DRAFTED_MAGIC, drafted.size())) return false;
+        if (!drafted.empty()) {
+            ofs.write((const char*)drafted.data(), (std::streamsize)(drafted.size() * sizeof(Dp32Record)));
+        }
+        ofs.flush();
+        if (!ofs.good()) return false;
+    }
+
+    g_log->ofs << "====Dp32 scan @ " << get_time() << " (" << dataDir << ")" << std::endl
+               << "  语料文件 " << st.files << " 个, 读入 " << st.read << " 条, 非32位/坏记录 "
+               << st.bad << " 条, 首列索引不符 " << st.idx_mismatch << " 条" << std::endl
+               << "  源库 " << DP32_SOURCE_FILE << ": " << st.src << " 条 (索引重复丢 " << st.src_dup << ")" << std::endl
+               << "  40 位 DP 直接征召 " << st.drafted << " 条 -> " << DP32_DRAFTED_FILE << ": 新归档到 "
+               << _DPFile_name << " " << st.dp40_new << " 条, 已存在 " << st.dp40_dup << " 条" << std::endl;
+    return true;
+}
+
+// (ta == 120 && ta2 == 888) 的入口: 两个库都完好就跳过 (幂等), 否则重建一遍
+void dp32_build_source_entry()
+{
+    uint64_t src_n = 0;
+    uint64_t drafted_n = 0;
+    bool src_ok = false;
+    bool drafted_ok = false;
+    {
+        std::ifstream ifs(DP32_SOURCE_FILE, std::ios::binary);
+        src_ok = ifs.is_open() && dp32_read_header(ifs, DP32_SOURCE_MAGIC, src_n);
+    }
+    {
+        std::ifstream ifs(DP32_DRAFTED_FILE, std::ios::binary);
+        drafted_ok = ifs.is_open() && dp32_read_header(ifs, DP32_DRAFTED_MAGIC, drafted_n);
+    }
+    if (src_ok && drafted_ok) {
+        g_log->ofs << "====Dp32 库已存在, 跳过扫描: " << DP32_SOURCE_FILE << " " << src_n
+                   << " 条 / " << DP32_DRAFTED_FILE << " " << drafted_n << " 条" << std::endl;
+        return;
+    }
+
+    Dp32ScanStats st;
+    const std::string dataDir = dp32_find_data_dir();
+    if (dataDir.empty() || !dp32_build_source(dataDir, st)) {
+        g_log->ofs << "====Dp32 扫描失败: 没找到可用的 data 目录 (试过 E:\\github\\bitcoin\\data\\ "
+                      "与 data\\ ..\\data\\ ... 各级相对路径)" << std::endl;
+        return;
+    }
+    // 扫完顺手把瘦索引载一遍 —— 等于给刚写出来的库做一次真实体检 (载入会逐条
+    // 复核升序与对账), 载进来的索引也正是漫步热路径要用的那一份。
+    dp32_store_init();
+}
+
+// ---------------------------------------------------------------------------
+// 32 位 DP 库的瘦索引: 只把每条记录的 index 字段抽出来 (源库 886,948 条 ≈ 7.1 MB,
+// 另加 111 KB 墓碑位图), 记录本体留在盘上, 命中之后按槽位读那 72 字节。
+// 查找全在内存里做, 不碰磁盘二分。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 载入时一次读 1024 条 (72 KB): 记录定长, 要拿每条的前 8 字节只能顺着读过去; 分块
+// 是为了不把 63.8 MB 一次摊在内存里。
+constexpr size_t DP32_CHUNK = 1024;
+
+inline uint64_t dp32_le64(const unsigned char* p)
+{
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) v = (v << 8) | (uint64_t)p[i];
+    return v;
+}
+
+// 槽位 -> 文件偏移 (头 24 字节 + 槽位 * 72 字节)
+inline std::streamoff dp32_offset(uint32_t slot)
+{
+    return (std::streamoff)sizeof(Dp32Header) +
+           (std::streamoff)slot * (std::streamoff)sizeof(Dp32Record);
+}
+
+// 打开 + 校验头 (魔数/版本/记录长度/条数与文件长度对账), 通过则流停在记录区开头
+bool dp32_open_indexed(std::ifstream& ifs, const char* path, const char* magic, uint64_t& count)
+{
+    count = 0;
+    ifs.open(path, std::ios::binary);
+    if (!ifs.is_open()) return false;
+    if (!dp32_read_header(ifs, magic, count)) {
+        ifs.close();
+        return false;
+    }
+    ifs.clear();
+    ifs.seekg((std::streamoff)sizeof(Dp32Header), std::ios::beg);
+    return ifs.good();
+}
+
+} // namespace
+
+void Dp32Store::unload()
+{
+    m_src_keys.clear();
+    m_src_keys.shrink_to_fit();
+    m_src_dead.clear();
+    m_src_dead.shrink_to_fit();
+    m_drf.clear();
+    m_src_dead_n = 0;
+    m_drf_count = 0;
+    m_loaded = false;
+}
+
+bool Dp32Store::load(const char* src_path, const char* drf_path)
+{
+    unload();
+    m_src_path = src_path;
+    m_drf_path = drf_path;
+    if (load_impl()) {
+        m_loaded = true;
+        return true;
+    }
+    // 半成品索引不许留在手上 —— 调用方只看 loaded()
+    unload();
+    return false;
+}
+
+bool Dp32Store::load_impl()
+{
+    // ---- 源库: 升序且索引唯一 ⇒ index -> 槽位就是有序数组的下标 ----
+    {
+        std::ifstream ifs;
+        uint64_t n = 0;
+        if (!dp32_open_indexed(ifs, m_src_path.c_str(), DP32_SOURCE_MAGIC, n)) return false;
+        if (n > 0xFFFFFFFFULL) return false;   // 槽位用 uint32_t 装
+        m_src_keys.resize((size_t)n);
+        m_src_dead.assign((size_t)((n + 63) / 64), 0);
+        std::vector<unsigned char> buf(DP32_CHUNK * sizeof(Dp32Record));
+        uint64_t got = 0;
+        uint64_t dead = 0;
+        while (got < n) {
+            const size_t batch = (size_t)std::min<uint64_t>(DP32_CHUNK, n - got);
+            ifs.read((char*)buf.data(), (std::streamsize)(batch * sizeof(Dp32Record)));
+            if ((size_t)ifs.gcount() != batch * sizeof(Dp32Record)) return false;
+            for (size_t i = 0; i < batch; ++i) {
+                const size_t slot = (size_t)(got + i);
+                const unsigned char* p = buf.data() + i * sizeof(Dp32Record);
+                const uint64_t key = dp32_le64(p);
+                // 严格升序既是"槽位 = 下标"这条捷径的前提, 也是库没被写坏的最强凭据
+                if (slot != 0 && key <= m_src_keys[slot - 1]) return false;
+                m_src_keys[slot] = key;
+                Dp32Record r;
+                memcpy(&r, p, sizeof(r));
+                if (dp32_is_tombstone(r)) {
+                    m_src_dead[slot / 64] |= (1ULL << (slot % 64));
+                    ++dead;
+                }
+            }
+            got += batch;
+        }
+        m_src_dead_n = dead;
+        ifs.close();
+    }
+
+    // ---- 已征召库: 追加序, 同一索引可能多条 (不同 x) ⇒ index -> 槽位列表 ----
+    {
+        std::ifstream ifs;
+        uint64_t n = 0;
+        if (!dp32_open_indexed(ifs, m_drf_path.c_str(), DP32_DRAFTED_MAGIC, n)) return false;
+        if (n > 0xFFFFFFFFULL) return false;
+        std::vector<unsigned char> buf(DP32_CHUNK * sizeof(Dp32Record));
+        uint64_t got = 0;
+        while (got < n) {
+            const size_t batch = (size_t)std::min<uint64_t>(DP32_CHUNK, n - got);
+            ifs.read((char*)buf.data(), (std::streamsize)(batch * sizeof(Dp32Record)));
+            if ((size_t)ifs.gcount() != batch * sizeof(Dp32Record)) return false;
+            for (size_t i = 0; i < batch; ++i) {
+                // 已征召库是纯追加的落点, 不做墓碑 ⇒ 每条都是活的, 直接入桶
+                m_drf[dp32_le64(buf.data() + i * sizeof(Dp32Record))].push_back((uint32_t)(got + i));
+            }
+            got += batch;
+        }
+        m_drf_count = n;
+        ifs.close();
+    }
+
+    return true;
+}
+
+Dp32Hit Dp32Store::src_find(uint64_t index, uint32_t& slot) const
+{
+    const auto it = std::lower_bound(m_src_keys.begin(), m_src_keys.end(), index);
+    if (it == m_src_keys.end() || *it != index) return Dp32Hit::Absent;
+    slot = (uint32_t)(it - m_src_keys.begin());
+    return src_dead(slot) ? Dp32Hit::Tombstone : Dp32Hit::Live;
+}
+
+bool Dp32Store::src_dead(uint32_t slot) const
+{
+    if (slot >= m_src_keys.size()) return true;
+    return ((m_src_dead[slot / 64] >> (slot % 64)) & 1ULL) != 0;
+}
+
+const std::vector<uint32_t>* Dp32Store::drf_slots(uint64_t index) const
+{
+    const auto it = m_drf.find(index);
+    return it == m_drf.end() ? nullptr : &it->second;
+}
+
+bool Dp32Store::read(Dp32File which, uint32_t slot, Dp32Record& r) const
+{
+    const std::string& path = (which == Dp32File::Source) ? m_src_path : m_drf_path;
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) return false;
+    ifs.seekg(dp32_offset(slot), std::ios::beg);
+    if (!ifs.good()) return false;
+    ifs.read((char*)&r, (std::streamsize)sizeof(r));
+    return (size_t)ifs.gcount() == sizeof(r);
+}
+
+// 写 72 字节里的 (m, n) 那 64 字节: 记录布局是 index(8) + m(32) + n(32)。
+static constexpr std::streamoff DP32_REC_MN_OFF = (std::streamoff)sizeof(uint64_t);
+// 头里 records 字段的偏移: magic(8) + version(4) + record_size(4)。
+static constexpr std::streamoff DP32_HDR_RECORDS_OFF =
+    (std::streamoff)(sizeof(Dp32Header) - sizeof(uint64_t));
+
+bool Dp32Store::src_tombstone(uint32_t slot)
+{
+    if (slot >= m_src_keys.size()) return false;
+    if (src_dead(slot)) return false;   // 已经是墓碑: 不重写文件, 也不重复计数
+
+    std::fstream fs(m_src_path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!fs.is_open()) return false;
+    // 只清 (m, n), index 与槽位都留在原地 —— 墓碑的哨兵只看 m/n (见 dp32_is_tombstone),
+    // 位置不动 ⇒ 源库依然按索引升序, "槽位 = 下标" 这条捷径不破。
+    static const unsigned char zeros[64] = {0};
+    fs.seekp(dp32_offset(slot) + DP32_REC_MN_OFF, std::ios::beg);
+    fs.write((const char*)zeros, (std::streamsize)sizeof(zeros));
+    fs.flush();
+    if (!fs.good()) return false;
+    fs.close();
+
+    m_src_dead[slot / 64] |= (1ULL << (slot % 64));
+    ++m_src_dead_n;
+    return true;
+}
+
+bool Dp32Store::drf_append(uint64_t index, const unsigned char* m, const unsigned char* n)
+{
+    if (m == nullptr || n == nullptr) return false;
+    const uint64_t slot = m_drf_count;
+    if (slot > 0xFFFFFFFFULL) return false;   // 槽位用 uint32_t 装
+
+    Dp32Record r = {};
+    r.index = index;
+    memcpy(r.m, m, sizeof(r.m));
+    memcpy(r.n, n, sizeof(r.n));
+
+    std::fstream fs(m_drf_path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!fs.is_open()) return false;
+    // 记录本体落在文件尾 (= 下一个槽位的位置)
+    fs.seekp(dp32_offset((uint32_t)slot), std::ios::beg);
+    fs.write((const char*)&r, (std::streamsize)sizeof(r));
+    fs.flush();
+    if (!fs.good()) return false;
+    // 头里的条数必须跟上: 载入时"条数 == 文件长度/72"是严格对账的, 只写一处会让整个
+    // 已征召库下次载不进来 (这条对账是"文件没被截断"的最强凭据, 不能为了省这一步放宽)。
+    // 两次写之间崩溃这一步是修不掉的窗口 (一次 write 才是原子的); 顺序取"先记录后
+    // 条数", 崩了至少记录还在, 能用工具补。落这一笔的时机是"预备点被征召上市",
+    // 通常一轮 0 条。
+    const uint64_t records = slot + 1;
+    fs.seekp(DP32_HDR_RECORDS_OFF, std::ios::beg);
+    fs.write((const char*)&records, (std::streamsize)sizeof(records));
+    fs.flush();
+    if (!fs.good()) return false;
+    fs.close();
+
+    m_drf[index].push_back((uint32_t)slot);
+    m_drf_count = records;
+    return true;
+}
+
+bool Dp32Store::src_next(uint32_t& cursor, Dp32Record& r) const
+{
+    while (cursor < m_src_keys.size()) {
+        const uint32_t slot = cursor++;
+        if (src_dead(slot)) continue;   // 已征召 / 已墓碑的槽位不交出去
+        return read(Dp32File::Source, slot, r);
+    }
+    return false;
+}
+
+Dp32Store& dp32_store()
+{
+    static Dp32Store s;
+    return s;
+}
+
+bool dp32_store_init()
+{
+    Dp32Store& s = dp32_store();
+    if (s.loaded()) return true;
+    if (!s.load()) {
+        // 载入失败是异常 (库缺失/损坏 -> 3 类货源回退随机点): 既印在控制台上让人当场
+        // 看见, 也留在生产日志里。
+        cprint() << "====Dp32 瘦索引载入失败 (库缺失或损坏): " << DP32_SOURCE_FILE << " / "
+                 << DP32_DRAFTED_FILE << std::endl;
+        if (g_log != nullptr) {
+            g_log->ofs << "====Dp32 瘦索引载入失败 (库缺失或损坏): " << DP32_SOURCE_FILE
+                       << " / " << DP32_DRAFTED_FILE << std::endl;
+        }
+        return false;
+    }
+    // 载入结果只在控制台上说一句, 不写生产日志: 每次启动都有的例行信息。
+    cprint() << "====Dp32 瘦索引已载入: 源库 " << s.src_count() << " 条 (墓碑 "
+             << s.src_dead_count() << "), 已征召库 " << s.drf_count() << " 条" << std::endl;
+    return true;
+}
+
+// 本文件由 bitcoin_node 工程编译, 而 Release 配置带 /DNDEBUG ⇒ 裸 assert() 连表达式
+// 一起被剔掉, 自测会退化成"什么都不验、只打印一行 ok"。自测必须真跑, 所以自己来一个
+// 同语义的 (打印表达式与行号后退出), 和 rho.cpp 的 RESERVE_CHECK 一致。
+#define DP32_CHECK(cond)                                                     \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            std::printf("dp32 check FAILED: %s (line %d)\n", #cond, __LINE__); \
+            std::fflush(stdout);                                             \
+            std::abort();                                                    \
+        }                                                                    \
+    } while (0)
+
+// 自测: 全部走合成文件 (不碰生产库); 最后若真库在, 再做一轮抽样复算。
+void validate_dp32_store()
+{
+    const std::string psrc = std::string(DP32_SOURCE_FILE) + ".selftest";
+    const std::string pdrf = std::string(DP32_DRAFTED_FILE) + ".selftest";
+    const std::string pbad = psrc + ".bad";
+
+    auto mk = [](uint64_t index, unsigned char tag) {
+        Dp32Record r;
+        memset(&r, 0, sizeof(r));
+        r.index = index;
+        memset(r.m, tag, sizeof(r.m));
+        memset(r.n, (unsigned char)(tag + 1), sizeof(r.n));
+        return r;
+    };
+    auto tomb = [](uint64_t index) {
+        Dp32Record r;
+        memset(&r, 0, sizeof(r));
+        r.index = index;   // 墓碑只清 m/n, index 留在原地
+        return r;
+    };
+    auto dump = [](const std::string& p, const char* magic, const std::vector<Dp32Record>& rs) {
+        std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) return false;
+        if (!dp32_write_header(ofs, magic, rs.size())) return false;
+        if (!rs.empty()) {
+            ofs.write((const char*)rs.data(), (std::streamsize)(rs.size() * sizeof(Dp32Record)));
+        }
+        ofs.flush();
+        return ofs.good();
+    };
+    auto slurp = [](const std::string& p) {
+        std::ifstream ifs(p, std::ios::binary);
+        return std::vector<unsigned char>((std::istreambuf_iterator<char>(ifs)),
+                                          std::istreambuf_iterator<char>());
+    };
+    auto sput = [](const std::string& p, const std::vector<unsigned char>& b) {
+        std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) return false;
+        if (!b.empty()) ofs.write((const char*)b.data(), (std::streamsize)b.size());
+        ofs.flush();
+        return ofs.good();
+    };
+
+    // 合成库: 源库 3 条 (槽位 1 是墓碑, 索引留在原地); 已征召库 3 条, 其中索引 20 有两条
+    const std::vector<Dp32Record> src = {mk(10, 0x11), tomb(20), mk(30, 0x33)};
+    const std::vector<Dp32Record> drf = {mk(20, 0x51), mk(99, 0x61), mk(20, 0x52)};
+    DP32_CHECK(dump(psrc, DP32_SOURCE_MAGIC, src));
+    DP32_CHECK(dump(pdrf, DP32_DRAFTED_MAGIC, drf));
+
+    Dp32Store s;
+    DP32_CHECK(s.load(psrc.c_str(), pdrf.c_str()));
+    DP32_CHECK(s.loaded());
+    DP32_CHECK(s.src_count() == 3 && s.drf_count() == 3 && s.src_dead_count() == 1);
+
+    uint32_t slot = 0xFFFFFFFFu;
+    DP32_CHECK(s.src_find(10, slot) == Dp32Hit::Live && slot == 0);
+    DP32_CHECK(s.src_find(20, slot) == Dp32Hit::Tombstone && slot == 1);
+    DP32_CHECK(s.src_find(30, slot) == Dp32Hit::Live && slot == 2);
+    DP32_CHECK(s.src_find(9, slot) == Dp32Hit::Absent);
+    DP32_CHECK(s.src_find(15, slot) == Dp32Hit::Absent);
+    DP32_CHECK(s.src_find(31, slot) == Dp32Hit::Absent);
+    DP32_CHECK(s.src_find(0, slot) == Dp32Hit::Absent);
+    DP32_CHECK(s.src_dead(1) && !s.src_dead(0) && !s.src_dead(2));
+    DP32_CHECK(s.src_dead(3));   // 越界也当"别去读"
+    // 已征召库: 同一个索引必须能把整个桶交出来, 不能只回一条
+    const std::vector<uint32_t>* b20 = s.drf_slots(20);
+    DP32_CHECK(b20 != nullptr && b20->size() == 2 && (*b20)[0] == 0 && (*b20)[1] == 2);
+    const std::vector<uint32_t>* b99 = s.drf_slots(99);
+    DP32_CHECK(b99 != nullptr && b99->size() == 1 && (*b99)[0] == 1);
+    DP32_CHECK(s.drf_slots(98) == nullptr);
+    // 按槽位读回来的必须就是写进去的那条
+    Dp32Record r;
+    DP32_CHECK(s.read(Dp32File::Source, 2, r) && r.index == 30 && r.m[0] == 0x33 && r.n[0] == 0x34);
+    DP32_CHECK(s.read(Dp32File::Drafted, 2, r) && r.index == 20 && r.m[0] == 0x52);
+    DP32_CHECK(!s.read(Dp32File::Source, 3, r));   // 越界: 读不到 72 字节
+    // 幂等: 再载一遍, 不许残留上一次的索引
+    DP32_CHECK(s.load(psrc.c_str(), pdrf.c_str()));
+    DP32_CHECK(s.src_count() == 3 && s.drf_count() == 3 && s.src_dead_count() == 1);
+
+    // 坏库必须整体拒绝, 而且失败后连半成品索引都不许留
+    auto must_reject = [&](const char* why) {
+        Dp32Store t;
+        const bool ok = t.load(pbad.c_str(), pdrf.c_str());
+        DP32_CHECK(!ok && !t.loaded() && t.src_count() == 0 && t.drf_count() == 0);
+        DP32_CHECK(t.src_find(10, slot) == Dp32Hit::Absent);
+        cprintf("dp32 store: 坏库已拒绝 (%s)\n", why);
+    };
+    const std::vector<unsigned char> raw = slurp(psrc);
+    DP32_CHECK(!raw.empty());
+    {
+        std::vector<unsigned char> b = raw;
+        b[0] ^= 0xFF;                                    // 魔数
+        DP32_CHECK(sput(pbad, b));
+        must_reject("magic");
+    }
+    {
+        std::vector<unsigned char> b = raw;
+        b[8] = 9;                                        // 版本号
+        DP32_CHECK(sput(pbad, b));
+        must_reject("version");
+    }
+    {
+        std::vector<unsigned char> b = raw;
+        b[12] = (unsigned char)(sizeof(Dp32Record) - 1); // 记录长度
+        DP32_CHECK(sput(pbad, b));
+        must_reject("record size");
+    }
+    {
+        std::vector<unsigned char> b = raw;              // 截断: 头里的条数对不上文件长度
+        b.resize(b.size() - sizeof(Dp32Record));
+        DP32_CHECK(sput(pbad, b));
+        must_reject("truncated");
+    }
+    {
+        std::vector<unsigned char> b = raw;              // 源库不再升序 (把首条索引改成 40)
+        const uint64_t k = 40;
+        memcpy(b.data() + sizeof(Dp32Header), &k, sizeof(k));
+        DP32_CHECK(sput(pbad, b));
+        must_reject("not ascending");
+    }
+    {
+        Dp32Store t;                                     // 文件不存在
+        DP32_CHECK(!t.load((psrc + ".nope").c_str(), pdrf.c_str()));
+        DP32_CHECK(!t.loaded() && t.src_count() == 0);
+        cprintf("dp32 store: 坏库已拒绝 (missing)\n");
+    }
+    std::remove(pbad.c_str());
+    std::remove(psrc.c_str());
+    std::remove(pdrf.c_str());
+    cprintf("dp32 store: ok (瘦索引 载入/升序查找/墓碑跳过/同索引多桶/坏库拒绝)\n");
+
+    // ---- 真库抽样复算: 记录里那个 index 是"x 低 32 位全 0 时 x 的 bit 32..95",
+    // 所以必须真拿 m,n 算出 x 来对一遍, 不能只信文件里那个数 ----
+    Dp32Store real;
+    if (!real.load()) {
+        cprintf("dp32 store: 真库不可用 (还没扫过), 跳过抽样复算\n");
+        return;
+    }
+    uint64_t checked = 0;
+    auto verify = [&](Dp32File which, uint32_t sl) {
+        Dp32Record rec;
+        DP32_CHECK(real.read(which, sl, rec));
+        secp256k1_pubkey pk = {0};
+        create(ctx, &pk, rec.m, rec.n);
+        uint64_t idx = 0;
+        DP32_CHECK(dp32_test(pk, idx));
+        DP32_CHECK(idx == rec.index);
+        ++checked;
+    };
+    const uint64_t sn = real.src_count();
+    if (sn > 0) {
+        // 头 / 四分位 / 中 / 尾各抽 32 条连续槽位 (跳过墓碑), 既验内容也验位图没标错。
+        // 连续抽是因为"槽位 -> 文件偏移"一旦错位, 单点抽样可能凑巧躲过去, 连续 32 条躲不掉。
+        const uint64_t probes[] = {0, sn / 4, sn / 2, (sn * 3) / 4, sn - 1};
+        for (uint64_t base : probes) {
+            for (uint64_t k = 0; k < 32 && base + k < sn; ++k) {
+                const uint32_t sl = (uint32_t)(base + k);
+                Dp32Record rec;
+                DP32_CHECK(real.read(Dp32File::Source, sl, rec));
+                DP32_CHECK(dp32_is_tombstone(rec) == real.src_dead(sl));
+                if (real.src_dead(sl)) continue;
+                verify(Dp32File::Source, sl);
+            }
+        }
+    }
+    // 已征召库不大 (几千条), 干脆全量复算: 记录自洽 (m, n 复算出的 x 落在自己写的
+    // index 上) 是这个库的基本契约 —— 征召销账时源库那条立墓碑之前, 同一份 (m, n)
+    // 先追加到了这里, 两个库记的必须是同一批点。
+    const uint64_t dn = real.drf_count();
+    for (uint32_t sl = 0; sl < dn; ++sl) {
+        Dp32Record rec;
+        DP32_CHECK(real.read(Dp32File::Drafted, sl, rec));
+        DP32_CHECK(!dp32_is_tombstone(rec));   // 已征召库是纯追加落点, 不该有墓碑
+        verify(Dp32File::Drafted, sl);
+    }
+    cprintf("dp32 store: 真库 ok (源库 %llu 条 / 墓碑 %llu, 已征召 %llu 条全量复算, 源库抽样 %llu 条)\n",
+            (unsigned long long)sn, (unsigned long long)real.src_dead_count(),
+            (unsigned long long)dn, (unsigned long long)checked);
+}
+
+// 已征召库里有没有"和这条语料记录完全一样"的那条 (索引 + m/n 逐字节)
+static bool dp32_corpus_in_drafted(const Dp32Store& s, uint64_t index, const SecPair& sp)
+{
+    const std::vector<uint32_t>* slots = s.drf_slots(index);
+    if (slots == nullptr) return false;
+    for (const uint32_t sl : *slots) {
+        Dp32Record rec;
+        if (!s.read(Dp32File::Drafted, sl, rec)) continue;
+        if (memcmp(rec.m, sp.m, 32) == 0 && memcmp(rec.n, sp.n, 32) == 0) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// 自测: 真库与 data 语料对账
+//
+// 两个库都是扫描器从 data 目录下的 DistinguishablePoints*.txt 语料合并来的, 但
+// "库确实是语料的忠实副本"这件事从来没被校验过: 上面那段真库抽样复算只验了"库里的
+// 记录自洽 (m, n 复算出的 x 真的落在自己写的 index 上)", 跟语料没有任何对照。补两件:
+//
+// (一) 条数对得上。语料里每个去重后的 32 位 DP 在库里必须正好有一条:
+//        语料里的 40 位点 -> 已征召库 (扫描时就地征召, 不进源库)
+//        语料里的其余点   -> 源库一条活记录, 或者已被征召销账 (源库立墓碑)
+//      即 (源库活记录) + (已征召库条数) == 语料去重后的条目数。少一条是扫描器漏读,
+//      多一条是点凭空出现。销账时源库 -1、已征召 +1 ⇒ 这个和数在运行期是不变量。
+// (二) 语料里的点确实能在库里找到。每个语料文件均分抽 8 条 (含首尾), 现算 x:
+//      首列索引必须等于复算出来的 idx32, 再去库里定位, 并把库里那条的 (m, n) 跟语料
+//      原文**逐字节**比 —— 索引只是 x 的 bit 32..95, 索引相同不等于同一条点。
+//
+// 计数只读语料首列 (不做 89 万次点乘), 那个口径扫描时已逐条复算核对过
+// (Dp32ScanStats::idx_mismatch); 只有抽样的那几十条才真算 x。
+//
+// 语料是追加写的 (DistinguishablePoints_rho*.txt 还在长), 而库是"缺了/坏了才重建"的,
+// 所以"库比语料少"可能是正常的落后: 语料文件比库新、且库侧每一项都没多于语料侧
+// (多出来的条目在语料里找不到出处), 就只提示重建而不判失败。
+// ---------------------------------------------------------------------------
+void validate_dp32_corpus()
+{
+    Dp32Store real;
+    if (!real.load()) {
+        cprintf("dp32 corpus: 真库不可用 (还没扫过), 跳过对账\n");
+        return;
+    }
+    const std::string dataDir = dp32_find_data_dir();
+    if (dataDir.empty()) {
+        cprintf("dp32 corpus: 没找到 data 语料目录, 跳过对账\n");
+        return;
+    }
+    const std::vector<fs::path> files = dp32_corpus_files(dataDir);
+
+    // ---- (一) 语料侧计数: 只取首列, 按 40 位判据 (索引低 8 位为 0) 分两类去重 ----
+    std::vector<uint64_t> idx32, idx40;
+    std::vector<uint64_t> per_file(files.size(), 0);
+    uint64_t n_rec = 0;
+    for (size_t fi = 0; fi < files.size(); ++fi) {
+        std::ifstream ifs(files[fi]);
+        if (!ifs.is_open()) continue;
+        uint64_t index = 0;
+        SecPair sp;
+        uint64_t n = 0;
+        while (dp32_read_text_record(ifs, index, sp)) {
+            ++n;
+            ((index & 0xFF) == 0 ? idx40 : idx32).push_back(index);
+        }
+        per_file[fi] = n;
+        n_rec += n;
+    }
+    std::sort(idx32.begin(), idx32.end());
+    idx32.erase(std::unique(idx32.begin(), idx32.end()), idx32.end());
+    std::sort(idx40.begin(), idx40.end());
+    idx40.erase(std::unique(idx40.begin(), idx40.end()), idx40.end());
+    const uint64_t d32 = (uint64_t)idx32.size();
+    const uint64_t d40 = (uint64_t)idx40.size();
+    const uint64_t corpus_n = d32 + d40;   // 语料去重后的条目数
+
+    // ---- (二) 抽样: 每文件均分 8 条 (含首尾), 现算 x 去库里认领 ----
+    constexpr int SAMPLE_PER_FILE = 8;
+    uint64_t planned = 0, sampled = 0, n40_sample = 0;
+    for (size_t fi = 0; fi < files.size(); ++fi) {
+        const uint64_t n = per_file[fi];
+        if (n == 0) continue;
+        std::vector<uint64_t> want;
+        for (int j = 0; j < SAMPLE_PER_FILE; ++j) {
+            const uint64_t pos = (n - 1) * (uint64_t)j / (uint64_t)(SAMPLE_PER_FILE - 1);
+            if (want.empty() || want.back() != pos) want.push_back(pos);
+        }
+        planned += want.size();
+        std::ifstream ifs(files[fi]);
+        if (!ifs.is_open()) continue;
+        uint64_t rec_no = 0;
+        size_t wi = 0;
+        uint64_t index = 0;
+        SecPair sp;
+        while (wi < want.size() && dp32_read_text_record(ifs, index, sp)) {
+            if (rec_no++ != want[wi]) continue;
+            ++wi;
+            secp256k1_pubkey pk = {0};
+            create(ctx, &pk, sp.m, sp.n);
+            uint64_t idx32 = 0;
+            DP32_CHECK(dp32_test(pk, idx32));
+            DP32_CHECK(idx32 == index);   // 语料首列就是复算出来的索引
+            if ((idx32 & 0xFF) == 0) {
+                DP32_CHECK(dp32_corpus_in_drafted(real, idx32, sp));   // 40 位点: 扫描时就地征召
+                ++n40_sample;
+            } else {
+                uint32_t slot = 0xFFFFFFFFu;
+                const Dp32Hit hit = real.src_find(idx32, slot);
+                DP32_CHECK(hit != Dp32Hit::Absent);
+                if (hit == Dp32Hit::Live) {
+                    Dp32Record rec;
+                    DP32_CHECK(real.read(Dp32File::Source, slot, rec));
+                    DP32_CHECK(!dp32_is_tombstone(rec));
+                    DP32_CHECK(memcmp(rec.m, sp.m, 32) == 0 && memcmp(rec.n, sp.n, 32) == 0);
+                } else {
+                    // 墓碑: 这条已被征召销账 ⇒ 已征召库里必须有同一条 (先追加后立墓碑)
+                    DP32_CHECK(dp32_corpus_in_drafted(real, idx32, sp));
+                }
+            }
+            ++sampled;
+        }
+    }
+    DP32_CHECK(sampled == planned);   // 两遍读同一个文件, 条数必须一致
+
+    // ---- (二·补) 上面那种均匀抽样有可能一条 40 位点都抽不到 (40 位只占语料的 0.37%),
+    // 那样"语料里的 40 位点能在已征召库里查到"这条路径就一次都没走过。所以再从 40 位
+    // 索引表里均匀挑 FORCE40 个当靶子, 把语料整体扫一遍把它们捞出来, 逐条现算 + 查库。
+    constexpr int FORCE40 = 8;
+    if (!idx40.empty()) {
+        std::vector<uint64_t> targets;   // 均匀挑出的靶子索引 (去重后 ≤ FORCE40), 天然升序
+        for (int j = 0; j < FORCE40; ++j) {
+            const size_t pos = (idx40.size() - 1) * (size_t)j / (size_t)(FORCE40 - 1);
+            if (targets.empty() || targets.back() != idx40[pos]) targets.push_back(idx40[pos]);
+        }
+        std::vector<bool> found(targets.size(), false);
+        for (const auto& f : files) {
+            std::ifstream ifs(f);
+            if (!ifs.is_open()) continue;
+            uint64_t index = 0;
+            SecPair sp;
+            while (dp32_read_text_record(ifs, index, sp)) {
+                if ((index & 0xFF) != 0) continue;     // 只看 40 位那批
+                if (!std::binary_search(targets.begin(), targets.end(), index)) continue;
+                const size_t ti = (size_t)(std::lower_bound(targets.begin(), targets.end(), index) -
+                                           targets.begin());
+                if (found[ti]) continue;               // 同一个 40 位点在多个文件里重复出现
+                found[ti] = true;
+                secp256k1_pubkey pk = {0};
+                create(ctx, &pk, sp.m, sp.n);
+                uint64_t i32 = 0;
+                DP32_CHECK(dp32_test(pk, i32));
+                DP32_CHECK(i32 == index);              // 语料首列就是复算出来的索引
+                DP32_CHECK(dp32_corpus_in_drafted(real, i32, sp));
+                ++sampled;
+                ++n40_sample;
+            }
+        }
+        for (bool b : found) DP32_CHECK(b);   // 靶子都是从语料里挑的, 必须都能捞出来
+    }
+
+    // ---- (三) 库侧计数, 与语料侧对账 ----
+    // 已征召库里"索引低 8 位为 0"的条目就是本身为 40 位点的那批, 全部来自语料 (扫描时
+    // 直接征召); 其余是征召销账时从源库挪过来的, 而源库只放非 40 位点 ⇒ 它们只可能是
+    // 语料里的非 40 位点。两边分开对, 出错时一眼看得出是哪半边。
+    const uint64_t src_n = real.src_count();
+    const uint64_t dead = real.src_dead_count();
+    const uint64_t live = src_n - dead;
+    const uint64_t drf = real.drf_count();
+    uint64_t drf40 = 0;
+    for (uint32_t sl = 0; sl < drf; ++sl) {
+        Dp32Record rec;
+        DP32_CHECK(real.read(Dp32File::Drafted, sl, rec));
+        if ((rec.index & 0xFF) == 0) ++drf40;
+    }
+    const uint64_t moved = drf - drf40;      // 征召销账时从源库挪过来的条数
+    const uint64_t lib_sum = live + drf;     // 两库之和
+
+    // 语料文件比库新 ⇒ 库可能只是落后 (扫描器"缺了才重建", 不会因为语料长大而重扫)
+    bool corpus_newer = false;
+    {
+        std::error_code ec;
+        const auto lib_t = fs::last_write_time(fs::u8path(real.src_path()), ec);
+        for (const auto& f : files) {
+            if (fs::last_write_time(f, ec) > lib_t) corpus_newer = true;
+        }
+    }
+    // 库侧比语料侧多 = 无从解释 (语料是唯一的进货渠道, 两个库都只由扫描器写)
+    const bool lib_over = (live + moved) > d32 || drf40 > d40;
+    const bool match = drf40 == d40 && (live + moved) == d32;
+
+    if (match) {
+        DP32_CHECK(lib_sum == corpus_n);   // 两库之和 == 语料去重后的条目数
+        cprintf("dp32 corpus: 对账 ok (语料 %llu 条去重 %llu = 40 位 %llu -> 已征召库 + 其余 %llu "
+                "(源库活 %llu + 已移库 %llu); 源库槽位 %llu 墓碑 %llu, 已征召 %llu 条; "
+                "抽样 %llu 条全中, 其中 40 位 %llu)\n",
+               (unsigned long long)n_rec, (unsigned long long)corpus_n,
+               (unsigned long long)d40, (unsigned long long)d32,
+               (unsigned long long)live, (unsigned long long)moved,
+               (unsigned long long)src_n, (unsigned long long)dead, (unsigned long long)drf,
+               (unsigned long long)sampled, (unsigned long long)n40_sample);
+        return;
+    }
+    if (corpus_newer && !lib_over) {
+        cprintf("dp32 corpus: 库比语料旧 %llu 条 (语料 %llu 去重后 %llu, 库 %llu) —— 语料文件比库新, "
+                "需要重建源库 (testmvp 120 888), 不算失败\n",
+               (unsigned long long)(corpus_n - lib_sum), (unsigned long long)n_rec,
+               (unsigned long long)corpus_n, (unsigned long long)lib_sum);
+        return;
+    }
+    cprintf("dp32 corpus: 对账失败: 语料 %llu 条去重 %llu (40 位 %llu / 其余 %llu); 源库 %llu 条 "
+            "(活 %llu / 墓碑 %llu); 已征召 %llu 条 (40 位 %llu / 其余 %llu)\n",
+           (unsigned long long)n_rec, (unsigned long long)corpus_n, (unsigned long long)d40,
+           (unsigned long long)d32, (unsigned long long)src_n, (unsigned long long)live,
+           (unsigned long long)dead, (unsigned long long)drf, (unsigned long long)drf40,
+           (unsigned long long)moved);
+    DP32_CHECK(lib_sum == corpus_n);      // 两库之和 == 语料去重后的条目数
+    DP32_CHECK(drf40 == d40);             // 40 位那半边
+    DP32_CHECK(live + moved == d32);      // 其余那半边
 }
 
 class BabyGiant
@@ -3617,7 +4645,7 @@ static bool pin_to_physical_core(unsigned index)
 
 template <typename PLAYER>
 void play() {
-    // 槽位数与 initRhoState 生成器共用同一个常量 (common.h), 存档文件条数一致
+    // 槽位数就是存档文件的条数上限 (RHO_STATE_SLOTS, 见 common.h)
     std::string _logvec[RHO_STATE_SLOTS];
     RhoState rs[RHO_STATE_SLOTS] = {0};
     bool pause = false;
@@ -4115,26 +5143,36 @@ static RPCHelpMan testmvp()
                 }
             }
 
-            auto initRhoState = []() {
-                RhoState rs[RHO_STATE_SLOTS] = {0};
-                for (RhoState& r : rs) {
-                    r.rand();                    
-                    r.times = 0;
-                }
-                saveRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
-
-
-                g_log->ofs << "====RhoState refreshed at " << get_time() << std::endl;
-            };
-            //生成RhoState
+            //整理 32 位可区分点源库: 把 data 目录下的 DistinguishablePoints*.txt 语料
+            //合并成源库 DpSource32.bin + 已征召库 DpDrafted32.bin, 顺便把其中本身也是
+            //40 位 DP 的点归档到 _DPFile_name 并直接计入已征召库。幂等: 两个库都完好就跳过。
+            //重建源库会移动槽位号, 而 rho 的 3 类货源 (ReserveSource::Dp) 在
+            //D:\RhoReserve.txt 里存的就是槽位游标 —— 重建之后那个游标至多指偏, 不会崩,
+            //只是可能重复发出几条已经用过的点。所以重建完最好把存档里的 supply Dp 清零。
             if (ta == 120 && ta2 == 888) {
-                initRhoState();
-
-                RhoState rs2[RHO_STATE_SLOTS] = {0};
-                loadRhoState(rs2, sizeof(rs2) / sizeof(RhoState), _RSFile1_name);
-                for (RhoState& r : rs2) {
-                    assert(check(ctx, &r.x, r.m, r.n));
-                }
+                dp32_build_source_entry();
+            }
+            //上面那两个库跟 data 语料的对账自检 (条数: 两库之和 == 语料去重后的条目数;
+            //抽样: 语料里的点能在库里找到同一条)。单独一个入口, 不必跑整个 validate:
+            //testmvp 120 889
+            if (ta == 120 && ta2 == 889) {
+                validate_dp32_corpus();
+            }
+            //货源配置的生产前自检: 按当前 g_reserve_source 把生产启动那一步 (建池 ->
+            //账本取满 -> 上传设备常量内存) 走一遍, 逐槽核对点是否自洽/互不相同, 以及
+            //来源配成 3 类时是不是真的都取到了源库里的 32 位 DP。
+            //换货源 (rho.cpp 的 g_reserve_source) 之后跑这个, 不必等全量 validate。
+            //testmvp 120 891
+            if (ta == 120 && ta2 == 891) {
+                validate_reserve_prod_config();
+            }
+            //被征召的预备点"重走"探针: 拿已征召库 (D:\DpDrafted32.bin) 尾部几条点的原始
+            //(m, n) 当起点, 用生产核同一套步进 (fun_add_w, W=RHO_GPU_WALKERS) 往前走,
+            //每步拿 (m, n) 去 RhoState2.txt 的 (m, n) 集合里查 —— 看被征召的那几个预备点
+            //之后有没有真的落到落盘的那批 rhostate 上。只读, 不动设备内存/不写文件。
+            //testmvp 120 892
+            if (ta == 120 && ta2 == 892) {
+                rho_rewalk_probe();
             }
             //测试 rho_F 与 rho_Fi 或者 giantStep 与 giantStepi
             if (ta == 121) {

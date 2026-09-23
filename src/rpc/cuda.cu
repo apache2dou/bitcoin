@@ -1020,7 +1020,11 @@ static_assert(sizeof(RhoPoint_dev) % 16 == 0, "array stride must be 16B or only 
 __device__ RhoPoint_dev adds_pub_dev[256];
 
 constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
-__constant__ RhoPoint_dev RhoStates_rand[dp_buffer_size];
+// DP 命中后的**预备队** (按缓冲区槽位下标一取出, 一人一个)。
+// 它和 RhoStates_dev 不是一回事: 这个数组不参与迭代, 只在某个 walker 命中可区分点
+// 时取出对应槽位的一份独立点, 把该 walker 原地顶替掉 (见 add_dp_to_buffer)。
+// 池里的点从哪儿来 (来源与账本) 全在 rpc/rho.cpp, 见 common.h 的 ReserveSource。
+__constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 
 // GPU 多 walker: 每线程 walker 数。批量求逆每点多付 ~3 次模乘, 换掉
 // (1-1/W) 次 safegcd 模逆。
@@ -1356,7 +1360,6 @@ __device__ volatile bool* break_flag_dev = nullptr;
 bool* break_flag_host = nullptr;                // 主机端指针
 extern bool gameover;
 
-
 RhoPoint_dev* RhoStates_host = nullptr;
 __device__ RhoPoint_dev* RhoStates_dev = nullptr;
 
@@ -1393,7 +1396,10 @@ __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
     transfer(buffer[index].sp.m , (const unsigned char*)&r.m);
     transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
 
-    r = RhoStates_rand[index];
+    // 记录完就走预备队: 这条 walker 由槽位 index 对应的替补点顶上。
+    // index 同时就是这条 DP 记录的下标 —— 主机侧的账本正是靠这一点知道
+    // "这一轮槽位 index 被征调了" (见 rho.cpp 的 note_reserve_dps)。
+    r = RhoStates_reserve[index];
 
     if (dp_buffer_count >= max_size)
         *break_flag_dev = true;
@@ -1469,8 +1475,9 @@ public:
         CHECK_CUDA(cudaMemcpyToSymbol(dp_buffer_count, &zero, sizeof(unsigned int)));
     }
 
-    // 从设备复制 DP 到主机并保存
-    void save_dps()
+    // 从设备复制 DP 到主机并保存。返回这一轮的**记录条数** —— 预备队账本要用它
+    // 记账 (记录下标 = 被征调的槽位, 见 rho.cpp 的 note_reserve_dps)。
+    unsigned int save_dps()
     {
         // 获取当前缓冲区计数
         unsigned int current_count;
@@ -1483,15 +1490,21 @@ public:
                                   current_count * sizeof(DpBuffer), cudaMemcpyDeviceToHost));
 
             for (const auto& dp : host_buffer) {
-                // 调用原始 saveDP 函数
+                // 调用原始 saveDP 函数。
+                // 注: 走出来的 40 位 DP 只进文本归档 (DistinguishablePoints.txt), **不碰**
+                // 那两个 .bin —— 它们记的是"被征召的预备点"这本账 (源库立墓碑 + 已征召库
+                // 追加), 见 rho.cpp 的 retire_dp_member。
                 _saveDP(dp.d, dp.sp);
             }
             // 重置设备缓冲区计数
-            reset_counters();
+            unsigned int zero = 0;
+            CHECK_CUDA(cudaMemcpyToSymbol(dp_buffer_count, &zero, sizeof(unsigned int)));
         }
 
         std::cout << get_time() << " : saved " << current_count << " dp." << std::endl;
+        return current_count;
     }
+
 private:
     DpBuffer* m_dp_device_buffer = nullptr;
     size_t buffer_size;
@@ -1561,7 +1574,9 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
 //
 // 每线程推进 W 个 walker, 每批一次批量求逆 (fun_add_w)。状态按
 // idx*W + k 交错存放。DP 命中的 walker 由 add_dp_to_buffer 原地换成
-// RhoStates_rand 池里的随机点, 与单 walker 语义一致。
+// RhoStates_reserve 里的替补点, 与单 walker 语义一致。
+//
+// DP 判据 (distinguishable, 40 位): 命中当场退役换预备队员, 记进 dp_device_buffer。
 template <int W>
 __global__ void rho_w()
 {
@@ -1577,7 +1592,7 @@ __global__ void rho_w()
         count_rho ++;
 #pragma unroll
         for (int k = 0; k < W; ++k) {
-            uint64_t d = distinguishable(s[k].x.x);
+            const uint64_t d = distinguishable(s[k].x.x);
             if (d != 0) {
                 count_dp++;
                 add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 10);
@@ -1668,15 +1683,39 @@ void init_adds_pub_dev()
     }
 }
 
-void init_RhoStates_rand() {
-    for (int i = 0; i < sizeof(RhoStates_rand) / sizeof(RhoPoint_dev); i++) {
-        RhoPoint_dev t;
-        RhoPoint r;
-        r.rand();
-        t.from(r);
-        CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_rand, &t, sizeof(RhoPoint_dev), sizeof(RhoPoint_dev) * i, cudaMemcpyHostToDevice));
+// ---------------------------------------------------------------------------
+// 预备队: 设备侧只需要这份常量内存
+//
+// 一个 walker 命中可区分点时, 用 RhoStates_reserve 里对应槽位的一份独立点把它的
+// (x, m, n) 整体顶替掉 (见 add_dp_to_buffer), 让它从这份新起点继续走。
+//
+// 池里放什么点 (来源与账本) 全在 rpc/rho.cpp —— 那是纯主机侧的逻辑, 不需要一行
+// CUDA 代码; 设备端只负责收下这一块常量内存。上传走下面这个函数 (唯一的跨 TU 接口),
+// "为什么 2、3 类来源要账本" 的完整说明见 common.h 的 ReserveSource 那段。
+// ---------------------------------------------------------------------------
+
+// 把主机侧算好的槽位点整块拷进设备常量内存 (110 x 144B 一次 DMA, 每轮一次)。
+// 槽位数必须与设备常量数组一致 —— 上传若写错偏移或长度, 只有这里的检查看得见
+// (validate 那边还会回读逐槽核对)。
+void upload_RhoStates_reserve(const RhoPoint* points, size_t count)
+{
+    if (count != dp_buffer_size) {
+        std::cerr << "upload_RhoStates_reserve: count " << count
+                  << " != dp_buffer_size " << dp_buffer_size << std::endl;
+        exit(EXIT_FAILURE);
     }
+    static std::vector<RhoPoint_dev> staging;
+    staging.resize(count);
+    for (size_t i = 0; i < count; ++i) staging[i].from(points[i]);
+    CHECK_CUDA(cudaMemcpyToSymbol(RhoStates_reserve, staging.data(),
+                                  count * sizeof(RhoPoint_dev), 0,
+                                  cudaMemcpyHostToDevice));
 }
+extern secp256k1_context* ctx;
+
+// 流水号 0 = "没有队员". 注意: 预备队账本整段已经搬到 rpc/rho.cpp —— 那是纯主机
+// 侧的逻辑, 一行 CUDA 都用不上; 设备侧只剩上面的 upload_RhoStates_reserve 与
+// RhoStates_reserve 那份常量内存。
 
 static const std::string _RSFile2_name = "D:\\RhoState2.txt";
 int loadRhoState(RhoState* s, int num, const std::string& name);
@@ -1824,6 +1863,316 @@ void save_RhoStates_dev(int total_points, const std::string& name)
     std::cout << get_time() << " : save_RhoStates_dev. " << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// 被征召的预备点"重走"探针 (入口: testmvp 120 892)
+//
+// 要验的一件事: 被征召的那几个预备点, 之后的轨迹到底有没有落在 RhoState2.txt 里。
+//
+// 设备侧的语义 (见 add_dp_to_buffer): 某条 walker 命中 40 位可区分点时, 它的 (x, m, n)
+// 被整体换成 RhoStates_reserve[index] 里那份独立点 (index = 这条 DP 记录的下标); 换完
+// 这条 walker 继续用同一个步进算法往前走, 到轮末由 save_RhoStates_dev 整体落盘。于是:
+//
+//   被征召的那份起点 P, 沿 fun_add_w 往前走的轨迹上**必有** RhoState2.txt 里的一条
+//   记录 (= 某一轮轮末的落盘状态) —— 前提是这条 walker 之后再没被换过 (又被征召)。
+//   反过来说, 走不到就说明这条 walker 中途断过。
+//
+// 拿什么比: 每步比 (m, n)。理由 —— 步进表每一行的 (m,n) 就是该行点 x 的"加法表示"
+// (x = m*G + n*MVP), 加法同态, 所以 walker 的 (m, n) 恒满足 x = m*G + n*MVP。同一个 x
+// 有 N 组等价的 (m,n) (模 N 的解有 N 组), 轨迹不同则 (m,n) 不同 —— 512 位撞上一条不是
+// 巧合。命中之后拿 x 复核一次 (x 也要逐字节相同)。
+//
+// 起点从哪来: D:\DpDrafted32.bin 尾部那几条非墓碑记录 = 最近被征召的几个预备点的原始
+// (m, n)。源库里同一批槽位已经打成墓碑 (m/n 清零) 拿不到; 已征召库是 append 的, 尾部
+// 就是最近被征召的。index / m / n 都打出来, 便于人工核对是哪几个槽位。
+//
+// 只读: 不碰设备内存, 不写任何文件, 不启动 play。fun_add_w 是 __host__ __device__,
+// 主机侧直接用 (与 perf_test_cpu 同一条路径); W = RHO_GPU_WALKERS 个点并排走, 一次
+// 模逆摊到 W 步上, 所以这里也是"生产核同款算法"在 CPU 上跑。
+// ---------------------------------------------------------------------------
+
+// 已征召库的记录布局 (与 blockchain.cpp 里的 Dp32Store 一致):
+//   头 24 字节 = magic "DP32DRF1" + version(u32) + record_size(u32) + records(u64)
+//   记录 72 字节 = index(u64) + m(32) + n(32); 墓碑 = m/n 清零, index 保留
+constexpr size_t kDraftedHeaderBytes = 24;
+constexpr size_t kDraftedRecordBytes = 72;
+
+// 当前生产几何下"最近一轮写下的前段"有多少条: 92 x 128 x 4 = 47104。
+// RhoState2.txt 里 0..47103 是最近一轮 (写盘的那个进程) 的落盘状态, 47104.. 是更早的
+// 一轮写的、之后每次写盘都原样保留的冻结段 (见 save_RhoStates_dev_fast 保留尾部的说明)。
+constexpr int kRhoState2FrontRecords = 92 * 128 * RHO_GPU_WALKERS;
+
+// (m,n) 参照集合。开放寻址线性探测, 建完只查不插。
+constexpr uint32_t kRewalkEmpty = 0xFFFFFFFFu;
+
+class RewalkRefSet
+{
+public:
+    // 从 name 读最多 num_cap 条 rhostate, 把 (m,n) 建索引。
+    bool load(const std::string& name, int num_cap)
+    {
+        std::vector<RhoState> rsv;
+        rsv.resize(num_cap);
+        const int n = loadRhoState(rsv.data(), num_cap, name);
+        if (n <= 0) {
+            return false;
+        }
+        m_records = (size_t)n;
+        size_t cap = 1;
+        while (cap < m_records * 2) {
+            cap <<= 1;
+        }
+        m_mask = cap - 1;
+        m_key.assign(cap * 64, 0);
+        m_val.assign(cap, kRewalkEmpty);
+        m_x.assign(m_records * 64, 0);
+        for (int i = 0; i < n; i++) {
+            // RhoState.x (secp256k1_pubkey) 的 64 字节就是 x||y, 与 RhoPoint_dev.x
+            // 的 AffinePoint 前 64 字节一致 (from()/to() 就是 memcpy 这一段)。
+            memcpy(&m_x[(size_t)i * 64], rsv[i].x.data, 64);
+            insert(rsv[i].m, rsv[i].n, (uint32_t)i);
+        }
+        return true;
+    }
+    size_t records() const { return m_records; }
+    const unsigned char* x_at(uint32_t idx) const { return &m_x[(size_t)idx * 64]; }
+    bool find(const unsigned char* m, const unsigned char* n, uint32_t& idx) const
+    {
+        size_t h = hash(m, n) & m_mask;
+        for (;;) {
+            const uint32_t v = m_val[h];
+            if (v == kRewalkEmpty) {
+                return false;
+            }
+            if (memcmp(&m_key[h * 64], m, 32) == 0 && memcmp(&m_key[h * 64 + 32], n, 32) == 0) {
+                idx = v;
+                return true;
+            }
+            h = (h + 1) & m_mask;
+        }
+    }
+
+private:
+    static uint64_t hash(const unsigned char* m, const unsigned char* n)
+    {
+        uint64_t h = 1469598103934665603ULL; // FNV-1a 偏移基, 再走一遍 64 位混合
+        for (int i = 0; i < 32; i++) {
+            h = (h ^ m[i]) * 1099511628211ULL;
+            h = (h ^ n[i]) * 1099511628211ULL;
+        }
+        h ^= h >> 29;
+        h *= 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
+        return h;
+    }
+    void insert(const unsigned char* m, const unsigned char* n, uint32_t idx)
+    {
+        size_t h = hash(m, n) & m_mask;
+        while (m_val[h] != kRewalkEmpty) {
+            h = (h + 1) & m_mask;
+        }
+        memcpy(&m_key[h * 64], m, 32);
+        memcpy(&m_key[h * 64 + 32], n, 32);
+        m_val[h] = idx;
+    }
+
+    std::vector<unsigned char> m_key; // cap * 64: m||n, 与文件里的字节序相同
+    std::vector<unsigned char> m_x;   // m_records * 64: x||y, 用来复核命中
+    std::vector<uint32_t> m_val;      // cap: 记录下标; kRewalkEmpty = 空槽
+    size_t m_mask = 0;
+    size_t m_records = 0;
+};
+
+// 从已征召库尾部取最多 want 条非墓碑记录当起点。返回的 out 按库内先后排列。
+static bool rewalk_load_starts(const std::string& name, int want,
+                               std::vector<RhoPoint>& out, std::vector<uint64_t>& out_index)
+{
+    std::ifstream in(name, std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+    in.seekg(0, std::ios::end);
+    const std::streamoff fsize = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (fsize <= (std::streamoff)kDraftedHeaderBytes) {
+        return false;
+    }
+    std::string blob;
+    blob.resize((size_t)fsize);
+    in.read(&blob[0], (std::streamsize)fsize);
+    in.close();
+    if (memcmp(blob.data(), "DP32DRF1", 8) != 0) {
+        return false;
+    }
+    uint32_t rec_size = 0;
+    uint64_t records = 0;
+    memcpy(&rec_size, blob.data() + 12, 4);
+    memcpy(&records, blob.data() + 16, 8);
+    if (rec_size != kDraftedRecordBytes ||
+        blob.size() < kDraftedHeaderBytes + records * kDraftedRecordBytes) {
+        return false;
+    }
+    out.clear();
+    out_index.clear();
+    for (uint64_t k = records; k > 0 && (int)out.size() < want; k--) {
+        const unsigned char* rec = (const unsigned char*)blob.data() + kDraftedHeaderBytes +
+                                   (size_t)(k - 1) * kDraftedRecordBytes;
+        uint64_t index = 0;
+        memcpy(&index, rec, 8);
+        bool tomb = true;
+        for (size_t i = 8; i < kDraftedRecordBytes; i++) {
+            if (rec[i] != 0) {
+                tomb = false;
+                break;
+            }
+        }
+        if (tomb) {
+            continue;
+        }
+        RhoPoint p;
+        memcpy(p.m, rec + 8, 32);
+        memcpy(p.n, rec + 40, 32);
+        create(ctx, &p.x, p.m, p.n);
+        out.push_back(p);
+        out_index.push_back(index);
+    }
+    std::reverse(out.begin(), out.end());
+    std::reverse(out_index.begin(), out_index.end());
+    return !out.empty();
+}
+
+struct RewalkWalk
+{
+    bool found = false;       // 走到了落盘状态
+    uint64_t step = 0;        // 走了几步 (第几次 fun_add_w 之后)
+    uint32_t record = 0;      // 命中的 RhoState2.txt 记录下标
+    bool x_ok = false;        // 命中那条记录的 x 与重走状态逐字节相同
+    bool replaced = false;    // 重走途中自己撞上 40 位 DP: 真实那条 walker 也会被换掉
+    uint64_t replaced_step = 0;
+};
+
+void rho_rewalk_probe()
+{
+    std::vector<RhoPoint> starts;
+    std::vector<uint64_t> starts_index;
+    if (!rewalk_load_starts("D:\\DpDrafted32.bin", RHO_GPU_WALKERS, starts, starts_index)) {
+        cprintf("rewalk: 读不到 D:\\DpDrafted32.bin 尾部的非墓碑记录, 中止\n");
+        return;
+    }
+
+    RewalkRefSet ref;
+    if (!ref.load("D:\\RhoState2.txt", 400000)) {
+        cprintf("rewalk: 读不到 D:\\RhoState2.txt, 中止\n");
+        return;
+    }
+
+    // 步进表: 与 init_adds_pub_dev / perf_test_cpu 用的是同一份 adds_pub[0][*]。
+    std::vector<RhoPoint_dev> adds(256);
+    for (int i = 0; i < 256; i++) {
+        adds[i].from(adds_pub[0][i]);
+    }
+    const int N = (int)starts.size();
+    std::vector<RhoPoint_dev> s((size_t)N);
+    for (int k = 0; k < N; k++) {
+        s[k].from(starts[k]);
+    }
+
+    // 上限取 2^27 = 134217728 步: 单个点最多跨 5 轮的剩余部分, 一轮的上限是
+    // 2^24 批 (rho_w 的自动返回点), 所以 5 x 2^24 = 83886080 步足够覆盖,
+    // 2^27 只是留一倍余量 (W=4 批量求逆, 实测约 1.3M 步/秒 => 上限约 100 秒)。
+    const uint64_t max_steps = 1ULL << 27;
+    std::vector<RewalkWalk> out((size_t)N);
+
+    cprintf("\nrewalk 探针: 起点 %d 个 (D:\\DpDrafted32.bin 尾部非墓碑记录), 参照 %llu 条 "
+            "(D:\\RhoState2.txt, 前段 %d 条)\n",
+            N, (unsigned long long)ref.records(), kRhoState2FrontRecords);
+    for (int k = 0; k < N; k++) {
+        char mh[65];
+        hex_encode(mh, starts[k].m, 32);
+        mh[64] = 0;
+        char nh[65];
+        hex_encode(nh, starts[k].n, 32);
+        nh[64] = 0;
+        cprintf("  [%d] 已征召库记录 index=%llu\n      m=%s\n      n=%s\n", k,
+                (unsigned long long)starts_index[k], mh, nh);
+    }
+
+    // step 0: 起点自己就是某条落盘状态? (正常应该不是)
+    for (int k = 0; k < N; k++) {
+        unsigned char mbe[32], nbe[32];
+        transfer(mbe, (const unsigned char*)&s[k].m);
+        transfer(nbe, (const unsigned char*)&s[k].n);
+        uint32_t idx = 0;
+        if (ref.find(mbe, nbe, idx)) {
+            out[k].found = true;
+            out[k].step = 0;
+            out[k].record = idx;
+        }
+    }
+
+    const uint64_t report_every = 1ULL << 24;
+    uint64_t reached = 0;
+    for (uint64_t i = 1; i <= max_steps; i++) {
+        fun_add_w<RHO_GPU_WALKERS>(s.data(), adds.data());
+        reached = i;
+        int pending = 0;
+        for (int k = 0; k < N; k++) {
+            if (out[k].found || out[k].replaced) {
+                continue;
+            }
+            pending++;
+            unsigned char mbe[32], nbe[32];
+            transfer(mbe, (const unsigned char*)&s[k].m);
+            transfer(nbe, (const unsigned char*)&s[k].n);
+            uint32_t idx = 0;
+            if (ref.find(mbe, nbe, idx)) {
+                out[k].found = true;
+                out[k].step = i;
+                out[k].record = idx;
+                out[k].x_ok = (memcmp(ref.x_at(idx), &s[k].x.x, 64) == 0);
+                continue;
+            }
+            if (distinguishable(s[k].x.x) != 0) {
+                // 真实 walker 走到这里会被 add_dp_to_buffer 再换一次起点, 轨迹断掉,
+                // 再往下走就跟生产轨迹不是同一条了 —— 如实报出来, 别冒充"没命中"。
+                out[k].replaced = true;
+                out[k].replaced_step = i;
+            }
+        }
+        if (pending == 0) {
+            break;
+        }
+        if (i % report_every == 0) {
+            printf("rewalk: %llu / %llu steps, no hit yet\n", (unsigned long long)i,
+                   (unsigned long long)max_steps);
+        }
+    }
+
+    int n_hit = 0;
+    for (int k = 0; k < N; k++) {
+        if (out[k].found) n_hit++;
+    }
+    cprintf("\nrewalk 结果 (最多走 %llu 步, 实际 %llu 步; 命中 %d/%d)\n",
+            (unsigned long long)max_steps, (unsigned long long)reached, n_hit, N);
+    for (int k = 0; k < N; k++) {
+        char mh[65];
+        hex_encode(mh, starts[k].m, 32);
+        mh[64] = 0;
+        cprintf("  [%d] m=%s\n", k, mh);
+        if (out[k].found) {
+            cprintf("      -> 命中: 走了 %llu 步, 落在 RhoState2.txt 第 %u 条, 区段=%s, x 复核=%s\n",
+                    (unsigned long long)out[k].step, out[k].record,
+                    out[k].record < (uint32_t)kRhoState2FrontRecords ? "front" : "tail",
+                    out[k].x_ok ? "ok" : "MISMATCH");
+        } else if (out[k].replaced) {
+            cprintf("      -> 第 %llu 步自己撞上 40 位 DP; 真实 walker 此处也会被换掉, "
+                    "轨迹到此为止, 不能当没命中处理\n",
+                    (unsigned long long)out[k].replaced_step);
+        } else {
+            cprintf("      -> %llu 步内没走到任何落盘状态\n", (unsigned long long)reached);
+        }
+    }
+}
+
 // DP 测试样点 (供 init_RhoStates_test 的尾槽使用): 取自 D:\DistinguishablePoints.txt
 // 第 1 条记录, 即 40 位判据下的一次真实运行写出的可区分点。已离线核验:
 //   x = m*G + n*MVP
@@ -1876,13 +2225,30 @@ void rho_play() {
     init_adds_pub_dev();
     // 初始化break_flag
     init_break_flag();
+    // 预备队账本: 槽位数 = DP 缓冲区槽位数。来源与账本本身都在 rho.cpp。
+    // persistent = true: 启动时回读 D:\RhoReserve.txt (货源游标 + 留用队员)。
+    // 不落盘的话游标重启归零, 头几批点跟上一次 run 逐字节重复 —— 重复的那批 DP
+    // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
+    init_reserve_pool(dp_buffer_size, true);
+    // 32 位 DP 库 (瘦索引: 源库 + 已征召库)。3 类货源就是从这儿取点的, 所以先载
+    // 索引; 载不进来这一类就回退随机点 (见 rho.cpp 的 reserve_load_dp)。
+    // 载入结果印在控制台上 (见 dp32_store_init), 不写生产日志。
+    if (!dp32_store_init()) {
+        cprintf("%s : Dp32 库不可用, 3 类货源(来源 3)回退随机点\n", get_time().c_str());
+    }
+    // 库载进来之后, 先把存档里"已经取走、又被征召掉"的那几个 3 类队员销一次账 ——
+    // 被征召的队员不进存档, 只能从"游标推过、槽位空着"反推出来 (见 rho.cpp)。
+    reserve_retire_consumed();
     while (!gameover) {
         break_rho(false);
-        init_RhoStates_rand();
+        // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由账本决定
+        init_RhoStates_reserve();
         rho_w<W><<<gridSize, blockSize>>>();
         // 等待核函数完成
         CHECK_CUDA(cudaDeviceSynchronize());
-        dp_manager.save_dps();
+        // 把这一轮的 40 位 DP 条数喂给账本 (记录下标 = 被征调的槽位), 然后落盘
+        note_reserve_dps(dp_manager.save_dps());
+        save_reserve_state();
         save_RhoStates_dev(total_points, _RSFile2_name);
     }
     free_break_flag();
@@ -2056,7 +2422,7 @@ __global__ void validate_multi()
 
     // DP 缓冲测试: 往缓冲区写 RHODP_TEST_NUM 条记录以验证溢出/break 路径。
     // 索引用尾点的真实索引 (RHO_DP_TEST_IDX), 与尾点自洽。
-    // 必须传尾点的**局部副本**: add_dp_to_buffer 会把传入的点换成 RhoStates_rand,
+    // 必须传尾点的**局部副本**: add_dp_to_buffer 会把传入的点换成 RhoStates_reserve,
     // 直接传 RhoStates_dev[RHOSTATES_TEST_NUM] 会把尾点改掉, 而 validate_point_add
     // 还要用尾点做 DP 判据检查 (本内核排在 validate_point_add 之前跑)。
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -2563,7 +2929,129 @@ void validate_test()
     std::remove(fn_.c_str());
     std::remove(fn2_.c_str());
 
+    // 预备队: 账本取点 + 整块上传的结果。生产路径里它每轮 rho_play 开跑前都跑,
+    // 而 validate 不跑 rho_play, 所以这里单独跑一次, 回读设备常量内存逐槽核对 ——
+    // 一份都必须是能独立起步的点 (m/n/x 自洽), 且彼此不同 (起点相同的两条链会
+    // 逐点重合)。上传若写错偏移或长度, 只有这里看得见。
+    init_reserve_pool(dp_buffer_size);
+    init_RhoStates_reserve();
+    {
+        std::vector<RhoPoint_dev> pool(dp_buffer_size);
+        CHECK_CUDA(cudaMemcpyFromSymbol(pool.data(), RhoStates_reserve, dp_buffer_size * sizeof(RhoPoint_dev)));
+        size_t tracked = 0;
+        for (size_t i = 0; i < pool.size(); i++) {
+            RhoPoint r;
+            pool[i].to(r);
+            HOST_ASSERT(check(ctx, &r.x, r.m, r.n));
+            // 比 129 字节 = m(32) + n(32) + x 的有效部分 (x.x 32 + x.y 32 +
+            // infinity 1), 与设备端 operator== 同口径, 不含 alignas(16) 的尾部填充。
+            for (size_t j = 0; j < i; j++) {
+                HOST_ASSERT(memcmp(&pool[i], &pool[j], 129) != 0);
+            }
+            if (reserve_slot_tracked(i)) ++tracked;
+        }
+        // "该不该有队员"随来源变, 不能写死成"全随机池":
+        //   1 类 不留履历, 所以一个槽位也不该进账本;
+        //   2 类 货源无上限 (阶梯由游标现算), 每个槽位都该是一位队员;
+        //   3 类 受存档条数所限, 取不到就**永久**降级成随机点, 只要求至少有一位。
+        const ReserveSource rsrc = reserve_configured_source();
+        if (rsrc == ReserveSource::Random) {
+            HOST_ASSERT(tracked == 0);
+        } else if (rsrc == ReserveSource::Special) {
+            HOST_ASSERT(tracked == pool.size());
+        } else {
+            HOST_ASSERT(tracked >= 1);
+        }
+        printf("reserve pool: %d slots ok (%d tracked, source %s)\n", (int)dp_buffer_size,
+               (int)tracked, reserve_source_name(rsrc));
+    }
+    // 账本状态机 (主机侧, 合成供应器 + 合成记录条数)、两类真货源的装载自检、以及
+    // 状态存档的往返自测, 都在 rho.cpp 里 —— 预备队逻辑整段搬过去了。
+    // (上面 init_reserve_pool 用的是默认 persistent = false: 自检绝不碰生产存档。)
+    validate_reserve_pool_state();
+    validate_reserve_supplies();
+    validate_reserve_state_file();
+    // 32 位 DP 库的瘦索引 (载入 / 升序查找 / 墓碑 / 同索引多桶 / 坏库拒绝 / 真库抽样复算)
+    validate_dp32_store();
+    // 真库与 data 语料对账 (两库之和 == 语料去重后的条目数; 语料里的点能在库里找到同一条)
+    validate_dp32_corpus();
+    // 阶梯口径: create(m=1, n=0) 必须就是设备常量里的生成元 G —— "G, 2G, 3G..."
+    // 这条阶梯要是算错, 2 类来源整批都是废点, 而平时根本看不出来。设备常量 G 只在
+    // 这里可见, 所以对拍只能放在这里。
+    {
+        RhoPoint one;
+        set_int(one.m, 1);
+        create(ctx, &one.x, one.m, one.n);
+        AffinePoint g_dev;
+        CHECK_CUDA(cudaMemcpyFromSymbol(&g_dev, G, sizeof(AffinePoint)));
+        HOST_ASSERT(memcmp(one.x.data, &g_dev.x, sizeof(uint256_t)) == 0);
+        HOST_ASSERT(memcmp(one.x.data + sizeof(uint256_t), &g_dev.y, sizeof(uint256_t)) == 0);
+        printf("reserve supply ladder: create(1,0) == device G ok\n");
+    }
+
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
     printf("validate_test passed!\n");
+}
+
+// 来源 3 (Dp) 的"能不能跑生产"自检 —— 把生产启动那一步原样走一遍, 不跑那套 25 分钟的
+// 全量 validate (入口: testmvp 120 891)。
+//
+// 要证的就一条: 按**当前配置**建池 -> 账本取点 -> 上传设备常量内存之后, 110 个槽位
+// 拿到的都是能独立起步、彼此不同的点; 来源配成 3 类时还必须是源库里的 32 位 DP。
+//
+// 前面几个自检都是拿独立实例 + 合成供应器验的 (reserve_load_dp / reserve_take 各一段),
+// 只有这里把"全局供应器 + 全局账本 + 真库存"串成生产那一串 —— 库不在盘上、游标落进
+// 墓碑堆、上传偏移写错, 都只有这里看得见。
+//
+// persistent = false: 只读不写, 绝不碰生产存档 D:\RhoReserve.txt。
+void validate_reserve_prod_config()
+{
+    const ReserveSource rsrc = reserve_configured_source();
+    printf("reserve prod config: source %s, slots %d\n", reserve_source_name(rsrc),
+           (int)dp_buffer_size);
+
+    init_reserve_pool(dp_buffer_size);
+    init_RhoStates_reserve();
+
+    std::vector<RhoPoint_dev> pool(dp_buffer_size);
+    CHECK_CUDA(cudaMemcpyFromSymbol(pool.data(), RhoStates_reserve,
+                                    dp_buffer_size * sizeof(RhoPoint_dev)));
+
+    size_t tracked = 0;
+    size_t is_dp = 0;
+    for (size_t i = 0; i < pool.size(); ++i) {
+        RhoPoint r;
+        pool[i].to(r);
+        // 都是能独立起步的点 (m/n/x 自洽)
+        HOST_ASSERT(check(ctx, &r.x, r.m, r.n));
+        // 起点必须互不相同: 起点相同的两条链逐点重合, 产出的记录完全一样, 白烧算力。
+        // 比 129 字节 = m(32) + n(32) + x 的有效部分, 与设备端 operator== 同口径。
+        for (size_t j = 0; j < i; ++j) {
+            HOST_ASSERT(memcmp(&pool[i], &pool[j], 129) != 0);
+        }
+        if (reserve_slot_tracked(i)) {
+            ++tracked;
+            uint64_t idx = 0;
+            if (dp32_test(r.x, idx)) ++is_dp;
+        }
+    }
+
+    if (rsrc == ReserveSource::Dp) {
+        // 真库存 88.7 万条 >> 槽位数, 所以一位都不许回退随机: 110 个槽位全在账本里,
+        // 且全是源库的 32 位 DP (3 类的定义就是这个)。有一条不是, 说明库存没接上。
+        HOST_ASSERT(tracked == pool.size());
+        HOST_ASSERT(is_dp == pool.size());
+        cprintf("reserve prod config: ok (%d slots, %d tracked, %d are 32-bit DP)\n",
+                (int)pool.size(), (int)tracked, (int)is_dp);
+    } else if (rsrc == ReserveSource::Special) {
+        // 2 类货源无上限 (阶梯由游标现算), 每个槽位都该是一位队员。
+        HOST_ASSERT(tracked == pool.size());
+        printf("reserve prod config: ok (%d slots, %d tracked)\n", (int)pool.size(),
+               (int)tracked);
+    } else {
+        // 1 类不留履历: 一个槽位也不该进账本。
+        HOST_ASSERT(tracked == 0);
+        cprintf("reserve prod config: ok (%d slots, all random)\n", (int)pool.size());
+    }
 }
