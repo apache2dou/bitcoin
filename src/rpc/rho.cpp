@@ -1110,10 +1110,11 @@ void rho_affine_prepare()
 // 槽位通过只增不减的流水号间接指向履历; 流水号 0 是哨兵, 表示"这个槽位没有队员"
 // (也就是随机点占位 —— 1 类不进账本)。
 //
-// 池子大小是 dp_buffer_size, 而 add_dp_to_buffer 取用的下标不止到 max_size - 1:
+// 池子大小是 dp_buffer_size, 而 add_dp_to_buffer 取用的下标不止到 max_size - 1
+// (max_size = dp_buffer_size - 20, 见 cuda.cu 的 edge_pool_size 那段):
 // 它先写入再判 break, 所以下标还会往上走一点 —— 同一批里每线程 W 个 walker 最多各
 // 命中一次, 而 break_flag 要等各线程轮询到才生效 (轮询间隔 2^18 批), 超出的量都是
-// 个位数, 数组比 max_size 多留的 10 项就是给这段的。
+// 个位数 (期望 ~3 条), 数组比 max_size 多留的 20 项就是给这段的。
 //
 // 库存要够首轮一次性填满 dp_buffer_size 个槽位 (之后每轮只补被征调的): 2 类的 256 条
 // + 无上限阶梯绰绰有余, 3 类看存档有多少。真取不到时走 begin_round 的耗尽处理 ——

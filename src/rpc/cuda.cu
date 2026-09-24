@@ -1392,7 +1392,8 @@ __device__ RhoPoint_dev* RhoStates_dev = nullptr;
 //
 // 起点池尺寸口径与预备队同构: 池位下标 = 边记录下标 = 这一轮被征用的起点位 (和
 // note_reserve_dps 那条"记录下标 = 被征调的槽位"是同一个约定), 每轮上限也照抄
-// dp_buffer_size - 10; 只有池容量比 dp_buffer_size 大 64, 理由见下面 edge_pool_size 那段。
+// dp_buffer_size - 20; 池容量与缓冲容量同为一个 dp_buffer_size, 余量的道理见下面
+// edge_pool_size 那段。
 struct EdgeBuffer {
     uint64_t d;      // 终点 (32 位 DP 索引)
     SecPair sp;      // 终点 (m, n), 与 DpBuffer 同构, 沿用 transfer 口径
@@ -1404,17 +1405,18 @@ static_assert(sizeof(EdgeBuffer) == 80, "EdgeBuffer layout changed");
 // 不再记账 (边记录里没有起点可记) —— 停机条件由主机按"还有没有活槽"判。
 static constexpr uint64_t EDGE_SRC_NONE = (uint64_t)-1;
 
-constexpr size_t edge_pool_size = dp_buffer_size + 64; // 起点池 / 边缓冲容量
+constexpr size_t edge_pool_size = dp_buffer_size; // 起点池 / 边缓冲容量 (与 DP 缓冲同大小)
 
-// 池子为什么比 dp_buffer_size 还大 64:
-//   上限 max_size 沿用生产那一档 (= dp_buffer_size - 10 = 100, 保持口径一致), 但 break_flag
-//   要等到各线程走到下一个 2^18 批的检查点才被看到, 所以"标志已置起但还没散场"这段窗口里
-//   还会再冒出来一批命中 —— 这一窗口的期望命中数 ≈ 47104 状态 x 2^18 步 / 2^32 ≈ 3 条
-//   (32 位判据的期望间距就是 2^32), 而生产用的 40 位判据只有它的 1/256。也就是说生产那
-//   10 个余量档位对 32 位判据来说太薄了 (Poisson(3) 冒到 11 次的概率 ~2.5e-4, 按 100 天
-//   ~4800 轮算期望上会撞上一次越界写)。这里把容量加到 max_size + 74, 74 个余量对
-//   Poisson(3) 已是天文数字级的安全边际, 而池位下标只用到 0..100, 多出来的部分不参与记账。
-constexpr unsigned int edge_max_edges = dp_buffer_size - 10; // 每轮最多收这么多条边
+// 两条路的缓冲容量都是 dp_buffer_size, 写入上限 max_size 都是 dp_buffer_size - 20;
+// 那 20 档余量留给"标志已置起但还没散场"的窗口:
+//   add_dp_to_buffer 是 *counter >= max_size 才置 break_flag, 而各线程要走到下一个 2^18
+//   批的检查点才看得到它, 这段窗口里还会再冒出来一批命中 —— 期望命中数 ≈ 47104 状态 x
+//   2^18 步 / 2^32 ≈ 3 条 (32 位判据的期望间距就是 2^32; 生产用的 40 位判据是它的 1/256,
+//   同一窗口只期望 0.01 条)。
+//   余量按最坏的那条路 (32 位) 定: 20 档 = Poisson(3) 冒到 21 次的概率 ~1e-11, 按 100 天
+//   ~4800 轮算期望 5e-8 次越界写; 10 档 (冒到 11 次 ~2.5e-4, 100 天里期望撞一次) 太薄,
+//   比 20 档再多对这么小的概率已无意义 —— 两条路统一取 20 档。
+constexpr unsigned int edge_max_edges = dp_buffer_size - 20; // 每轮最多收这么多条边
 
 __device__ EdgeBuffer* edge_device_buffer = nullptr;
 __device__ unsigned int edge_buffer_count = 0;
@@ -1464,8 +1466,9 @@ __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
     unsigned int* counter = EDGE ? &edge_buffer_count : &dp_buffer_count;
     unsigned int index = atomicAdd(counter, 1);
 
-    // 调用方保证不越界: 生产传 max_size = dp_buffer_size - 10; 漫游传 edge_max_edges
-    // (数值相同), 但漫游的缓冲容量是 edge_pool_size, 另留了断流窗口的余量。
+    // 调用方保证不越界: 生产传 max_size = dp_buffer_size - 20; 漫游传 edge_max_edges
+    // (同一个数), 两条路的缓冲容量都是 dp_buffer_size —— 差的 20 档就是留给下面这个
+    // break_flag 到各线程散场之间的窗口的, 见 edge_pool_size 那段。
     buffer[index].d = d;
     transfer(buffer[index].sp.m , (const unsigned char*)&r.m);
     transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
@@ -1798,7 +1801,7 @@ __global__ void rho_w()
                     }
                 } else {
                     count_dp++;
-                    add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 10);
+                    add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 20);
                 }
             }
         }
@@ -2430,9 +2433,10 @@ void init_RhoStates_test(int total_points)
 // 设备侧 (与 RhoStates_dev / RhoStates_reserve / dp_device_buffer 平行, 互不相干):
 //   edge_states_dev[total_points]   每槽当前点
 //   edge_src_dev[total_points]      每槽当前起点索引 (EDGE_SRC_NONE = 空槽, 不再记账)
-//   edge_starts_dev[174]            起点池: 池位 i 就是 library[cursor + i]
-//   edge_starts_src_dev[174]        池位 -> 库索引
-//   edge_device_buffer[174]         本轮的边 (每轮上限 100, 见 edge_max_edges)
+//   edge_starts_dev[110]            起点池: 池位 i 就是 library[cursor + i]
+//   edge_starts_src_dev[110]        池位 -> 库索引
+//   edge_device_buffer[110]         本轮的边 (容量 110 = dp_buffer_size, 每轮上限 90 =
+//                                   edge_max_edges, 差的 20 档是断流窗口余量)
 //
 // 主机侧只有两件账:
 //   cursor          库游标 = 下一个要发出去的库**位置** (从状态文件的起点索引列恢复:
