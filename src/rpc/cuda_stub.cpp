@@ -10,6 +10,11 @@ void rho_play()
 {
 }
 
+// 起点漫游与 rho_play 一样是"跑起来就一直转"的入口, 这里同样只求能链接上。
+void dp32_edge_play()
+{
+}
+
 void validate_test()
 {
     throw std::runtime_error("CUDA support is not enabled in this build.");

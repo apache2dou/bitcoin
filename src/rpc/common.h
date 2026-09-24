@@ -96,6 +96,12 @@ inline CPrintStream cprint() { return CPrintStream(); }
 
 void break_rho(bool value);
 void rho_play();
+// 定义在 rpc/cuda.cu (BUILD_BITCOIN_CUDA) 或 rpc/cuda_stub.cpp:
+// 32 位 DP 起点漫游。与 rho_play 跑同一个核 rho_w<W,EDGE>、同一份 fun_add_w /
+// add_dp_to_buffer, 区别只有编译期那一档: 判据换成 32 位, 命中后换的是"下一个
+// 起点"(取自 DpSource32all.bin) 而不是预备队, 每条边走出来的 (起点索引, 终点
+// 索引, m, n) 追加到 D:\Dp32Edge.txt, 状态落 D:\Dp32EdgeState.txt (文本)。
+void dp32_edge_play();
 void validate_test();
 void perf_test();
 // 定义在 rpc/cuda.cu (BUILD_BITCOIN_CUDA) 或 rpc/cuda_stub.cpp: GPU 多 walker
@@ -191,31 +197,54 @@ void validate_reserve_prod_config();
 void rho_rewalk_probe();
 
 // ---------------------------------------------------------------------------
-// 32 位可区分点 (DP) 的源库 / 已征召库
+// 32 位可区分点 (DP) 的源库 / 已征召库 / 全量库
 //
 // 判据: "n 位可区分点" = x 的低 n 位全 0 (x.data 按字节小端存坐标, 见 cuda.cu):
 //   * 32 位判据: x 低 32 位全 0, 索引 = x 的 bit 32..95
 //   * 40 位判据: x 低 40 位全 0, 索引 = x 的 bit 40..103 (= distinguishable() 的返回值)
-// 源库 DpSource32.bin 由 blockchain.cpp 的扫描器从 data 目录下的
-// DistinguishablePoints*.txt 语料合并而来 (那批语料是 32 位 DP)。一个点被征召之后
-// 在源库**原地立墓碑** (m/n 清零, 槽位不回收, 文件长度不变) + 追加到已征召库
-// DpDrafted32.bin。墓碑不动位置 ⇒ 源库**永远保持按索引升序**, 磁盘二分一直有效。
-// 两个文件同构: 24 字节头 + 定长 72 字节记录。
+// 源库 DpSource32.bin 是从 data 目录下的 DistinguishablePoints*.txt 语料合并来的
+// (那批语料是 32 位 DP), 合并由离线脚本完成 —— 与全量库 DpSource32all.bin 同一个,
+// 应用内已经没有重建入口。一个点被征召之后在源库**原地立墓碑** (m/n 清零, 槽位不
+// 回收, 文件长度不变) + 追加到已征召库 DpDrafted32.bin。墓碑不动位置 ⇒ 源库**永远
+// 保持按索引升序**, 磁盘二分一直有效。三个文件同构: 24 字节头 + 定长 72 字节记录。
 //
 // 两个库记的是**同一批点**: 源库里被立墓碑的那条, 就是已征召库里追加的那条。什么
 // 时候销这笔账: 拿这个点当起点的那份预备队员**被征召** (它那一记漫步走到 DL 端点,
 // 由 add_dp_to_buffer 换掉) 的时候 —— 见 rho.cpp 的 retire_dp_member。所以 3 类货源
 // 每被用掉一个, 源库就少一条活的、已征召库多一条, 两库之和不变。
-// 另有两条写作口: 扫描器 (语料里的 40 位点在扫描时直接征召进已征召库) 和预备点被征
-// 召销账 (同上)。
+// 建库那一轮 (离线) 还写过一次已征召库: 语料里本身也是 40 位 DP 的那批不进源库,
+// 直接计入已征召库。运行期的写作口只剩预备点被征召销账这一个。
 // 漫步当场走出来的 40 位 DP 不归这两个库管 —— 它只写文本归档 _DPFile_name (见
 // cuda.cu 的 save_dps), 那是采集结果的账。
+//
+// 全量库 DpSource32all.bin 跟上面两个不是一套账: 它是语料的**只读快照** —— 语料里
+// 全部去重后的 32 位 DP (含本身就是 40 位 DP 的那 3,323 条) 按索引升序装在一个库里,
+// 没有墓碑也没有征召销账, 运行期只用来跟语料对账。三个库同一套记录格式, 魔数同源。
 // ---------------------------------------------------------------------------
 constexpr const char* DP32_SOURCE_FILE   = "D:\\DpSource32.bin";
 constexpr const char* DP32_DRAFTED_FILE  = "D:\\DpDrafted32.bin";
+constexpr const char* DP32_ALL_FILE      = "D:\\DpSource32all.bin";
 constexpr const char* DP32_SOURCE_MAGIC  = "DP32SRC1";
 constexpr const char* DP32_DRAFTED_MAGIC = "DP32DRF1";
 constexpr uint32_t    DP32_VERSION       = 1;
+
+// 32 位 DP 起点漫游 (dp32_edge_play) 的两个文本落盘口 —— 故意用 txt 而不用 .bin,
+// 方便直接翻看/核对:
+//   Dp32Edge.txt      一行一条边, 空格分隔: "起点索引 终点索引 终点m 终点n"
+//                     (起点索引 = 这条边是从哪个 32 位 DP 出发的, 用于跟踪)。
+//                     一行 = 一次库派发, 所以行数可以拿来跟游标互校。
+//   Dp32EdgeState.txt 每槽 4 行: x / m / n / 起点索引, 与 RhoState 文本格式逐字一致
+//                     (第 4 行的 times 字段在这里被借用来存起点索引: 起点漫游不数
+//                     步数, 所以 times 空着, 直接拿来放索引, 就能白嫖
+//                     loadRhoState / saveRhoState 这一对读写函数)。
+//                     库游标就藏在这一列里: 库位置是按游标递增发的, 派出去的最大那个
+//                     索引值还握在某个活槽手上, 所以"把它换算成库位置再 + 1"就是游标,
+//                     不必另存一份。注意索引值 (x 的 bit 32..95) 能到 9e17, **不能**直接
+//                     当位置用 —— 换算靠库内二分 (库按索引升序), 见 cuda.cu 的
+//                     dp32_edge_session。
+// 起点索引的哨兵值 EDGE_SRC_NONE 见 cuda.cu。
+constexpr const char* DP32_EDGE_FILE       = "D:\\Dp32Edge.txt";
+constexpr const char* DP32_EDGE_STATE_FILE = "D:\\Dp32EdgeState.txt";
 
 // 头里的 records 既是条数也是完整性凭据: 跟文件长度对不上就说明被截断/写坏了。
 #pragma pack(push, 1)
@@ -267,6 +296,8 @@ class Dp32Store
 public:
     // 载入两个库的索引。任一库读不了 (缺失 / 魔数 / 版本 / 记录长度 / 条数与文件长度
     // 对不上 / 源库不再升序) ⇒ 整体失败, 并把已建的索引清掉 —— 不做"尽力恢复"。
+    // drf_path 传 nullptr (或空串) ⇒ 只载前一个库: 全量库 DpSource32all.bin 就是这么
+    // 载的 —— 它一个库装完语料里全部去重后的 32 位 DP, 既没有已征召库也没有墓碑。
     bool load(const char* src_path = DP32_SOURCE_FILE,
               const char* drf_path = DP32_DRAFTED_FILE);
     void unload();
@@ -275,6 +306,10 @@ public:
     uint64_t src_count() const { return (uint64_t)m_src_keys.size(); }
     uint64_t drf_count() const { return m_drf_count; }
     uint64_t src_dead_count() const { return m_src_dead_n; }
+
+    // 源库槽位的索引表 (升序去重, 槽位 = 下标)。漫步热路径不用它 —— 对账自测要把整张
+    // 索引表跟语料去重后的索引集合逐条比 (条数相同但少了 A 多了 B, 光看条数看不出来)。
+    const std::vector<uint64_t>& src_keys() const { return m_src_keys; }
 
     // 源库: 按索引取槽位 (索引唯一)。命中的槽位即使已墓碑也照样回填 slot。
     Dp32Hit src_find(uint64_t index, uint32_t& slot) const;
@@ -285,10 +320,10 @@ public:
     // 按槽位读一条记录 (命中之后才调; 一次 72 字节随机读, 不常开文件句柄)
     bool read(Dp32File which, uint32_t slot, Dp32Record& r) const;
 
-    // ---- 生产侧的两个落盘写口 ----
-    // 写作口有两个, 都走下面这两个函数: 扫描器 (建库) / 预备点被征召销账 (rho.cpp
-    // 的 retire_dp_member)。后者是"这一条已经用过了": 先 drf_append 再 src_tombstone,
-    // 两笔账一起记。
+    // ---- 生产侧的落盘写口 ----
+    // 应用内只有这一个写口: 预备点被征召销账 (rho.cpp 的 retire_dp_member)。那是
+    // "这一条已经用过了": 先 drf_append 再 src_tombstone, 两笔账一起记。(离线建库脚本
+    // 另算, 不在应用内 —— 应用内没有重建入口, 见下面 validate_dp32_corpus。)
     //
     // 源库立墓碑: 内存位图标死 + 文件里那条的 (m, n) 原地清零。**槽位与 index 都
     // 不动**, 所以源库依然按索引升序 (槽位 = 下标这条捷径不破)。已经是墓碑的槽位
@@ -334,13 +369,19 @@ bool dp32_test(const secp256k1_pubkey& pk, uint64_t& index);
 // 定义在 blockchain.cpp (要对 x 全值复算, 需要 create)。由 validate_test() 调。
 void validate_dp32_store();
 
-// 自测: 真库与 data 语料对账 —— (一) 条数: (源库活记录) + (已征召库条数) == 语料去重后的
-// 条目数 (语料里的 40 位点全在已征召库, 其余点 = 源库活记录 + 已被征召销账的);
-// (二) 抽样: 每个语料文件抽 8 条现算 x, 列出的索引要对得上, 且库里那条的 (m, n) 与语料
-// 逐字节相同; 另外再从 40 位索引里挑 8 个靶子单独扫一遍, 保证"40 位点能在已征召库查到"
-// 这条路径一定被走过。定义在 blockchain.cpp, 由 validate_test() 调, 也可用
-// testmvp 120 889 单独触发。
-void validate_dp32_corpus();
+// 自测: 库与 data 语料对账。语料侧的读法/抽样/报告两种口径完全一样, 只有"库侧怎么
+// 查"不同 —— 所以下面这个目标只是库侧口径的开关:
+//   TwoLib: 源库 + 已征召库。条数口径 (源库活记录) + (已征召库条数) == 语料去重后的
+//           条目数; 语料里的 40 位点必定在已征召库, 其余点 = 源库一条活记录, 或者
+//           已被征召销账立了墓碑 (那时已征召库里必有同一条)。
+//   AllLib: 全量库 DpSource32all.bin。一个库装完语料里全部去重后的 32 位 DP (含 40 位
+//           那批, 无墓碑) ⇒ 条数口径就是 库条数 == 语料去重后的条目数。
+// 两种口径都每个语料文件均分抽 8 条现算 x 定位 (索引 + m/n 逐字节对), 并额外从 40 位
+// 索引里挑 8 个靶子单独扫一遍, 保证"40 位那批"这条路径一定被走过。定义在 blockchain.cpp,
+// 由 validate_test() 调 (默认 TwoLib), 也可用 testmvp 120 889 (TwoLib) /
+// testmvp 120 888 (AllLib) 单独触发。
+enum class Dp32CorpusTarget { TwoLib, AllLib };
+void validate_dp32_corpus(Dp32CorpusTarget target = Dp32CorpusTarget::TwoLib);
 
 // ---------------------------------------------------------------------------
 // 同线程多 walker

@@ -1154,7 +1154,8 @@ static bool reserve_source_by_name(const std::string& s, ReserveSource& out)
 //   1. 源库/已征召库在盘上 (不在就静默回退随机, 见 reserve_load_dp —— 池子照跑,
 //      只是又变回"全随机起点");
 //   2. D:\RhoReserve.txt 里的 "supply Dp <游标>" 还指得准。游标存的是源库**槽位号**,
-//      重建过源库 (testmvp 120 888) 槽位就会整体挪位, 那时要把这个游标清零。
+//      而源库是离线脚本一次生成的快照 (应用内没有重建入口), 所以重新离线建库之后槽位
+//      会整体挪位, 那时要把这个游标清零。
 static ReserveSource g_reserve_source = ReserveSource::Dp;
 
 // 给 cuda.cu 的 validate_test 用: 池子里"该不该有队员"随来源变 (1 类不留履历,
@@ -1266,10 +1267,10 @@ static void reserve_load_special(ReserveSupply& sup)
               << sup.cursor << ")" << std::endl;
 }
 
-// 3 类库存: 32 位 DP 的源库 (DpSource32.bin, 由 blockchain.cpp 的扫描器从 data 目录
-// 下的 DistinguishablePoints*.txt 语料合并而来)。**不物化**: 取点时按槽位游标在库里
-// 往前找下一条活记录 (墓碑由 src_next 跳过), 所以磁盘上那 88.7 万条就是库存本身,
-// 而且被征召销账立了墓碑的点自然不会再发出去。
+// 3 类库存: 32 位 DP 的源库 (DpSource32.bin, 由离线脚本从 data 目录下的
+// DistinguishablePoints*.txt 语料合并而来 —— 应用内没有重建入口)。**不物化**: 取点时
+// 按槽位游标在库里往前找下一条活记录 (墓碑由 src_next 跳过), 所以磁盘上那 88.7 万条就是
+// 库存本身, 而且被征召销账立了墓碑的点自然不会再发出去。
 //
 // 与 2 类同一约定: 按参数装货, 全局那份只在启动时调一次 (tried 守卫); 不动 cursor ——
 // 游标是**生产状态** (这里是源库槽位号), 由存档一节按同一字段存盘。槽位只增不减、

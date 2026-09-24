@@ -1275,6 +1275,23 @@ __host__ __device__ uint64_t distinguishable(const uint256_t& x)
     return 0;
 }
 
+// 32 位判据 (起点漫游路径专用): x 的低 32 位 (bit 0..31) 全 0 即为 DP,
+// 返回其后连续 64 位 (bit 32..95) 作为索引; 否则返回 0。
+//
+// 与 distinguishable 同构, 只差一档宽度, 理由: 主机侧 dp32_test 的字节口径就是
+// "data[0..3] 全 0, 索引取 data[4..11]" (见 blockchain.cpp), 32 位 DP 源库
+// (DpSource32all.bin) 里的索引也全是按这个口径算的 —— 所以这里走出来的索引能
+// 直接和库里/边记录里的索引对上, 不需要任何换算。
+// 约定同 distinguishable: 索引 0 与"非 DP"同值。
+__host__ __device__ uint64_t distinguishable32(const uint256_t& x)
+{
+    // limb[0] = x bit 0..31, limb[1] = x bit 32..63, limb[2] = x bit 64..95
+    if (x.limb[0] == 0) {
+        return (uint64_t)x.limb[1] | ((uint64_t)x.limb[2] << 32);
+    }
+    return 0;
+}
+
 // ================== 同线程多 walker 批量求逆 ==================
 //
 // 动机与 CPU 版 (rho.cpp 的 rho_affine_FW) 相同: 仿射点加每步一次域模逆,
@@ -1364,6 +1381,49 @@ RhoPoint_dev* RhoStates_host = nullptr;
 __device__ RhoPoint_dev* RhoStates_dev = nullptr;
 
 // ---------------------------------------------------------------------------
+// 32 位 DP 起点漫游 (edge) 的设备侧存储 —— 与上面那套 DP 存储平行, 各管各的。
+//
+// 两条路共用 fun_add_w / rho_w / add_dp_to_buffer 的同一份实现, 只差编译期一档:
+//   生产 (EDGE=false): 每走一步判 40 位 DP; 命中 -> 记 (终点 d, m, n) 到
+//                      dp_device_buffer, 该 walker 换成预备队点 RhoStates_reserve[index]。
+//   漫游 (EDGE=true) : 每走一步判 32 位 DP; 命中 -> 记 (起点索引 src, 终点 d, m, n)
+//                      到 edge_device_buffer, 该 walker 换成起点池 edge_starts_dev[index]
+//                      继续走 —— 也就是"走到下一个 32 位 DP 就换下一个起点"。
+//
+// 起点池尺寸口径与预备队同构: 池位下标 = 边记录下标 = 这一轮被征用的起点位 (和
+// note_reserve_dps 那条"记录下标 = 被征调的槽位"是同一个约定), 每轮上限也照抄
+// dp_buffer_size - 10; 只有池容量比 dp_buffer_size 大 64, 理由见下面 edge_pool_size 那段。
+struct EdgeBuffer {
+    uint64_t d;      // 终点 (32 位 DP 索引)
+    SecPair sp;      // 终点 (m, n), 与 DpBuffer 同构, 沿用 transfer 口径
+    uint64_t src;    // 起点 (32 位 DP 库索引); EDGE_SRC_NONE = 空槽
+};
+static_assert(sizeof(EdgeBuffer) == 80, "EdgeBuffer layout changed");
+
+// 空槽哨兵: 库走完 / 几何变大补不满时用它。换到空槽的 walker 照旧往前走, 但它
+// 不再记账 (边记录里没有起点可记) —— 停机条件由主机按"还有没有活槽"判。
+static constexpr uint64_t EDGE_SRC_NONE = (uint64_t)-1;
+
+constexpr size_t edge_pool_size = dp_buffer_size + 64; // 起点池 / 边缓冲容量
+
+// 池子为什么比 dp_buffer_size 还大 64:
+//   上限 max_size 沿用生产那一档 (= dp_buffer_size - 10 = 100, 保持口径一致), 但 break_flag
+//   要等到各线程走到下一个 2^18 批的检查点才被看到, 所以"标志已置起但还没散场"这段窗口里
+//   还会再冒出来一批命中 —— 这一窗口的期望命中数 ≈ 47104 状态 x 2^18 步 / 2^32 ≈ 3 条
+//   (32 位判据的期望间距就是 2^32), 而生产用的 40 位判据只有它的 1/256。也就是说生产那
+//   10 个余量档位对 32 位判据来说太薄了 (Poisson(3) 冒到 11 次的概率 ~2.5e-4, 按 100 天
+//   ~4800 轮算期望上会撞上一次越界写)。这里把容量加到 max_size + 74, 74 个余量对
+//   Poisson(3) 已是天文数字级的安全边际, 而池位下标只用到 0..100, 多出来的部分不参与记账。
+constexpr unsigned int edge_max_edges = dp_buffer_size - 10; // 每轮最多收这么多条边
+
+__device__ EdgeBuffer* edge_device_buffer = nullptr;
+__device__ unsigned int edge_buffer_count = 0;
+__device__ RhoPoint_dev* edge_states_dev = nullptr;  // 每槽当前点 (total_points 份)
+__device__ uint64_t* edge_src_dev = nullptr;         // 每槽当前起点索引
+__device__ RhoPoint_dev* edge_starts_dev = nullptr;  // 起点池 (edge_pool_size 份)
+__device__ uint64_t* edge_starts_src_dev = nullptr;  // 起点池每位的库索引
+
+// ---------------------------------------------------------------------------
 // 验证内核的失败上报机制
 //
 // Release 构建带 -DNDEBUG, 设备端的 assert 会被完全编译掉 (看 nvcc 的
@@ -1384,24 +1444,43 @@ __device__ unsigned long long g_validate_fail = 0;
         }                                                                       \
     } while (0)
 
-// 添加 DP 到缓冲区 (设备端)
+// 添加 DP / 边到缓冲区 (设备端)。
+//
+// EDGE=false (生产路径): 记 (终点 d, m, n), 然后换预备队点 RhoStates_reserve[index]。
+//   index 同时就是这条 DP 记录的下标 —— 主机侧的账本正是靠这一点知道"这一轮槽位
+//   index 被征调了" (见 rho.cpp 的 note_reserve_dps)。
+// EDGE=true (起点漫游路径): 多记一个起点索引 (slot 槽当前用的那个), 并把 slot 换到
+//   起点池的第 index 个新起点; 池位取空 (空槽) 时槽位标成 EDGE_SRC_NONE, 该 walker
+//   从此不再记账。slot 是 walker 槽号 (idx*W + k) —— 设备侧本来不知道自己的槽号,
+//   所以必须由调用方 (内核) 在命中当场传进来。
+//
+// BufT 由实参推出 (DpBuffer / EdgeBuffer), 两条路只有这一个函数。
+template <bool EDGE = false, typename BufT>
 __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
-                                 DpBuffer* buffer, unsigned int max_size)
+                                 BufT* buffer, unsigned int max_size,
+                                 unsigned int slot = 0)
 {
-    // 原子递增获取缓冲区位置
-    unsigned int index = atomicAdd(&dp_buffer_count, 1);
+    // 原子递增获取缓冲区位置 (两条路各数各的)
+    unsigned int* counter = EDGE ? &edge_buffer_count : &dp_buffer_count;
+    unsigned int index = atomicAdd(counter, 1);
 
-    // 调用方保证不越界: 唯一的调用点传 max_size = dp_buffer_size - 10。
+    // 调用方保证不越界: 生产传 max_size = dp_buffer_size - 10; 漫游传 edge_max_edges
+    // (数值相同), 但漫游的缓冲容量是 edge_pool_size, 另留了断流窗口的余量。
     buffer[index].d = d;
     transfer(buffer[index].sp.m , (const unsigned char*)&r.m);
     transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
 
-    // 记录完就走预备队: 这条 walker 由槽位 index 对应的替补点顶上。
-    // index 同时就是这条 DP 记录的下标 —— 主机侧的账本正是靠这一点知道
-    // "这一轮槽位 index 被征调了" (见 rho.cpp 的 note_reserve_dps)。
-    r = RhoStates_reserve[index];
+    if constexpr (EDGE) {
+        // 记下"这条边从哪个 32 位 DP 出发的", 再换下一个起点
+        buffer[index].src = edge_src_dev[slot];
+        r = edge_starts_dev[index];
+        edge_src_dev[slot] = edge_starts_src_dev[index];
+    } else {
+        // 记录完就走预备队: 这条 walker 由槽位 index 对应的替补点顶上
+        r = RhoStates_reserve[index];
+    }
 
-    if (dp_buffer_count >= max_size)
+    if (*counter >= max_size)
         *break_flag_dev = true;
 }
 
@@ -1445,6 +1524,9 @@ void break_rho(bool value)
 }
 
 void _saveDP(uint64_t index, const SecPair& sp);
+// 定义在 blockchain.cpp (与 _saveDP 同处, 那边的 HexStr / iLog 才是文件出口):
+// 一条起点漫游的边 -> 追加一行到 D:\Dp32Edge.txt, 列序 "起点 终点 m n"。
+void _saveEdge(uint64_t src, uint64_t dst, const SecPair& sp);
 // DP 管理器类
 class DpManager
 {
@@ -1510,6 +1592,110 @@ private:
     size_t buffer_size;
 };
 
+// 起点漫游的边缓冲管理器 —— 与 DpManager 同构, 只是落到 D:\Dp32Edge.txt,
+// 且多一列"起点索引"。
+class EdgeManager
+{
+public:
+    explicit EdgeManager(size_t buffer_size)
+    {
+        CHECK_CUDA(cudaMalloc(&m_dev_buffer, buffer_size * sizeof(EdgeBuffer)));
+        CHECK_CUDA(cudaMemset(m_dev_buffer, 0, buffer_size * sizeof(EdgeBuffer)));
+        CHECK_CUDA(cudaMemcpyToSymbol(::edge_device_buffer, &m_dev_buffer, sizeof(EdgeBuffer*)));
+        reset_counters();
+    }
+
+    ~EdgeManager()
+    {
+        CHECK_CUDA(cudaFree(m_dev_buffer));
+    }
+
+    void reset_counters()
+    {
+        unsigned int zero = 0;
+        CHECK_CUDA(cudaMemcpyToSymbol(edge_buffer_count, &zero, sizeof(unsigned int)));
+    }
+
+    // 取回这一轮的边并追加落盘。返回条数 —— 库游标要按它推进: 每条边恰好用掉起点池
+    // 的一个池位, 池位 i 的起点 = library[cursor + i], 所以 cursor += n。
+    //
+    // 落盘次序 (先边, 后状态) 是设计的一部分。两边各自代表什么:
+    //   边文件   = 已经发生过的派发 (事实), 一条行就是一次派发;
+    //   状态文件 = 现在站在哪里 (游标就是从它第 4 列取 max + 1 恢复的)。
+    // 先把事实记全再记位置:
+    //   在两步之间崩 -> 边多出 n 条, 而状态还停在上一轮, 重启后游标退回去把池位**重发
+    //   一遍** (同样的边会再记一遍, 重复几条, 但一条不漏);
+    //   反过来先记位置 -> 状态里的游标已经推过 n, 边却没落盘, 重启后库游标跳过这 n 个
+    //   起点, 它们永远没人走 (漏号), 比重复坏得多。
+    unsigned int save_edges()
+    {
+        unsigned int current_count = 0;
+        CHECK_CUDA(cudaMemcpyFromSymbol(&current_count, edge_buffer_count, sizeof(unsigned int)));
+
+        if (current_count != 0) {
+            std::vector<EdgeBuffer> host_buffer(current_count);
+            CHECK_CUDA(cudaMemcpy(host_buffer.data(), m_dev_buffer,
+                                  current_count * sizeof(EdgeBuffer), cudaMemcpyDeviceToHost));
+
+            for (const auto& e : host_buffer) {
+                _saveEdge(e.src, e.d, e.sp);
+            }
+            reset_counters();
+        }
+
+        std::cout << get_time() << " : saved " << current_count << " edge." << std::endl;
+        return current_count;
+    }
+
+private:
+    EdgeBuffer* m_dev_buffer = nullptr;
+};
+
+// 数一个文本文件的行数 —— 只用于对账与报告 (每次收工时报"本次新增多少条边", 以及
+// 与状态文件推出的游标互校)。它**不等于**库游标: 补种发出去的号不记边, 所以
+//   边文件行数 = 游标 - 累计补种数
+// 库游标的恢复口径在 dp32_edge_session (从状态文件的起点索引列取 max + 1)。
+// 文件不存在 / 打不开都算 0 行。
+static uint64_t count_lines(const std::string& name)
+{
+    std::ifstream ifs(name);
+    if (!ifs.is_open()) return 0;
+    uint64_t n = 0;
+    std::string line;
+    while (std::getline(ifs, line)) n++;
+    return n;
+}
+
+// 每轮一行的性能对账, 写生产日志 D:\iLog.txt (见 ilog_line)。
+//
+// 单独标定几何就靠这一行: 行里带齐了编译期几何 (grid x block / warps per SM / W /
+// walker 状态数), 所以换档重编后不同档位的日志可以直接并排比。
+// 口径 (与核里 count_rho 同一套单位):
+//   批数 batches = 内核自己的 count_rho (idx==0 那一份, 见 rho_round_batches);
+//   每 walker 步数 = batches * W   —— "walker 步"是唯一与 W 无关的单位, 换 W 时
+//                                    比它才公平;
+//   总步数 = 每 walker 步数 * walker 状态数; 总步/秒 = 整卡吞吐。
+// 注意: batches 是 idx==0 的采样。break_flag 是在 2^18 的整数倍上被看到的, 各线程
+// 快慢不同会落在相邻两档, 所以它是 ±2^18 批的采样值, 不是全体精确值。
+static void log_round_rate(const char* tag, uint64_t round_index, double secs,
+                           unsigned long long batches, int total_points, int W,
+                           int grid, int block, unsigned int hits)
+{
+    const uint64_t per_walker = batches * (uint64_t)W;
+    const double total_steps = (double)per_walker * (double)total_points;
+    const double rate_walker = (secs > 0.0) ? (double)per_walker / secs : 0.0;
+    const double rate_total = (secs > 0.0) ? total_steps / secs : 0.0;
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "%s round %llu: %.1f s, %llu steps/walker (%.0f steps/s/walker), "
+             "%.1f M steps/s, %u hits, geometry %dx%d (%d warps/SM, W=%d, %d states)",
+             tag, (unsigned long long)round_index, secs,
+             (unsigned long long)per_walker, rate_walker, rate_total / 1e6, hits,
+             grid, block, RHO_PROD_WARPS_PER_SM, W, total_points);
+    ilog_line(buf);
+}
+
 // 设备端辅助函数：将32位整数转换为大端序十六进制字符串
 __host__ __device__ void uint32_to_hex_be(char* output, uint32_t value)
 {
@@ -1573,17 +1759,26 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
 // ================== 多 walker 内核 ==================
 //
 // 每线程推进 W 个 walker, 每批一次批量求逆 (fun_add_w)。状态按
-// idx*W + k 交错存放。DP 命中的 walker 由 add_dp_to_buffer 原地换成
-// RhoStates_reserve 里的替补点, 与单 walker 语义一致。
+// idx*W + k 交错存放。命中当场由 add_dp_to_buffer 原地换掉 state。
 //
-// DP 判据 (distinguishable, 40 位): 命中当场退役换预备队员, 记进 dp_device_buffer。
-template <int W>
+// 判据与"换点"按 EDGE 编译期分档 (不用运行期标志 —— 热循环里连一个分支都不多):
+//   EDGE=false: 40 位判据 distinguishable   -> dp_device_buffer   + 预备队 RhoStates_reserve
+//   EDGE=true : 32 位判据 distinguishable32 -> edge_device_buffer + 起点池 edge_starts_dev
+// 其余 (fun_add_w / 计数 / 周期性返回 / 状态回存) 两条路完全共用。
+//
+// 本轮实际批数 (idx==0 那一份) 留在设备符号里, 主机落盘时读回去算吞吐 —— 单独标定
+// 几何时 (见 log_round_rate) 要靠它, 否则主机不知道这一轮是被配额还是被缓冲区打断的。
+__device__ unsigned long long rho_round_batches = 0;
+
+template <int W, bool EDGE = false>
 __global__ void rho_w()
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     RhoPoint_dev s[W];
 #pragma unroll
-    for (int k = 0; k < W; ++k) s[k] = RhoStates_dev[idx * W + k];
+    for (int k = 0; k < W; ++k) {
+        s[k] = EDGE ? edge_states_dev[idx * W + k] : RhoStates_dev[idx * W + k];
+    }
 
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
@@ -1592,10 +1787,19 @@ __global__ void rho_w()
         count_rho ++;
 #pragma unroll
         for (int k = 0; k < W; ++k) {
-            const uint64_t d = distinguishable(s[k].x.x);
+            const uint64_t d = EDGE ? distinguishable32(s[k].x.x) : distinguishable(s[k].x.x);
             if (d != 0) {
-                count_dp++;
-                add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 10);
+                if constexpr (EDGE) {
+                    // 空槽上的命中不记账: 它没有起点可记 (库走完 / 本轮补不满)。
+                    if (edge_src_dev[idx * W + k] != EDGE_SRC_NONE) {
+                        count_dp++;
+                        add_dp_to_buffer<true>(d, s[k], edge_device_buffer, edge_max_edges,
+                                               (unsigned int)(idx * W + k));
+                    }
+                } else {
+                    count_dp++;
+                    add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 10);
+                }
             }
         }
         // 周期性返回, 让 rho_play 能定期落盘 (意外关机最多丢这一段):
@@ -1606,6 +1810,8 @@ __global__ void rho_w()
         //   按其 ~1.29M pts/s 约 30 分钟。GPU 侧 2^24 批 x 4 = 2^26 点/线程,
         //   生产几何 (grid 92 = 8 warps/SM) 实测 37,499 pts/s => 1789 s = 29.8 分钟,
         //   两边落盘间隔对齐到同一档 (改成 2^23 批时只有 14.9 分钟, 差一倍)。
+        //   起点漫游沿用同一档: 2^26 点/线程下每条 walker 平均命中 2^26/2^32 次
+        //   32 位 DP, 一轮的边数远小于缓冲区上限, 落盘节奏同样是 ~30 分钟一档。
         // 注意: 内层判断被外层 (count_rho & 0x3FFFF) == 0 短路, 所以 2^24 必须
         //       是 2^18 的整数倍 (2^24 = 64 x 2^18, 成立), 否则这一支永远不会被求值。
         // 注意: count_rho 是批数, 而 printf 打的是点数, 两套单位不要混。
@@ -1614,9 +1820,13 @@ __global__ void rho_w()
         }
     }
 #pragma unroll
-    for (int k = 0; k < W; ++k) RhoStates_dev[idx * W + k] = s[k];
+    for (int k = 0; k < W; ++k) {
+        if constexpr (EDGE) edge_states_dev[idx * W + k] = s[k];
+        else                RhoStates_dev[idx * W + k] = s[k];
+    }
     if (idx == 0) {
-        printf("rho_w<W=%d> count_rho:%llu count_dp:%d\n", W, count_rho * W, count_dp);
+        rho_round_batches = count_rho;
+        printf("rho_w<W=%d%s> count_rho:%llu count_dp:%d\n", W, EDGE ? " EDGE" : "", count_rho * W, count_dp);
     }
 }
 
@@ -2210,10 +2420,292 @@ void init_RhoStates_test(int total_points)
     CHECK_CUDA(cudaMemcpy(RhoStates_host + total_points - 1, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
 }
 
-void rho_play() {
+// ================== 32 位 DP 起点漫游 (dp32_edge_play 的干活部分) ==================
+//
+// 用户口径: 拿 DpSource32all.bin 里的 32 位 DP 当起点, 从每个起点往前走; 走到下一个
+// 32 位 DP 就把这条边记下来 (带上"起源 DP 的索引值"以便跟踪), 然后像 rho_play 一样
+// 换下一个起点继续走 —— 轮结构与 rho_play 同构 (清 break_flag -> 铺池 -> 跑核 -> 同步
+// -> 落账 -> 落状态), 只是判据换成 32 位、换的是起点而不是预备队、落的是边表。
+//
+// 设备侧 (与 RhoStates_dev / RhoStates_reserve / dp_device_buffer 平行, 互不相干):
+//   edge_states_dev[total_points]   每槽当前点
+//   edge_src_dev[total_points]      每槽当前起点索引 (EDGE_SRC_NONE = 空槽, 不再记账)
+//   edge_starts_dev[174]            起点池: 池位 i 就是 library[cursor + i]
+//   edge_starts_src_dev[174]        池位 -> 库索引
+//   edge_device_buffer[174]         本轮的边 (每轮上限 100, 见 edge_max_edges)
+//
+// 主机侧只有两件账:
+//   cursor          库游标 = 下一个要发出去的库**位置** (从状态文件的起点索引列恢复:
+//                   把 max(活槽起点索引) 换算成它在库里的位置再 + 1;
+//                   索引值不能直接当位置用, 见 dp32_edge_session 里的换算)
+//   每槽起点索引     落 D:\Dp32EdgeState.txt 的第 4 行 (借 RhoState.times 这一格)
+//
+// 停机: 库走完 (不再有起点可发) 且所有槽都退役 (alive == 0)。库走完之后的尾巴是最后
+// 那批 walker 各自走完自己的 2^32 期望距离, 还要几天, 期间只出不进。
+static void dp32_edge_session(int gridSize, int blockSize, int total_points)
+{
+    constexpr int W = RHO_GPU_WALKERS;
+
+    // ---- 全量库 (只读, 起点都从这儿取) ----
+    // drf_path 传 nullptr = 只载这一个库: 全量库是语料的只读快照, 没有墓碑/销账那套账。
+    Dp32Store lib;
+    if (!lib.load(DP32_ALL_FILE, nullptr) || !lib.loaded()) {
+        cprintf("%s : %s 载入失败, 起点漫游不启动\n", get_time().c_str(), DP32_ALL_FILE);
+        return;
+    }
+    const uint64_t lib_total = lib.src_count();
+    if (lib_total == 0) {
+        cprintf("%s : %s 是空库, 起点漫游不启动\n", get_time().c_str(), DP32_ALL_FILE);
+        return;
+    }
+
+    // 读库第 at 条 -> 还原成点 (create) 并给出该条自己的索引。越界/读失败返回 false。
+    auto library_start = [&](uint64_t at, RhoPoint& p, uint64_t& index) -> bool {
+        if (at >= lib_total) return false;
+        Dp32Record rec;
+        if (!lib.read(Dp32File::Source, (uint32_t)at, rec)) return false;
+        memcpy(p.m, rec.m, sizeof(p.m));
+        memcpy(p.n, rec.n, sizeof(p.n));
+        create(ctx, &p.x, p.m, p.n);
+        index = rec.index;
+        return true;
+    };
+
+    // 一次性自检: 库第一条的 index 必须与"由 (m,n) 还原出的点"上跑的 32 位判据一致。
+    // 索引对不上, 整套跟踪就无从谈起, 所以这里出错直接停。只查第一条, 不拖慢每轮。
+    {
+        RhoPoint p;
+        uint64_t idx = 0, check = 0;
+        HOST_ASSERT(library_start(0, p, idx));
+        HOST_ASSERT(dp32_test(p.x, check));
+        HOST_ASSERT(check == idx);
+    }
+
+    // ---- 主机侧账 ----
+    std::vector<RhoPoint_dev> states_host(total_points);   // 每槽当前点 (设备镜像)
+    std::vector<uint64_t>     src_host(total_points);      // 每槽当前起点索引
+    std::vector<RhoPoint_dev> pool_host(edge_pool_size);   // 起点池 staging
+    std::vector<uint64_t>     pool_src_host(edge_pool_size);
+
+    // ---- 设备侧 ----
+    RhoPoint_dev* states_dev = nullptr;
+    uint64_t* src_dev = nullptr;
+    RhoPoint_dev* pool_dev = nullptr;
+    uint64_t* pool_src_dev = nullptr;
+    CHECK_CUDA(cudaMalloc(&states_dev, total_points * sizeof(RhoPoint_dev)));
+    CHECK_CUDA(cudaMemcpyToSymbol(edge_states_dev, &states_dev, sizeof(RhoPoint_dev*)));
+    CHECK_CUDA(cudaMalloc(&src_dev, total_points * sizeof(uint64_t)));
+    CHECK_CUDA(cudaMemcpyToSymbol(edge_src_dev, &src_dev, sizeof(uint64_t*)));
+    CHECK_CUDA(cudaMalloc(&pool_dev, edge_pool_size * sizeof(RhoPoint_dev)));
+    CHECK_CUDA(cudaMemcpyToSymbol(edge_starts_dev, &pool_dev, sizeof(RhoPoint_dev*)));
+    CHECK_CUDA(cudaMalloc(&pool_src_dev, edge_pool_size * sizeof(uint64_t)));
+    CHECK_CUDA(cudaMemcpyToSymbol(edge_starts_src_dev, &pool_src_dev, sizeof(uint64_t*)));
+    EdgeManager edge_manager(edge_pool_size);
+
+    // ---- 状态: 能恢复多少恢复多少, 缺的槽从库游标处补起点 ----
+    int got = 0;
+    {
+        std::vector<RhoState> rsv(total_points);
+        got = loadRhoState(rsv.data(), total_points, DP32_EDGE_STATE_FILE);
+        for (int i = 0; i < got; i++) {
+            states_host[i].from(rsv[i]);
+            src_host[i] = rsv[i].times;   // 第 4 行的 times 位在这里存的是起点索引
+        }
+    }
+
+    // ---- 库游标: 已经派发出去的库位置数 ----
+    // 恢复口径是从状态里读回来, 不是数边文件行数: 每槽第 4 行存的就是"它从库里领到的
+    // 那个起点 DP 的索引值"(用户口径: 记索引, 便于跟踪 —— 不是位置序号)。位置是按游标
+    // 严格递增发的: 启动补种拿 0..got-1, 之后每轮的池子窗口从 cursor 起按 library[cursor+i]
+    // 铺, 设备按池位 0,1,2,... 依序取用, 所以派出去的位置恰好是 0,1,...,cursor-1 一段
+    // 连续区间; 而**最后派出去的那个位置还握在某个槽手上** (池位按序发, 最后一个领到
+    // 位置的槽在那一轮里不会再把它换掉), 于是
+    //     游标 = (max(活槽起点索引) 在库里的位置) + 1
+    // 是精确值, 不必额外存一份游标。(拿行数当游标会恒差一个"启动补种数": 补种发的号
+    // 不会记成边 —— 边文件行数 = 游标 - 补种数。)
+    //
+    // 这里必须把**索引换算成位置**: 索引值是 x 的 bit 32..95, 能到 9e17, 直接拿它当游标
+    // 会一步冲过 lib_total 被下面的兜底夹住, 之后每轮铺池取 library[lib_total + i] 全是
+    // 越界空槽 —— 每个槽命中一次就退役, 只减不增, 重启一次整支舰队就走死。
+    // 换算: 全量库按索引升序 (见 common.h), 位置就是下界下标, 二分即可。只在启动时做
+    // 一次, 不加热路径。
+    auto library_position_of = [&](uint64_t index, uint64_t& pos) -> bool {
+        Dp32Record rec;
+        uint64_t lo = 0, hi = lib_total;   // [lo, hi) 内找第一个 index >= 目标的位置
+        while (lo < hi) {
+            const uint64_t mid = lo + (hi - lo) / 2;
+            if (!lib.read(Dp32File::Source, (uint32_t)mid, rec)) return false;
+            if (rec.index < index) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= lib_total) return false;
+        if (!lib.read(Dp32File::Source, (uint32_t)lo, rec)) return false;
+        if (rec.index != index) return false;
+        pos = lo;
+        return true;
+    };
+
+    uint64_t cursor = 0;
+    {
+        uint64_t max_index = 0;
+        bool have = false;
+        for (int i = 0; i < got; i++) {
+            if (src_host[i] == EDGE_SRC_NONE) continue;
+            if (!have || src_host[i] > max_index) { max_index = src_host[i]; have = true; }
+        }
+        if (have) {
+            uint64_t pos = 0;
+            if (library_position_of(max_index, pos)) {
+                cursor = pos + 1;
+            } else {
+                // 状态里的起点索引在库里找不到 (库被重建过 / 状态文件写坏了): 只能从头重发,
+                // 会重复走掉已经走过的位置, 但绝不会漏号。
+                cprintf("%s : 状态里的起点索引 %llu 在全量库里找不到, 游标从 0 重发 (会重复走)\n",
+                        get_time().c_str(), (unsigned long long)max_index);
+            }
+        }
+    }
+    const uint64_t edge_lines = count_lines(DP32_EDGE_FILE);
+    if (got == 0 && edge_lines != 0) {
+        // 状态没了而边还在: 只能从头重发 (会重复走掉已经走过的号, 但绝不会漏号)。
+        cprintf("%s : %s 无记录但 %s 已有 %llu 行, 游标从 0 重发 (会重复走)\n",
+                get_time().c_str(), DP32_EDGE_STATE_FILE, DP32_EDGE_FILE,
+                (unsigned long long)edge_lines);
+    } else if (edge_lines > cursor) {
+        // 边数只可能 <= 派发数 (每条边 = 一次派发, 补种不记边)。真超了就是状态被回滚
+        // 过: 叫一声, 仍按状态口径走 —— 宁可重复, 不可漏号。
+        cprintf("%s : 边文件 %llu 行 > 状态推出的游标 %llu, 状态似被回滚, 按状态走\n",
+                get_time().c_str(), (unsigned long long)edge_lines, (unsigned long long)cursor);
+    }
+    // 兜底: 上面按"库内位置 + 1"算, 结构上不可能越界; 留着防的是以后有人改了恢复口径。
+    if (cursor > lib_total) {
+        cprintf("%s : 游标 %llu 超过库条数 %llu, 夹回库尾 (后面发的都是空槽)\n", get_time().c_str(),
+                (unsigned long long)cursor, (unsigned long long)lib_total);
+        cursor = lib_total;
+    }
+    if (got < total_points) {
+        // 首次运行 (got == 0), 或上次写到一半被杀 (尾部缺几条), 或改了几何 (条数变了)。
+        // 缺的槽从**库游标处**补: 已恢复槽的起点索引在库里的位置都 < cursor, 与游标自洽,
+        // 不会被重复派发; 库也补不满的槽标成空槽, 命中一次即退役。
+        cprintf("%s : %s 恢复 %d/%d 槽, 其余从库游标 %llu 处补起点\n", get_time().c_str(),
+                DP32_EDGE_STATE_FILE, got, total_points, (unsigned long long)cursor);
+        for (int i = got; i < total_points; i++) {
+            RhoPoint p;
+            uint64_t idx = 0;
+            if (library_start(cursor, p, idx)) {
+                states_host[i].from(p);
+                src_host[i] = idx;
+                cursor++;
+            } else {
+                states_host[i] = RhoPoint_dev();
+                src_host[i] = EDGE_SRC_NONE;
+            }
+        }
+    }
+    CHECK_CUDA(cudaMemcpy(states_dev, states_host.data(), total_points * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(src_dev, src_host.data(), total_points * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+    uint64_t alive = 0;
+    for (const uint64_t s : src_host) {
+        if (s != EDGE_SRC_NONE) alive++;
+    }
+
+    cprintf("%s : dp32 起点漫游启动: 库 %llu 条, 游标 %llu, 活槽 %llu/%d, 几何 %dx%d (W=%d)\n",
+            get_time().c_str(), (unsigned long long)lib_total, (unsigned long long)cursor,
+            (unsigned long long)alive, total_points, gridSize, blockSize, W);
+
+    uint64_t round_no = 0;
+    uint64_t total_edges = 0;   // 累计记下的边数 (= 边文件新增的行数; 游标不是这个数)
+    if (alive == 0) {
+        // 库已见底且所有槽都已退役 —— 这是"跑完了"的重启态, 不要再空转一整轮 (半小时),
+        // 因为空槽上的命中不记账, 也永远不会有 hit 把这一轮提前打断。
+        cprintf("%s : 库已见底且所有槽都已退役, 直接收工 (本轮不空转)\n", get_time().c_str());
+        ilog_line("dp32_edge_play: done already, exit.");
+    }
+    while (!gameover && alive != 0) {
+        break_rho(false);
+
+        // 铺起点池 (与 init_RhoStates_reserve 同一时序位: 每轮开始重铺一次池子)。
+        // 注意**不动 cursor** —— 池子是个窗口, 只有真被用掉的那 n 个池位才推游标,
+        // 所以下一轮的窗口是 library[cursor + n ...], 上一轮没用到的池位会被重新列出。
+        for (size_t i = 0; i < edge_pool_size; i++) {
+            RhoPoint p;
+            uint64_t idx = 0;
+            if (library_start(cursor + i, p, idx)) {
+                pool_host[i].from(p);
+                pool_src_host[i] = idx;
+            } else {
+                pool_host[i] = RhoPoint_dev();
+                pool_src_host[i] = EDGE_SRC_NONE;
+            }
+        }
+        CHECK_CUDA(cudaMemcpy(pool_dev, pool_host.data(),
+                              edge_pool_size * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(pool_src_dev, pool_src_host.data(),
+                              edge_pool_size * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+        const auto t0 = std::chrono::steady_clock::now();
+        rho_w<W, true><<<gridSize, blockSize>>>();
+        CHECK_CUDA(cudaDeviceSynchronize());
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        // 次序: 先落边 (边文件的尾巴就是账), 再落状态 —— 理由见 EdgeManager::save_edges
+        const unsigned int edges = edge_manager.save_edges();
+        total_edges += edges;
+        const uint64_t avail = (cursor < lib_total) ? (lib_total - cursor) : 0;
+        const uint64_t revived = std::min<uint64_t>(edges, avail);
+        alive = alive - edges + revived;   // 命中 n 条 = n 个槽换点, 其中 revived 个拿到真起点
+        cursor += edges;
+
+        unsigned long long batches = 0;
+        CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
+        log_round_rate("dp32edge", round_no, secs, batches, total_points, W, gridSize, blockSize, edges);
+
+        // 状态落盘: 文本 4 行/条, "x / m / n / 起点索引" (与 RhoState 格式逐字一致)
+        CHECK_CUDA(cudaMemcpy(states_host.data(), states_dev,
+                              total_points * sizeof(RhoPoint_dev), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(src_host.data(), src_dev,
+                              total_points * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        {
+            std::vector<RhoState> rsv(total_points);
+            for (int i = 0; i < total_points; i++) {
+                states_host[i].to(rsv[i]);
+                rsv[i].times = src_host[i];
+            }
+            saveRhoState(rsv.data(), total_points, DP32_EDGE_STATE_FILE);
+        }
+        round_no++;
+
+        if (alive == 0) {
+            cprintf("%s : 起点走完了 (本轮 %llu 条边, 累计 %llu 条, %llu 轮), 起点漫游收工\n",
+                    get_time().c_str(), (unsigned long long)edges,
+                    (unsigned long long)total_edges, (unsigned long long)round_no);
+            ilog_line("dp32_edge_play: all starts walked, exit.");
+            break;
+        }
+    }
+
+    CHECK_CUDA(cudaFree(states_dev));
+    CHECK_CUDA(cudaFree(src_dev));
+    CHECK_CUDA(cudaFree(pool_dev));
+    CHECK_CUDA(cudaFree(pool_src_dev));
+    cprintf("%s : dp32 起点漫游结束: 本次新增 %llu 条边, 游标 %llu/%llu, 活槽 %llu/%d\n",
+            get_time().c_str(), (unsigned long long)total_edges,
+            (unsigned long long)cursor, (unsigned long long)lib_total,
+            (unsigned long long)alive, total_points);
+}
+
+// rho_play 与 dp32_edge_play 共用的一份实现 —— 只有"判据 / 换什么点 / 落什么账"这三件
+// 事按编译期分档 (EDGE), 其余 (几何选定、线程数、W、一轮的骨架、2^24 批的返回节奏、
+// break_flag、停机) 完全相同。EDGE=false 那一支就是原来的 rho_play, 逻辑逐行未改,
+// 只多了一行性能对账 (见 log_round_rate)。
+template <bool EDGE>
+static void rho_play_impl()
+{
     enable_blocking_sync(); // 必须最先调用：避免 cudaDeviceSynchronize 自旋空转占满一个核
-    // 创建 DP 管理器
-    DpManager dp_manager(dp_buffer_size);
     int gridSize = 0;
     int blockSize = 0;
     get_optimal_block_size(gridSize, blockSize);
@@ -2221,40 +2713,69 @@ void rho_play() {
     constexpr int W = RHO_GPU_WALKERS;
     const int threads = gridSize * blockSize;
     const int total_points = threads * W;
-    init_RhoStates_dev(total_points, _RSFile2_name);
-    init_adds_pub_dev();
-    // 初始化break_flag
-    init_break_flag();
-    // 预备队账本: 槽位数 = DP 缓冲区槽位数。来源与账本本身都在 rho.cpp。
-    // persistent = true: 启动时回读 D:\RhoReserve.txt (货源游标 + 留用队员)。
-    // 不落盘的话游标重启归零, 头几批点跟上一次 run 逐字节重复 —— 重复的那批 DP
-    // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
-    init_reserve_pool(dp_buffer_size, true);
-    // 32 位 DP 库 (瘦索引: 源库 + 已征召库)。3 类货源就是从这儿取点的, 所以先载
-    // 索引; 载不进来这一类就回退随机点 (见 rho.cpp 的 reserve_load_dp)。
-    // 载入结果印在控制台上 (见 dp32_store_init), 不写生产日志。
-    if (!dp32_store_init()) {
-        cprintf("%s : Dp32 库不可用, 3 类货源(来源 3)回退随机点\n", get_time().c_str());
+
+    if constexpr (EDGE) {
+        // 起点漫游: 状态 / 起点池 / 边缓冲全在 dp32_edge_session 里自己管, 一个字节都不碰
+        // 预备队与 DP 账本 (CPU 侧 play() 只朝前走, 从不取预备点, 所以这里用不着那本账)。
+        init_adds_pub_dev();
+        init_break_flag();
+        dp32_edge_session(gridSize, blockSize, total_points);
+    } else {
+        // 创建 DP 管理器
+        DpManager dp_manager(dp_buffer_size);
+        init_RhoStates_dev(total_points, _RSFile2_name);
+        init_adds_pub_dev();
+        // 初始化break_flag
+        init_break_flag();
+        // 预备队账本: 槽位数 = DP 缓冲区槽位数。来源与账本本身都在 rho.cpp。
+        // persistent = true: 启动时回读 D:\RhoReserve.txt (货源游标 + 留用队员)。
+        // 不落盘的话游标重启归零, 头几批点跟上一次 run 逐字节重复 —— 重复的那批 DP
+        // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
+        init_reserve_pool(dp_buffer_size, true);
+        // 32 位 DP 库 (瘦索引: 源库 + 已征召库)。3 类货源就是从这儿取点的, 所以先载
+        // 索引; 载不进来这一类就回退随机点 (见 rho.cpp 的 reserve_load_dp)。
+        // 载入结果印在控制台上 (见 dp32_store_init), 不写生产日志。
+        if (!dp32_store_init()) {
+            cprintf("%s : Dp32 库不可用, 3 类货源(来源 3)回退随机点\n", get_time().c_str());
+        }
+        // 库载进来之后, 先把存档里"已经取走、又被征召掉"的那几个 3 类队员销一次账 ——
+        // 被征召的队员不进存档, 只能从"游标推过、槽位空着"反推出来 (见 rho.cpp)。
+        reserve_retire_consumed();
+        uint64_t round_no = 0;
+        while (!gameover) {
+            break_rho(false);
+            // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由账本决定
+            init_RhoStates_reserve();
+            const auto t0 = std::chrono::steady_clock::now();
+            rho_w<W><<<gridSize, blockSize>>>();
+            // 等待核函数完成
+            CHECK_CUDA(cudaDeviceSynchronize());
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            // 把这一轮的 40 位 DP 条数喂给账本 (记录下标 = 被征调的槽位), 然后落盘
+            const unsigned int hits = dp_manager.save_dps();
+            note_reserve_dps(hits);
+            unsigned long long batches = 0;
+            CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
+            log_round_rate("rho", round_no++, secs, batches, total_points, W, gridSize, blockSize, hits);
+            save_reserve_state();
+            save_RhoStates_dev(total_points, _RSFile2_name);
+        }
+        CHECK_CUDA(cudaFree(RhoStates_host));
+        RhoStates_host = nullptr;
     }
-    // 库载进来之后, 先把存档里"已经取走、又被征召掉"的那几个 3 类队员销一次账 ——
-    // 被征召的队员不进存档, 只能从"游标推过、槽位空着"反推出来 (见 rho.cpp)。
-    reserve_retire_consumed();
-    while (!gameover) {
-        break_rho(false);
-        // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由账本决定
-        init_RhoStates_reserve();
-        rho_w<W><<<gridSize, blockSize>>>();
-        // 等待核函数完成
-        CHECK_CUDA(cudaDeviceSynchronize());
-        // 把这一轮的 40 位 DP 条数喂给账本 (记录下标 = 被征调的槽位), 然后落盘
-        note_reserve_dps(dp_manager.save_dps());
-        save_reserve_state();
-        save_RhoStates_dev(total_points, _RSFile2_name);
-    }
+
     free_break_flag();
-    CHECK_CUDA(cudaFree(RhoStates_host));
-    RhoStates_host = nullptr;
-    std::cout << "rho_play exit." << std::endl;
+    std::cout << (EDGE ? "dp32_edge_play exit." : "rho_play exit.") << std::endl;
+}
+
+void rho_play()
+{
+    rho_play_impl<false>();
+}
+
+void dp32_edge_play()
+{
+    rho_play_impl<true>();
 }
 
 // ================== 验证测试 ==================
@@ -2973,8 +3494,6 @@ void validate_test()
     validate_reserve_state_file();
     // 32 位 DP 库的瘦索引 (载入 / 升序查找 / 墓碑 / 同索引多桶 / 坏库拒绝 / 真库抽样复算)
     validate_dp32_store();
-    // 真库与 data 语料对账 (两库之和 == 语料去重后的条目数; 语料里的点能在库里找到同一条)
-    validate_dp32_corpus();
     // 阶梯口径: create(m=1, n=0) 必须就是设备常量里的生成元 G —— "G, 2G, 3G..."
     // 这条阶梯要是算错, 2 类来源整批都是废点, 而平时根本看不出来。设备常量 G 只在
     // 这里可见, 所以对拍只能放在这里。
