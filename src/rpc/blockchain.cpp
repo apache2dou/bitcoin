@@ -3358,11 +3358,44 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
     return count;
 }
 
-bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, const SecPair& sp2)
+// bingo 的结局。老口径是一个 bool: false 只在 sp1 == sp2 时给, 两个 x 不相等也照样给
+// true (配一个假 k)。可调用方要的信息其实是三分的 —— 真碰撞 / 短回路 (同一份记录) /
+// 只是索引撞了 (两个点根本不是一个), 所以把 bool 拆成这个枚举。
+enum class BingoResult {
+    SameRecord,    // sp1 == sp2: 同一条记录, 谈不上碰撞 (老口径的 false)
+    Solved,        // 两个 x 相同, r 里是真解 (同点式或反号式解出来的)
+    NotCollision,  // 两个 x 不相等, 或者 x 相同但退化 (分母 0), 总之不是可用的碰撞
+};
+
+// ---------------------------------------------------------------------------
+// bingo: 两条 DP 记录 (m1, n1) / (m2, n2) 表示的点落到同一个 x 上时, 解出 k (MVP = k*G)。
+//
+// 口径: 点 x 的标量 s 满足 x = m*G + n*MVP = (m + n*k)*G, 即 s = m + n*k。x 相同只有
+// 两种可能, 各自对应一个公式, 差别只在两个符号上:
+//     同点 (P2 ==  P1, y 相同):  s1 =  s2  =>  k =  (m1 - m2) / (n2 - n1)
+//     反号 (P2 == -P1, y 反号):  s1 = -s2  =>  k = -(m1 + m2) / (n1 + n2)
+// 是哪种**本函数自己算点, 再用 check() 比出来** (同点走同点式, 反号走反号式), 调用方不
+// 用管 —— 老口径一律按同点算, 反号那一类要么被静默跳过 (调用方先比全值公钥, y 反号就
+// 当成"同索引不同点"), 要么算出一个假 k 当真碰撞存下去。
+// 返回值 (BingoResult, 三分):
+//     SameRecord   = sp1 == sp2, 同一份记录 (ta2 == 1 靠这个认"短回路")
+//     Solved       = 两个 x 相同且解出了 k, r 里是真解
+//     NotCollision = 不是可用碰撞: 两个 x 不相等 (常态), 或 x 相同但两边都化成 0
+//                    (精确孪生 (m,n)/(-m,-n), 解不出 k) —— 调用方拿到的信息一样:
+//                    别存这个 k, 也别当碰撞。
+// ---------------------------------------------------------------------------
+
+BingoResult bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, const SecPair& sp2)
 {
-    if (sp1 == sp2) {
-        return false;
-    }
+    if (sp1 == sp2) return BingoResult::SameRecord;
+    secp256k1_pubkey x1;
+    create(ctx, &x1, sp1.m, sp1.n);
+    // 同点/反号/不同点交给 check(): 它就是这套约定的原版 (只比 x 那 32 字节, 命中再用
+    // ec_pubkey_cmp 分符号) —— 同点给 1, 反号给 -1, x 不同给 0, find_baby 吃的也是它。
+    const int form = check(ctx, &x1, sp2.m, sp2.n);
+    if (form == 0) return BingoResult::NotCollision;   // 两个 x 不等, 本来就不是同一个点
+    const bool neg_point = form < 0;
+
     unsigned char cm1[33] = {0};
     unsigned char cn1[33] = {0};
     unsigned char cm2[33] = {0};
@@ -3371,18 +3404,26 @@ bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, const SecP
     memcpy(cn1, sp1.n, sizeof(sp1.n));
     memcpy(cm2, sp2.m, sizeof(sp2.m));
     memcpy(cn2, sp2.n, sizeof(sp2.n));
-
-    secp256k1_ec_seckey_negate(ctx, cn1);
-    secp256k1_ec_seckey_negate(ctx, cm2);
-    secp256k1_ec_seckey_tweak_add(ctx, cn1, cn2);
-    secp256k1_ec_seckey_tweak_add(ctx, cm1, cm2);
+    secp256k1_ec_seckey_negate(ctx, cn1);   // cn1 = -n1
+    if (neg_point) {
+        secp256k1_ec_seckey_negate(ctx, cn2);   // 反号: 分母 -(n1 + n2), 分子 m1 + m2
+    } else {
+        secp256k1_ec_seckey_negate(ctx, cm2);   // 同点: 分母 n2 - n1, 分子 m1 - m2
+    }
+    // 分母为 0 就没得解。精确孪生 (m, n) / (-m, -n) 正落在这一支: 两边都化成 0, 对 k 不
+    // 含任何信息 (同一个点的两种写法而已), 报 NotCollision, 不编造 k。
+    // (negate 入参为 0 时它返回 0 并把结果留成 0 —— 正是"0 的相反数还是 0", 不查返回值。)
+    if (!secp256k1_ec_seckey_tweak_add(ctx, cn1, cn2)) return BingoResult::NotCollision;
+    if (!secp256k1_ec_seckey_tweak_add(ctx, cm1, cm2)) return BingoResult::NotCollision;
     unsigned char cn1i[33] = {0};
-    secp256k1_ec_seckey_inverse(ctx, cn1i, cn1);
-    secp256k1_ec_seckey_tweak_mul(ctx, cm1, cn1i);
+    if (!secp256k1_ec_seckey_inverse(ctx, cn1i, cn1)) return BingoResult::NotCollision;
+    if (!secp256k1_ec_seckey_tweak_mul(ctx, cm1, cn1i)) return BingoResult::NotCollision;
     r.Set(cm1, &cm1[32], false);
-    return true;
+    return BingoResult::Solved;
 }
 
+// 三参数版: 把 m 折成一份 (|m|, 0) 记录再调上面那个 (m < 0 时取负)。只要"解出了 k"
+// 这一个 bit, 所以仍旧返回 bool —— 生产上的 BabyGiant::shoot 用的就是它。
 bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp, int m)
 {
     SecPair sp2 = {0};
@@ -3390,7 +3431,7 @@ bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp, int m)
     if (m < 0) {
         secp256k1_ec_seckey_negate(ctx, sp2.m);
     } 
-    return bingo(ctx, r, sp, sp2);
+    return bingo(ctx, r, sp, sp2) == BingoResult::Solved;
 }
 
 #include <chrono>
@@ -4830,6 +4871,13 @@ static RPCHelpMan testmvp()
                                               {RPCResult::Type::STR, "str", "str"},
                                               {RPCResult::Type::STR, "str2", "str2"},
                                               {RPCResult::Type::NUM, "num", "num"},
+                                              // 只在个别分支出现的键必须标 optional: 不标的话
+                                              // 文档自检反过来报 "key missing, despite not being
+                                              // optional in doc"。
+                                              {RPCResult::Type::STR, "str_bingo", /*optional=*/true,
+                                               "ta == 12: bingo 反号/同点自测结论"},
+                                              {RPCResult::Type::NUM, "idx_dup_diff", /*optional=*/true,
+                                               "ta2 == 1: 40 位索引相同但非同一份记录的条数"},
                                           }},
         RPCExamples{HelpExampleCli("-rpcclienttimeout=0 testmvp", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
@@ -4965,6 +5013,15 @@ static RPCHelpMan testmvp()
                 //m=1ffffff
                 //n2=4895a70cb210634c8caa2f597e5abd013aefc7cbfd749c8e30dbd3e16370ce0c
                 //m2=cad9954ad40d7e586df711835bdde9f5327f99ed4d59ac4ea19f811b17340a1c
+                // 底下这一整段自测的数据是按上面注释里那对 "私钥已知的 mock MVP" 造的:
+                // sec = 5294873c…5ba1, 公钥 pk_mock = 2a9d0567…14eb8。(m2, n2) 表示 x = m*G、
+                // (m2_neg, n2_neg) 表示 -x 这两件事, **只在 pk_mvp 正好是 pk_mock 时才成立**。
+                // 老 bingo 是纯标量代数、从不看点, 所以在真 MVP 下也"过" —— 那是假过。
+                // create() 吃的就是全局 pk_mvp, 所以要在这段里把它换成 mock, 让下面每个
+                // bingo/check 都真的比得到点; 跑完在段末还原。
+                const secp256k1_pubkey pk_mvp_saved = pk_mvp;
+                CPubKey pk_mock(ParseHex("042a9d0567a5531408a7927116cdebd3d2e246df1ed423bfb95ef661f7be5e0b3d05838517687b13e266e3464a7acd81e85d049a9128bbbf1e6375bfa473714eb8"));
+                secp256k1_ec_pubkey_parse(ctx, &pk_mvp, pk_mock.data(), pk_mock.size());
                 CPubKey cpbkey_x(ParseHex("04e785ae5d44cac354b410c1b2b90ff2ff848333f059a53daec1fd693592a47c7d491b8040ed7a05bebcd057cb50f8427abced2a6bdd5028fa16f280faeaf60cee"));
                 RhoState rs = {0};
                 secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
@@ -4976,7 +5033,6 @@ static RPCHelpMan testmvp()
                 int m = 0x1ffffff;
                 bingo(ctx, mvp_mock, rs, m);
                 CPubKey pk_got = mvp_mock.GetPubKey();
-                CPubKey pk_mock(ParseHex("042a9d0567a5531408a7927116cdebd3d2e246df1ed423bfb95ef661f7be5e0b3d05838517687b13e266e3464a7acd81e85d049a9128bbbf1e6375bfa473714eb8"));
                 assert(pk_got == pk_mock);
                 secp256k1_pubkey pk_1ffffff;                
                 unsigned char c_1ffffff[33] = {0};
@@ -4991,7 +5047,7 @@ static RPCHelpMan testmvp()
 
                 //测试 bingo 负值的情况
                 CPubKey cpbkey_x_neg(ParseHex("04e785ae5d44cac354b410c1b2b90ff2ff848333f059a53daec1fd693592a47c7db6e47fbf1285fa41432fa834af07bd854312d59422afd705e90d7f041509ef41"));
-                secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x.data(), cpbkey_x.size());
+                secp256k1_ec_pubkey_parse(ctx, &rs.x, cpbkey_x_neg.data(), cpbkey_x_neg.size());
                 auto n2_neg = ParseHex("b76a58f34def9cb37355d0a681a542fd7fbf151ab1d403ad8ef68aab6cc57335");
                 auto m2_neg = ParseHex("35266ab52bf281a79208ee7ca4221609882f42f961eef3ed1e32dd71b9023725");
                 memcpy(rs.n, n2_neg.data(), n2_neg.size());
@@ -4999,6 +5055,120 @@ static RPCHelpMan testmvp()
                 CKey mvp_mock2;
                 bingo(ctx, mvp_mock2, rs, -m);
                 assert(memcmp(mvp_mock.data(), mvp_mock2.data(), mvp_mock.size()) == 0);
+
+                //测试 bingo 反号的情况 (P2 == -P1: x 相同, y 反号)======================
+                // 上面那组 (m2, n2) 表示的就是 x = m*G。这一组从它构造出**表示 -x** 的另一份:
+                //     m2' = m2 + 1,   n2' = -(m + m2 + 1) / k
+                // 于是 s' = m2' + n2'*k = (m2 + 1) - (m + m2 + 1) = -m = -s —— 也就是 x2 = -x1:
+                // x 一模一样 (索引必然相同), y 反号。这正是"m, n 不同而 x 相同"里老口径会静默
+                // 漏掉的那一类 (老口径比全值公钥, y 反号就当成"同索引不同点"直接跳过)。
+                // 顺便把两种情形都钉住: bingo 自己算 y 判形式, 反号这组必须解出真解;
+                // 同一个点的两种写法 (y 相同) 走另一支公式, 同样要解得出 —— 两条路都测。
+                {
+                    // 报告口: Release 带 -DNDEBUG, 上面那些 assert 会被编掉, 这个自测块改用
+                    // 自己数 + 回一个结论 (str_bingo 字段 + 控制台), 让 testmvp 12 在 Release 下
+                    // 也真的检查得到东西。
+                    int bingo_neg_fail = 0;
+                    std::string bingo_neg_first;
+                    auto chk = [&](bool ok, const char* what) {
+                        if (!ok) {
+                            bingo_neg_fail++;
+                            if (bingo_neg_first.empty()) {
+                                bingo_neg_first = what;
+                            }
+                        }
+                    };
+
+                    SecPair sp_x = {0};     // 表示 x
+                    SecPair sp_nx = {0};    // 表示 -x (x 相同, y 反号)
+                    memcpy(sp_x.m, m2.data(), sizeof(sp_x.m));
+                    memcpy(sp_x.n, n2.data(), sizeof(sp_x.n));
+                    memcpy(sp_nx.m, sp_x.m, sizeof(sp_nx.m));
+                    unsigned char c_one[33] = {0};
+                    c_one[31] = 0x01;
+                    unsigned char c_k[33] = {0};
+                    memcpy(c_k, mvp_mock.data(), sizeof(c_k) - 1);
+                    unsigned char c_kinv[33] = {0};
+                    chk(secp256k1_ec_seckey_inverse(ctx, c_kinv, c_k) == 1, "MVP 私钥求逆失败");
+                    chk(secp256k1_ec_seckey_tweak_add(ctx, sp_nx.m, c_one) == 1, "m2 + 1 溢出");
+                    unsigned char c_sum[33] = {0};
+                    set_int(c_sum, m);
+                    chk(secp256k1_ec_seckey_tweak_add(ctx, c_sum, sp_nx.m) == 1, "m + m2 + 1 溢出");
+                    secp256k1_ec_seckey_negate(ctx, c_sum);
+                    chk(secp256k1_ec_seckey_tweak_mul(ctx, c_sum, c_kinv) == 1, "n2' 算出 0");
+                    memcpy(sp_nx.n, c_sum, sizeof(sp_nx.n));
+
+                    secp256k1_pubkey x_px;
+                    secp256k1_pubkey x_nx;
+                    create(ctx, &x_px, sp_x.m, sp_x.n);
+                    create(ctx, &x_nx, sp_nx.m, sp_nx.n);
+                    chk(memcmp(x_px.data, x_nx.data, 32) == 0, "构造出的 -x 与 x 的 x 坐标不同");
+                    chk(memcmp(x_px.data + 32, x_nx.data + 32, 32) != 0, "构造出的 -x 和 x 是同一个点");
+
+                    // 反号数据: bingo 自己按 y 判出是反号, 用反号公式解出真解
+                    CKey k_neg;
+                    const bool neg_ok = bingo(ctx, k_neg, sp_x, sp_nx) == BingoResult::Solved;
+                    chk(neg_ok, "反号数据解不出 k");
+                    chk(neg_ok && memcmp(k_neg.data(), mvp_mock.data(), mvp_mock.size()) == 0,
+                        "反号数据解出的 k 不对");
+                    CKey k_neg2;
+                    // 谁当第一份都该是同一个 k
+                    const bool neg_ok2 = bingo(ctx, k_neg2, sp_nx, sp_x) == BingoResult::Solved;
+                    chk(neg_ok2 && memcmp(k_neg2.data(), mvp_mock.data(), mvp_mock.size()) == 0,
+                        "反号数据反方向解出的 k 不对");
+
+                    // 同点那一类照旧要能解: (m2 + 1, n2 - 1/k) 表示的还是同一个点 x
+                    SecPair sp_same = {0};
+                    memcpy(sp_same.m, sp_x.m, sizeof(sp_same.m));
+                    memcpy(sp_same.n, sp_x.n, sizeof(sp_same.n));
+                    chk(secp256k1_ec_seckey_tweak_add(ctx, sp_same.m, c_one) == 1, "m2 + 1 溢出");
+                    unsigned char c_minus_kinv[33] = {0};
+                    memcpy(c_minus_kinv, c_kinv, sizeof(c_minus_kinv) - 1);
+                    secp256k1_ec_seckey_negate(ctx, c_minus_kinv);
+                    chk(secp256k1_ec_seckey_tweak_add(ctx, sp_same.n, c_minus_kinv) == 1, "n2 - 1/k 溢出");
+                    secp256k1_pubkey x_same;
+                    create(ctx, &x_same, sp_same.m, sp_same.n);
+                    chk(memcmp(x_px.data, x_same.data, 64) == 0, "构造出的同点写法不是同一个点");
+                    CKey k_same;
+                    chk(bingo(ctx, k_same, sp_x, sp_same) == BingoResult::Solved
+                            && memcmp(k_same.data(), mvp_mock.data(), mvp_mock.size()) == 0,
+                        "同一个点的两种写法没解出真解");
+
+                    // 精确孪生 (m, n) / (-m, -n): x 相同, y 反号, 但两边都化成 0, 对 k 不含任何
+                    // 信息 —— 必须报 NotCollision, 不能算一个假 k, 更不能崩。
+                    // (上面"测试 bingo 负值"那组 (m2_neg, n2_neg) 正好就是这个孪生对)
+                    SecPair sp_twin = {0};
+                    memcpy(sp_twin.m, sp_x.m, sizeof(sp_twin.m));
+                    memcpy(sp_twin.n, sp_x.n, sizeof(sp_twin.n));
+                    secp256k1_ec_seckey_negate(ctx, sp_twin.m);
+                    secp256k1_ec_seckey_negate(ctx, sp_twin.n);
+                    chk(memcmp(sp_twin.m, m2_neg.data(), sizeof(sp_twin.m)) == 0, "m2_neg 不等于 -m2");
+                    chk(memcmp(sp_twin.n, n2_neg.data(), sizeof(sp_twin.n)) == 0, "n2_neg 不等于 -n2");
+                    CKey k_twin;
+                    chk(bingo(ctx, k_twin, sp_x, sp_twin) == BingoResult::NotCollision,
+                        "孪生对没被判成 NotCollision");
+
+                    // 另外两种结局也各钉一条: 同一份记录 (SameRecord) / 两个 x 不相等 (NotCollision)
+                    CKey k_self;
+                    chk(bingo(ctx, k_self, sp_x, sp_x) == BingoResult::SameRecord,
+                        "同一份记录没判成 SameRecord");
+                    SecPair sp_other = {0};
+                    sp_other.rand();
+                    CKey k_other;
+                    chk(bingo(ctx, k_other, sp_x, sp_other) == BingoResult::NotCollision,
+                        "两条 x 不相等的记录没判成 NotCollision");
+
+                    cprintf("testmvp 12: bingo 反号/同点自测 %s (失败 %d 项%s)\n",
+                            bingo_neg_fail == 0 ? "ok" : "FAILED", bingo_neg_fail,
+                            bingo_neg_first.empty() ? "" : (", 首个: " + bingo_neg_first).c_str());
+                    // 单开一个键, 不覆盖这层原有的 "str" (那是查 MVP 私钥那段留下的)
+                    unspent.pushKV("str_bingo", strprintf("bingo neg/same-point selftest %s (fail %d%s)",
+                                                          bingo_neg_fail == 0 ? "ok" : "FAILED", bingo_neg_fail,
+                                                          bingo_neg_first.empty() ? "" : (", first: " + bingo_neg_first).c_str()));
+                }
+
+                // 这一段自测用的是 mock MVP 口径 (段首换的), 出了这段把真 MVP 装回去
+                pk_mvp = pk_mvp_saved;
 
                 SecPair sp1 = {0};
                 sp1.rand();
@@ -5033,7 +5203,7 @@ static RPCHelpMan testmvp()
                 std::remove("D:\\test.txt");*/
 
                 //测试CUDA
-                validate_test();
+                //validate_test();
             }
 
             if (ta == 112) {
@@ -5287,6 +5457,10 @@ static RPCHelpMan testmvp()
                 if (ta2 == 1) {
                     // 检查DP文件中是否存在碰撞，若存在则计算bingo
                     std::map<uint64_t, SecPair> dpMap;
+                    // 40 位索引相同、但两份记录表示的点不同 (x 不相等) 的条数。这不是碰撞也不是
+                    // 短回路, 只是索引撞了 —— 以前这一支会被当成 short circulation 停下来,
+                    // 反而把后面真正的短回路/碰撞挡住了。
+                    uint64_t n_idx_dup_diff = 0;
 
                     // 处理单个DP文件流：解析每条记录(三行一组)并入dpMap，检测碰撞
                     // 返回值: 0=正常读完(EOF); 非0=遇到错误或碰撞(应停止后续处理)
@@ -5311,15 +5485,23 @@ static RPCHelpMan testmvp()
                             auto iter = dpMap.find(dp_index);
                             if (iter != dpMap.end()) {
                                 CKey k;
-                                if (bingo(ctx, k, sp, iter->second)) {
+                                const BingoResult br = bingo(ctx, k, sp, iter->second);
+                                if (br == BingoResult::Solved) {
+                                    // 真碰撞: 两份记录是同一个 x 的两种写法 (同点或反号)
                                     save_key(k);
                                     unspent.pushKV("str", "!!!!bingo!!!!");
                                     return 2;
-                                } else {
+                                }
+                                if (br == BingoResult::SameRecord) {
+                                    // 同一份记录的第二次出现 —— 这才是"短回路", 也正是这个
+                                    // 工具本来要手工去重的东西
                                     unspent.pushKV("str", "!!!!short circulation!!!!");
                                     unspent.pushKV("str2", std::to_string(dp_index));
                                     return 3;
                                 }
+                                // NotCollision: 只是索引撞了, 两个点不是同一个 (x 不同), 既不是
+                                // 碰撞也不是短回路 —— 继续扫, 不再在这儿假报 short circulation
+                                n_idx_dup_diff++;
                             } else {
                                 dpMap[dp_index] = sp;
                             }
@@ -5386,6 +5568,11 @@ static RPCHelpMan testmvp()
                     }
                     */
                     unspent.pushKV("num", dpMap.size());
+                    unspent.pushKV("idx_dup_diff", n_idx_dup_diff);
+                    if (n_idx_dup_diff != 0) {
+                        cprintf("testmvp 8 1: 索引相同但非同一份记录 %llu 条 (不是短回路, 已跳过)\n",
+                                (unsigned long long)n_idx_dup_diff);
+                    }
                 } else if (ta2 == 2) {
                     // 校验 D:\Dp32Edge.txt 里的每条边确实是 32 位 DP (ta2 == 1 的 32 位兄弟)。
                     // 一行 "起点索引 终点索引 终点m 终点n": 由 (m, n) 现算 x = m*G + n*MVP,
@@ -5404,6 +5591,11 @@ static RPCHelpMan testmvp()
 
                     std::map<uint64_t, SecPair> dstMap;   // 终点索引 -> 该终点的 (m, n)
                     uint64_t n_lines = 0, n_bad = 0, n_src_unknown = 0, n_dst_dup = 0;
+                    // 重复终点里 x 真的相同的有几条 (= 真碰撞候选), 其中 bingo 解不出 k 的有几条。
+                    // x 相同 ⇒ 同点/反号必居其一, bingo 本该必解得出; 唯独"精确孪生" (m,n)/(-m,-n)
+                    // 那种写法两边都化成 0 (同一个点的两种写法而已, 对 k 不含信息) 会落在这里 ——
+                    // 所以它正常应该恒为 0, 或者只被孪生对填满; 两种都不算碰撞。
+                    uint64_t n_x_same = 0, n_x_nosol = 0;
                     std::string first_bad;
 
                     iLog _edgelog(DP32_EDGE_FILE);
@@ -5455,36 +5647,50 @@ static RPCHelpMan testmvp()
                         uint32_t slot = 0;
                         if (all_lib.src_find(src, slot) == Dp32Hit::Absent) n_src_unknown++;
 
-                        // 终点碰撞: 同一索引先确认是同一个点, 是才谈得上 bingo
+                        // 终点碰撞: 索引相同只说明 x 的 bit 32..95 相同, **不等于**同一个点,
+                        // 所以先确认 x (只比前 32 字节, y 允许反号)。x 相同只有两种情形,
+                        // 都是真碰撞, 两种都要能解:
+                        //     (a) 同一个点: P2 =  P1 (y 相同)  k =  (m1 - m2) / (n2 - n1)
+                        //     (b) 互为反号: P2 = -P1 (y 反号)  k = -(m1 + m2) / (n1 + n2)
+                        // 老口径用 ec_pubkey_cmp 比全值点, (b) 因为 y 反号被判成"同索引不同点"
+                        // 静默丢掉 —— 这正是"m, n 不同而 x 相同"里最容易漏的一类。
+                        // 两种情形都交给 bingo —— 它自己算 y 判形式, 反号那类不会再被漏掉。
                         const auto iter = dstMap.find(dst);
                         if (iter == dstMap.end()) {
                             dstMap[dst] = sp;
                         } else {
                             secp256k1_pubkey x_old;
                             create(ctx, &x_old, iter->second.m, iter->second.n);
-                            if (secp256k1_ec_pubkey_cmp(ctx, &x_old, &x_tmp) == 0) {
+                            if (memcmp(x_old.data, x_tmp.data, 32) == 0) {
+                                n_x_same++;
                                 CKey k;
-                                if (bingo(ctx, k, sp, iter->second)) {
+                                if (bingo(ctx, k, sp, iter->second) == BingoResult::Solved) {
                                     save_key(k);
                                     unspent.pushKV("str", "!!!!bingo!!!!");
                                     unspent.pushKV("str2", std::to_string(dst));
                                     return unspent;
                                 }
+                                n_x_nosol++;
                             }
                             n_dst_dup++;
                         }
                     }
 
                     cprintf("Dp32Edge 校验: %llu 行, 非 32 位 DP %llu 条, 起点不在库里 %llu 条, "
-                            "同终点碰撞 %llu 条 (终点去重 %llu)\n",
+                            "同终点碰撞 %llu 条 (其中 x 相同 %llu 条, x 相同但解不出 %llu 条), "
+                            "终点去重 %llu\n",
                             (unsigned long long)n_lines, (unsigned long long)n_bad,
                             (unsigned long long)n_src_unknown, (unsigned long long)n_dst_dup,
+                            (unsigned long long)n_x_same, (unsigned long long)n_x_nosol,
                             (unsigned long long)dstMap.size());
                     unspent.pushKV("str", strprintf("lines %llu, not_32dp %llu, src_not_in_lib %llu, "
-                                                    "dst_collision %llu, dst_unique %llu",
+                                                    "dst_collision %llu, x_same %llu, x_same_nosol %llu, "
+                                                    "dst_unique %llu",
                                                     (unsigned long long)n_lines, (unsigned long long)n_bad,
                                                     (unsigned long long)n_src_unknown,
                                                     (unsigned long long)n_dst_dup,
+                                                    (unsigned long long)n_x_same,
+                                                    (unsigned long long)n_x_nosol,
                                                     (unsigned long long)dstMap.size()));
                     unspent.pushKV("str2", first_bad);
                     unspent.pushKV("num", n_lines);
