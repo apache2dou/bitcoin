@@ -1292,6 +1292,53 @@ __host__ __device__ uint64_t distinguishable32(const uint256_t& x)
     return 0;
 }
 
+// ---- 关于"正负折叠" (walk 时按 y 的奇偶把 y 取反, 即把点折成 -P) 的结论: 本项目不省 ----
+//
+// 想法: 每走一步看 y 的末位, 为 1 就把 y 取反, 让状态空间减半, 从而少走一半点。
+// 结论是**不省**, 因为本项目的 DP 判据与索引口径**都只看 x**, ± 早就在索引那一层
+// 被折成同一条记录了:
+//
+//   (1) 判据只读 x: distinguishable32 / distinguishable 一个字都没碰 y。
+//   (2) 索引只由 x 算出: 主机侧 dp32_test (blockchain.cpp) 的口径是
+//       "data[0..3] 全 0, 索引取 data[4..11]", 即索引 = x 的 bit 32..95。
+//       因 x(-P) = x(P), 故 index(-P) = index(P), dp32_test(-P) = dp32_test(P)。
+//   (3) 库/语料按索引归并: 语料侧见 dp32_corpus_reconcile 的 idx32/idx40 去重 (键
+//       就是 index), 库侧见 Dp32Store::load_impl 的严格升序检查
+//       (key <= m_src_keys[slot-1] 即判假, 升序即 unique) —— 一个索引一个槽位,
+//       重复索引进不来。
+//       所以 P 与 -P 在进库那一刻已经是同一条。DpSource32all.bin 的 890271 条
+//       (= 源库 886948 + 已征召 3323) 就是 890271 个不同的 x 类, 折叠量不了它。
+//
+// 于是三笔账都不动: 每步命中概率仍是 2^-32 (由 x 决定), 库条数仍是 890271,
+// 每条边期望步数仍是 2^32。± 的"减半"这一层**已经做过了**, 再做一次没有可省的。
+// 唯一还没折的只是 walker 脚下踩哪个代表元, 而踩哪个都记同一个 index、都算一次命中,
+// 不产生重复工作量, 也不会因为库里同时有 P 和 -P 而多走一趟。
+//
+// 代价反而实打实: 若每步都折 (唯一能改变游走动力学的位置), 每步多一次
+// mod_sub (y -> p - y, 同机微基准约 142 cyc) 加一次奇偶判断, 相对每点 1e4 cyc 的
+// 量级 => 净慢 1~2%, 换回 0 收益。若只在命中时折 (只改记录里 y 的代表元), 代价约 0,
+// 但游走一步未变, 收益同样为 0。
+//
+// 两个会撞上的"经典说法", 在这里都不成立:
+//   a) 记录含义: 折叠确实会改 (m, n) 的符号, 但 bingo 本来就两种都吃 ——
+//        同点 (P2 ==  P1): k =  (m1 - m2) / (n2 - n1)
+//        反号 (P2 == -P1): k = -(m1 + m2) / (n1 + n2)
+//      是哪一支由 bingo 自己 create() 出点、再 check() 判出来 (1 同点 / -1 反号 /
+//      0 x 不等), 不依赖记录里写的是哪一支。折了以后反号支变死代码, 解的条数不变;
+//      老记录的符号与新口径不一致 bingo 也照样判得出, 只是人读日志时要留意。
+//      同时 index 的含义完全不变, 老库老边原样继续可用, 不存在"舍不得"的损失。
+//   b) negmap 的 sqrt(2): 折叠确实能让"walker 自己撞自己成圈"那类题里的圈长按
+//      sqrt(2) 缩短 (1.2533*sqrt(N) -> 1.2533*sqrt(N/2)), 前提是**同一条 walker
+//      一直走、靠自撞成圈**。本项目两条路径都是"命中即换起点" (生产路径换
+//      RhoStates_reserve[index], 起点漫游换 edge_starts_dev[index]), walker 从不
+//      积累圈, 所以这条根本不介入。真正产出解的事件是**不同 walker 的 DP 记录落到
+//      同一个 x 上**, 其速率 ~ (DP 访问总数)^2 / (2 * DP 类数), 两个因子都不含符号。
+//      (secp256k1 的群阶是奇素数, 没有 2 阶点, 故 -P != P, negmap 无不动点 ——
+//       折叠在这条曲线上确实是"干净"的, 只是本项目不在那个题上。)
+//
+// 想真正减半, 该动的地方是**判据宽度与 index 口径** (以及随之绑死的
+// DpSource32all.bin / Dp32Edge.txt 字节格式), 与正负无关。
+
 // ================== 同线程多 walker 批量求逆 ==================
 //
 // 动机与 CPU 版 (rho.cpp 的 rho_affine_FW) 相同: 仿射点加每步一次域模逆,
@@ -1669,33 +1716,86 @@ static uint64_t count_lines(const std::string& name)
     return n;
 }
 
-// 每轮一行的性能对账, 写生产日志 D:\iLog.txt (见 ilog_line)。
+// 每轮性能对账的累加器 —— 只在内存里记账, 收工时打一行汇总 (见 flush_round_rate)。
 //
-// 单独标定几何就靠这一行: 行里带齐了编译期几何 (grid x block / warps per SM / W /
-// walker 状态数), 所以换档重编后不同档位的日志可以直接并排比。
-// 口径 (与核里 count_rho 同一套单位):
+// 原实现是每轮往生产日志 D:\iLog.txt 写一行 ("dp32edge round N: ...")。一轮动辄上千秒,
+// 逐轮写只让日志文件随轮数线性膨胀, 信息量与"收工看一次总账"没多大差别; 所以改成累加。
+// 汇总行的口径与历史逐轮行**逐项一致** (同一套 per_walker / total_steps 公式),
+// 换档重编后仍可与老日志并排比 —— ⚠ 但历史行 (以及改动前的汇总行) 把 per_walker
+// 多乘了一个 W (见 accum_round_rate 里那段), 要跟老日志比先把老数字除以 W:
 //   批数 batches = 内核自己的 count_rho (idx==0 那一份, 见 rho_round_batches);
-//   每 walker 步数 = batches * W   —— "walker 步"是唯一与 W 无关的单位, 换 W 时
-//                                    比它才公平;
+//   每 walker 步数 = batches       —— 一批 = W 条 walker **各走一步**, 所以
+//                                    "walker 步"是唯一与 W 无关的单位, 换 W 时比它才公平;
+//                                    (内核 printf 打的是 count_rho*W = 每线程"点数",
+//                                     单位是点不是步, 当初就是照它多乘了个 W)
 //   总步数 = 每 walker 步数 * walker 状态数; 总步/秒 = 整卡吞吐。
+// 行里还带齐了编译期几何 (grid x block / warps per SM / W / walker 状态数), 所以
+// 单独标定几何也只靠这一行。
 // 注意: batches 是 idx==0 的采样。break_flag 是在 2^18 的整数倍上被看到的, 各线程
 // 快慢不同会落在相邻两档, 所以它是 ±2^18 批的采样值, 不是全体精确值。
-static void log_round_rate(const char* tag, uint64_t round_index, double secs,
-                           unsigned long long batches, int total_points, int W,
-                           int grid, int block, unsigned int hits)
+struct RoundRateAcc {
+    const char* tag = "";
+    uint64_t rounds = 0;             // 已累加的轮数
+    double secs = 0.0;               // 各轮核函数耗时之和 (不含落盘/落边)
+    unsigned long long steps = 0;    // 各轮 "每 walker 步数 (batches)" 之和
+    unsigned long long hits = 0;     // 各轮命中数之和 (EDGE 档 = 落边条数)
+    double best = 0.0, worst = 0.0;  // 单轮最快/最慢的整卡吞吐 (steps/s)
+    uint64_t best_round = 0, worst_round = 0;
+    int total_points = 0, W = 0, grid = 0, block = 0;
+};
+
+static RoundRateAcc g_round_rate;
+
+static void accum_round_rate(const char* tag, uint64_t round_index, double secs,
+                             unsigned long long batches, int total_points, int W,
+                             int grid, int block, unsigned int hits)
 {
-    const uint64_t per_walker = batches * (uint64_t)W;
-    const double total_steps = (double)per_walker * (double)total_points;
-    const double rate_walker = (secs > 0.0) ? (double)per_walker / secs : 0.0;
-    const double rate_total = (secs > 0.0) ? total_steps / secs : 0.0;
+    RoundRateAcc& a = g_round_rate;
+    // 一批 = W 条 walker 各走一步 ⇒ 每 walker 的步数**就是批数本身** (batches = count_rho)。
+    // 曾经写成 batches * W —— 那是"这个线程一共产出多少点", 单位是点不是步: 于是
+    // steps/walker 与 M steps/s 两栏都虚了 W 倍 (W=4 时报 36,726, 真值 9,182)。
+    // 注意 total_points = 线程数 * W 本来已含 W, 所以整卡吞吐跟着一起虚 W 倍 —— 两栏
+    // 内部是一致的, 光看日志自洽性发现不了这个错 (要靠与基准的每线程点数对账)。
+    const uint64_t per_walker = batches;
+    const double rate_total = (secs > 0.0) ? (double)per_walker * total_points / secs : 0.0;
+
+    a.tag = tag;
+    a.rounds++;
+    a.secs += secs;
+    a.steps += per_walker;
+    a.hits += hits;
+    a.total_points = total_points;
+    a.W = W;
+    a.grid = grid;
+    a.block = block;
+    if (a.rounds == 1 || rate_total > a.best) { a.best = rate_total; a.best_round = round_index; }
+    if (a.rounds == 1 || rate_total < a.worst) { a.worst = rate_total; a.worst_round = round_index; }
+}
+
+// 收工时的总账: 一行打完并复位累加器 (重复调用只出一次)。控制台与生产日志各一份。
+// 平均速率 = 累计总步数 / 累计秒数, 不是各轮速率的算术平均 —— 长轮该占更大权重。
+// 只有正常收工 (gameover / 起点走完) 才走得到这里; 进程被硬杀时这一行会丢。
+static void flush_round_rate()
+{
+    const RoundRateAcc a = g_round_rate;
+    g_round_rate = RoundRateAcc{};
+    if (a.rounds == 0) return;
+
+    const double total_steps = (double)a.steps * (double)a.total_points;
+    const double rate_walker = (a.secs > 0.0) ? (double)a.steps / a.secs : 0.0;
+    const double rate_total = (a.secs > 0.0) ? total_steps / a.secs : 0.0;
 
     char buf[512];
     snprintf(buf, sizeof(buf),
-             "%s round %llu: %.1f s, %llu steps/walker (%.0f steps/s/walker), "
-             "%.1f M steps/s, %u hits, geometry %dx%d (%d warps/SM, W=%d, %d states)",
-             tag, (unsigned long long)round_index, secs,
-             (unsigned long long)per_walker, rate_walker, rate_total / 1e6, hits,
-             grid, block, RHO_PROD_WARPS_PER_SM, W, total_points);
+             "%s 汇总: %llu 轮, %.1f s, %llu steps/walker (%.0f steps/s/walker), "
+             "%.1f M steps/s, %llu hits, 单轮 %.1f~%.1f M steps/s (最快第 %llu 轮, 最慢第 %llu 轮), "
+             "geometry %dx%d (%d warps/SM, W=%d, %d states)",
+             a.tag, (unsigned long long)a.rounds, a.secs,
+             a.steps, rate_walker, rate_total / 1e6, a.hits,
+             a.best / 1e6, a.worst / 1e6,
+             (unsigned long long)a.best_round, (unsigned long long)a.worst_round,
+             a.grid, a.block, RHO_PROD_WARPS_PER_SM, a.W, a.total_points);
+    cprintf("%s\n", buf);
     ilog_line(buf);
 }
 
@@ -1770,7 +1870,7 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
 // 其余 (fun_add_w / 计数 / 周期性返回 / 状态回存) 两条路完全共用。
 //
 // 本轮实际批数 (idx==0 那一份) 留在设备符号里, 主机落盘时读回去算吞吐 —— 单独标定
-// 几何时 (见 log_round_rate) 要靠它, 否则主机不知道这一轮是被配额还是被缓冲区打断的。
+// 几何时 (见 accum_round_rate) 要靠它, 否则主机不知道这一轮是被配额还是被缓冲区打断的。
 __device__ unsigned long long rho_round_batches = 0;
 
 template <int W, bool EDGE = false>
@@ -2666,7 +2766,7 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
 
         unsigned long long batches = 0;
         CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
-        log_round_rate("dp32edge", round_no, secs, batches, total_points, W, gridSize, blockSize, edges);
+        accum_round_rate("dp32edge", round_no, secs, batches, total_points, W, gridSize, blockSize, edges);
 
         // 状态落盘: 文本 4 行/条, "x / m / n / 起点索引" (与 RhoState 格式逐字一致)
         CHECK_CUDA(cudaMemcpy(states_host.data(), states_dev,
@@ -2705,7 +2805,7 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
 // rho_play 与 dp32_edge_play 共用的一份实现 —— 只有"判据 / 换什么点 / 落什么账"这三件
 // 事按编译期分档 (EDGE), 其余 (几何选定、线程数、W、一轮的骨架、2^24 批的返回节奏、
 // break_flag、停机) 完全相同。EDGE=false 那一支就是原来的 rho_play, 逻辑逐行未改,
-// 只多了一行性能对账 (见 log_round_rate)。
+// 只多了一行性能对账 (收工时汇总, 见 flush_round_rate)。
 template <bool EDGE>
 static void rho_play_impl()
 {
@@ -2760,7 +2860,7 @@ static void rho_play_impl()
             note_reserve_dps(hits);
             unsigned long long batches = 0;
             CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
-            log_round_rate("rho", round_no++, secs, batches, total_points, W, gridSize, blockSize, hits);
+            accum_round_rate("rho", round_no++, secs, batches, total_points, W, gridSize, blockSize, hits);
             save_reserve_state();
             save_RhoStates_dev(total_points, _RSFile2_name);
         }
@@ -2769,6 +2869,9 @@ static void rho_play_impl()
     }
 
     free_break_flag();
+    // 收工总账: 逐轮那一行原来是每轮写一次生产日志, 现在只在退出时汇总一行
+    // (两者口径一致, 见 accum_round_rate / flush_round_rate)。
+    flush_round_rate();
     std::cout << (EDGE ? "dp32_edge_play exit." : "rho_play exit.") << std::endl;
 }
 
