@@ -267,6 +267,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/output_script.cpp
   rpc/rawtransaction.cpp
   rpc/rho.cpp
+  rpc/rho_lab.cpp
   rpc/server.cpp
   rpc/server_util.cpp
   rpc/signmessage.cpp
@@ -301,6 +302,8 @@ target_link_libraries(bitcoin_node
 )
 
 if(BUILD_BITCOIN_CUDA)
+  # GPU 实验田 (rpc/cuda_lab.cu) 不在这里列出: 它由 cuda.cu 末尾 #include 进来
+  # (没开 RDC, 独立翻译单元看不到 cuda.cu 的设备符号), 见那边的长注释。
   target_sources(bitcoin_node PRIVATE rpc/cuda.cu)
   target_link_libraries(bitcoin_node PRIVATE CUDA::cudart)
   target_compile_options(bitcoin_node PRIVATE

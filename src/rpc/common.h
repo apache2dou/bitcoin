@@ -448,4 +448,72 @@ void rho_affine_flush(RhoState* rs);
 
 // 定义在 rpc/rho.cpp: 扫描 1/2/4/8 个 walker 的吞吐, 用来选 RHO_WALKERS
 void perf_test_rho_affine_walkers();
+
+// ---------------------------------------------------------------------------
+// 实验田 (rho_lab.cpp)
+//
+// 玩乐/试验性质的加速点子都先落在 rpc/rho_lab.cpp: 只读生产状态, 不碰存档、不启动
+// play、不动设备内存。验证成形后再考虑往生产路径搬。新入口在这里声明。
+// ---------------------------------------------------------------------------
+
+// ---- 试验 1: kg40 -----------------------------------------------------------
+//
+// 枚举 k = 1, 2, 3, ... 把 x(k·G) 的 40 位可分点连同它的 k 记下来。
+// 纯 GPU (设备侧实现在 rpc/cuda_lab.cu, 由 cuda.cu 末尾 #include 进来); 主机侧
+// (起点解析、文件名、断点游标、DP 落盘) 在 rpc/rho_lab.cpp。
+//
+// 怎么跑 (没有命令行开关, 是手动切换): 把 blockchain.cpp 的 work() 里那行线程
+//   threads.emplace_back(kg40_play, std::string("0"));
+// 留着就行 (它本来就顶掉了生产那一路 rho_play); 要换起点就改这个字符串字面量。
+//   <起点> 写法:
+//     0            P0 = 无穷远点 (等价于从 1·G 开始数)
+//     1mvp         P0 = 1·MVP            (MVP = blockchain.cpp 的 pk_mvp)
+//     <a>mvp       P0 = a·MVP             (a 可省略 = 1)
+//     <b>g         P0 = b·G
+//     <a>mvp+<b>g  P0 = a·MVP + b·G       (b 后的 g 可省略), 大小写不敏感
+//   第 m 个点 (m>=1) 是 P0 + m·G, DP 记下来的 k 就是 m (从 P0 起又加了几个 G;
+//   起点本身的 a/b 偏移不算进 k)。所以 "0" 的第一个被检点是 1·G (k=1),
+//   "7g" 的第一个被检点是 8·G (k=8)。
+//
+// 落盘 (每个起点一套, 互不覆盖):
+//   D:\Kg40_<起点>.txt     每行 "<k> <索引>", 追加写, 首行是 # 注释
+//   D:\Kg40_<起点>.state   断点游标 (已覆盖的 k 上界), 每轮覆盖写
+// 把 .state 删掉就从 k=0 重来。
+// 起点标签里的 '+' 在文件名里写成 '_', 例: 3mvp+7g -> D:\Kg40_3mvp_7g.txt。
+
+// 起点 P0: 65 字节非压缩编码 (0x04||x||y) + 无穷远点标记
+struct Kg40Start {
+    unsigned char ser[65];
+    bool infinity;
+};
+
+// 解析起点描述串 (见上), 成功返回 true
+bool kg40_parse_spec(const std::string& spec, uint64_t& a_mvp, uint64_t& b_g);
+
+// 规范化的起点标签 ("0" / "1mvp" / "3mvp+7g")
+std::string kg40_spec_tag(uint64_t a_mvp, uint64_t b_g);
+
+// 落盘路径
+std::string kg40_dp_file(uint64_t a_mvp, uint64_t b_g);
+std::string kg40_state_file(uint64_t a_mvp, uint64_t b_g);
+
+// P0 = a·MVP + b·G (a=b=0 -> 无穷远点)
+bool kg40_make_start(uint64_t a_mvp, uint64_t b_g, Kg40Start& out);
+
+// 段首点: out[row] = P0 + (cursor + row·walkers_per_row + 1)·G, row = 0..rows-1
+// (调用方传 walkers_per_row = block_size·W, rows = grid)
+bool kg40_build_bases(const Kg40Start& p0, uint64_t cursor, uint64_t walkers_per_row,
+                      int rows, std::vector<Kg40Start>& out);
+
+// 断点游标读写 (文件不存在 / 读不出来 -> 0)
+uint64_t kg40_load_cursor(const std::string& file);
+bool kg40_save_cursor(const std::string& file, uint64_t cursor);
+
+// DP 追加落盘: 第 i 条是 "ks[i] idxs[i]" (十进制, 每行一条)
+bool kg40_append_dps(const std::string& file, uint64_t a_mvp, uint64_t b_g,
+                     const std::vector<uint64_t>& ks, const std::vector<uint64_t>& idxs);
+
+// 定义在 rpc/cuda_lab.cu: 跑 kg40 (GPU)。非 CUDA 构建里 cuda_stub.cpp 有抛异常的桩。
+void kg40_play(const std::string& spec);
+
 #endif // BITCOIN_RPC_COMMON_H

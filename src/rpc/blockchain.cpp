@@ -3047,7 +3047,8 @@ void break_rho(bool f);
 
 static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
-static secp256k1_pubkey pk_mvp;
+// 去掉 static: rpc/rho_lab.cpp 的 kg40 要拿它的倍数当起点 (extern 声明在那边)。
+secp256k1_pubkey pk_mvp;
 
 RhoPoint adds_pub[2][256] = {0};
 
@@ -4837,10 +4838,15 @@ void play() {
         threads.emplace_back(T, i);
     }
     if (g_run_mode != 1) {
-        // threads.emplace_back(rho_play); // 模式1不启动CUDA线程
-        // 32 位 DP 起点漫游顶掉生产那一路 (改回生产: 放开上面一行, 注掉下面一行即可)。
-        // 两者是同一个核 rho_w<W,EDGE> 的两个编译期实例, 轮结构完全一样, 见 cuda.cu。
-        threads.emplace_back(dp32_edge_play);
+        // 模式1不启动CUDA线程
+        // threads.emplace_back(rho_play); 
+        // 32 位 DP 起点漫游
+        // threads.emplace_back(dp32_edge_play); 
+
+        // 实验田 kg40 (沿固定加数链路扫 40 位可分点) 
+        // 起点描述串的写法见 src/rpc/common.h
+        // 的 "试验 1: kg40" 一节 (例: "0" / "1mvp" / "7g" / "3mvp+7g")。
+        threads.emplace_back(kg40_play, std::string("0"));
     }
     for (auto& t : threads) {
         t.join();

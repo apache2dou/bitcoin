@@ -3681,3 +3681,16 @@ void validate_reserve_prod_config()
         cprintf("reserve prod config: ok (%d slots, all random)\n", (int)pool.size());
     }
 }
+
+// ===========================================================================
+// GPU 实验田 (rpc/cuda_lab.cu)
+//
+// 为什么要 #include 而不是当成独立源文件编: 本工程没开 CUDA_SEPARABLE_COMPILATION
+// (RDC), 一个 .cu 翻译单元既看不到 cuda.cu 里 static/文件作用域的**设备**符号
+// (fun_add_w 用到的 step_prepare/step_apply/mod_inv_p/mul_mod/distinguishable/
+// adds_pub_dev/break_flag_dev ...), 也不能发另一个 .cu 里定义的 __global__ 核。
+// 把实验田的代码整段并进来, 它就与本文件同一个翻译单元, 上面所有东西都看得见 ——
+// 这也是它必须放在文件**末尾**的原因 (要用到 G)。
+// 对应地, rpc/cuda_lab.cu 已从 src/CMakeLists.txt 的 CUDA 源列表里去掉。
+// ===========================================================================
+#include "cuda_lab.cu"
