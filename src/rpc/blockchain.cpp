@@ -4841,12 +4841,12 @@ void play() {
         // 模式1不启动CUDA线程
         // threads.emplace_back(rho_play); 
         // 32 位 DP 起点漫游
-        // threads.emplace_back(dp32_edge_play); 
+        threads.emplace_back(dp32_edge_play); 
 
         // 实验田 kg40 (沿固定加数链路扫 40 位可分点) 
         // 起点描述串的写法见 src/rpc/common.h
         // 的 "试验 1: kg40" 一节 (例: "0" / "1mvp" / "7g" / "3mvp+7g")。
-        threads.emplace_back(kg40_play, std::string("0"));
+        //threads.emplace_back(kg40_play, std::string("0"));
     }
     for (auto& t : threads) {
         t.join();
