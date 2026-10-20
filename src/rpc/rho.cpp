@@ -1150,14 +1150,20 @@ static bool reserve_source_by_name(const std::string& s, ReserveSource& out)
 // 当前用哪一类来源。来源是按槽位存的, 这里只是"全池统一"的开关 —— 要换来源就改
 // 这一行 (不提供运行期切换: 换了之后池子里已有的队员怎么算, 是另一回事)。
 //
-// 当前配置 = 3 类 (Dp): 队员从 D:\DpSource32.bin 的源库按槽位游标现取, 库取完
-// (或库不在盘上) 就整池逐槽回退随机点。换来源前先确认两件事:
+// 当前配置 = 1 类 (Random): 每轮整池换新随机点, 不建账本、不碰
+// D:\RhoReserve.txt 的货源游标, 也不载 32 位 DP 库 (cuda.cu 的 rho_play 按这个
+// 来源跳过 dp32_store_init / reserve_retire_consumed, 见那边 EDGE=false 那一支)。
+// 这样生产路与 32 位 DP 库彻底解耦: 库只归起点漫游 (dp32_edge_play) 用。
+//
+// 换回 3 类 (Dp) 时的前提 (改下面那一行即可, 其余代码不用动): 队员从
+// D:\DpSource32.bin 的源库按槽位游标现取, 库取完 (或库不在盘上) 就整池逐槽回退
+// 随机点。换之前先确认两件事:
 //   1. 源库/已征召库在盘上 (不在就静默回退随机, 见 reserve_load_dp —— 池子照跑,
 //      只是又变回"全随机起点");
 //   2. D:\RhoReserve.txt 里的 "supply Dp <游标>" 还指得准。游标存的是源库**槽位号**,
 //      而源库是离线脚本一次生成的快照 (应用内没有重建入口), 所以重新离线建库之后槽位
 //      会整体挪位, 那时要把这个游标清零。
-static ReserveSource g_reserve_source = ReserveSource::Dp;
+static ReserveSource g_reserve_source = ReserveSource::Random;
 
 // 给 cuda.cu 的 validate_test 用: 池子里"该不该有队员"随来源变 (1 类不留履历,
 // 2/3 类每槽都是队员), 那一段自检不能写死成"全随机池"。
@@ -1210,6 +1216,8 @@ struct ReserveSupply {
 static ReserveSupply g_supply_special;
 static ReserveSupply g_supply_dp;
 // 是否读写状态存档 = 是不是生产路径 (只有 rho_play 打开; validate 一律不碰盘)。
+// 另外: 来源配成 Random 时即使传 persistent = true 也一律关掉 (见 init_reserve_pool) ——
+// 这个池子没有队员、没有货源游标, 存档里那两项对它全是空的, 读写只是在糟鸥别人的进度。
 static bool g_reserve_persistent = false;
 
 // 十六进制 -> 字节。本翻译单元不引 util/strencodings.h (那是 bitcoin 的头, 与这里
@@ -1742,8 +1750,15 @@ void init_reserve_pool(size_t slots, bool persistent)
 {
     delete g_reserve_pool;
     g_reserve_pool = new ReservePool(slots, g_reserve_source);
-    g_reserve_persistent = persistent;
-    if (!persistent) return;
+    // 来源是 Random 时**整条存档通道关掉**: 不回读、也不落盘 (写的那一侧靠下面这个
+    // 标志拦, 见 save_reserve_state)。与 cuda.cu 里"只有 Dp 才载库"是同一个守卫。
+    // 理由: 1 类池子没有队员也没有货源游标, 存档里那两项对它全是空的 ——
+    //   回读: 会把上一段 Dp/Special 配置的游标与队员回填进来, 又被 begin_round 当成
+    //         "已退役/待补员"重新算一遍, 白花力气还容易误销账 (见 reserve_retire_consumed);
+    //   写入: 每轮重写会把上一段的游标/队员冲成 0 与全空, 将来换回 Dp 时进度就丢了。
+    // 所以 Random 期间那份存档**原样留着**, 换回 Dp/Special 只需要改 g_reserve_source。
+    g_reserve_persistent = persistent && g_reserve_source != ReserveSource::Random;
+    if (!g_reserve_persistent) return;
 
     // 回读失败 (存档不存在 / 坏掉) 时 reserve_state_read 可能已经往池子里塞了半份,
     // 所以整份丢掉重建 —— 要么是整份旧状态, 要么是干净起点, 不留半真半假的中间态。
@@ -1756,9 +1771,12 @@ void init_reserve_pool(size_t slots, bool persistent)
 }
 
 // 落一次盘 (每轮 loop 末了一次, 紧跟 note_reserve_dps)。
+// Random 来源下 g_reserve_persistent 恒为 false (见 init_reserve_pool), 这里直接返回 ——
+// 不打开 D:\RhoReserve.txt, 也不写它的 .tmp。
 void save_reserve_state()
 {
     if (g_reserve_pool == nullptr || !g_reserve_persistent) return;
+    if (g_reserve_source == ReserveSource::Random) return;
     ReserveCursors cur;
     reserve_cursors(cur);
     reserve_state_write(*g_reserve_pool, cur, RHO_RESERVE_STATE_FILE);

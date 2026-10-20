@@ -1240,18 +1240,31 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 // ⚠ run-17 曾把 4->8 记成 1.27 / 拐点在 8, 源头是当时 W=8 读到 601.6M 这个
 //   复现不出来的高值; 反复复测 W=8 只在 539~558M (差 ~9%), 该记录已作废。
 // ⚠ W=16/32 档两轮间漂移 5% / 11% (机器升频); 16->32 离 1 很远, 不受影响。
-// 即: **W 轴的最优点与 warps/SM 轴的最优点重合在生产配置上
-//   (W=4 + cap 8 warps/SM), 不需要为 W 单独记账。**
-// W=4 保留的另外两个理由:
-//   开销见上面 "成本随 states" 那张表: W=4 的 141,312 states 小于
-//   D:\RhoState2.txt 现有条数, 所以它是**第一轮零补点**的最大档;
-//   W=8 要补点, W=32 的 states 是它的 8 倍 (设备态 20 MB -> 163 MB,
-//   每轮落盘 0.56 s -> 4.44 s)。
-// 相对 W=8: 总吞吐 -25.9%, 单 walker +48.3%, states -50%, 补点由零变正。
-// 相对 W=32: 总吞吐 53.6%, 单 walker 4.29x, states 1/8。
-// 注意: W=1 之所以不能选, 除了吞吐低, 还因为 W=1 每点都要做一次 safegcd 模逆
-// (批量求逆只摊掉 (1-1/W)); W=1->2 的 +59.2% 就是这段收益最陡的地方。
-constexpr int RHO_GPU_WALKERS = 4;
+// 上面那张表按**交换比** (总吞吐倍率对数 / 单 walker 倍率对数) 定档, 它回答的是
+// "让一条 walker 自己走够远"这类题的定价 —— 在 W=4 处拐头。
+//
+// ⚠ **生产取值已改成 32 (2026-10-19)**, 与上面那张表的口径不同, 理由: 40 位这条路
+//   要的不是单 walker 走多远, 而是**整卡每秒产出多少条 40 位 DP** (碰撞率 = DP 记录
+//   数的平方 / (2 x DP 类数), 只跟产出总量有关; walker 命中后被预备队换掉, 从不靠
+//   自己走够远)。产出率 = 整卡吞吐 / 2^40, 于是只看总吞吐这一列:
+//     W=4 399.7M  ->  W=8 539.1M  ->  W=16 665.7M  ->  W=32 745.7M pts/s
+//   代价是 states = threads x W 线性涨 (47,104 -> 376,832): 启动补点 ~8 s (只这一次),
+//   每轮落盘 100 MB / ~1.5 s (save_RhoStates_dev_fast), 单 walker 速度掉到 1,979 pts/s
+//   ⇒ 内核 2^24 批的返回点从 ~30 分钟拉长到 ~2.35 小时 (一轮的墙钟时间)。
+//   要换回来只改这一行; 上面 W=4 的实测表与开销表保留作历史对照, 不必重算。
+constexpr int RHO_GPU_WALKERS = 32;
+
+// 起点漫游 (32 位判据, dp32_edge_play) 的每线程 walker 数 —— 与生产路**分开定档**。
+// 它的产出率同样是"整卡吞吐 / 2^32", 所以方向上也该加 W (W=16 比 W=4 快 67%),
+// 但它的每轮上限是 edge_max_edges 条边, 而断流窗口 (break_flag 置起到各线程散场)
+// 里冒出来的命中数随 states 线性涨:
+//   W=4  47,104 states  一个窗口期望 2.9 条  20 档余量下越界概率 3e-13/轮 (现状)
+//   W=16 188,416        期望 11.5 条         20 档余量下 6e-4/轮 (每天 ~0.09 次)
+//   W=32 376,832        期望 23 条           20 档余量下 0.13/轮 (必崩)
+// 这就是边缓冲容量 (edge_pool_size) 与 20 档余量按 47,104 states 推出来的直接后果。
+// 要加大 W, 先把余量一起加 (W=16 加 32 档, W=32 加 52 档), 见 edge_pool_size 那段。
+// 这里先保持 4。
+constexpr int RHO_EDGE_WALKERS = 4;
 
 // 生产几何的每 SM warp 数 —— 单线程速度与总吞吐的**权衡档位**, 不是极值:
 // 8 -> 12 这一步总吞吐 +22% 而每线程 -19%, 已经换不过来; 单看总吞吐 24 才是极值,
@@ -1457,12 +1470,15 @@ constexpr size_t edge_pool_size = dp_buffer_size; // 起点池 / 边缓冲容量
 // 两条路的缓冲容量都是 dp_buffer_size, 写入上限 max_size 都是 dp_buffer_size - 20;
 // 那 20 档余量留给"标志已置起但还没散场"的窗口:
 //   add_dp_to_buffer 是 *counter >= max_size 才置 break_flag, 而各线程要走到下一个 2^18
-//   批的检查点才看得到它, 这段窗口里还会再冒出来一批命中 —— 期望命中数 ≈ 47104 状态 x
-//   2^18 步 / 2^32 ≈ 3 条 (32 位判据的期望间距就是 2^32; 生产用的 40 位判据是它的 1/256,
-//   同一窗口只期望 0.01 条)。
-//   余量按最坏的那条路 (32 位) 定: 20 档 = Poisson(3) 冒到 21 次的概率 ~1e-11, 按 100 天
-//   ~4800 轮算期望 5e-8 次越界写; 10 档 (冒到 11 次 ~2.5e-4, 100 天里期望撞一次) 太薄,
-//   比 20 档再多对这么小的概率已无意义 —— 两条路统一取 20 档。
+//   批的检查点才看得到它, 这段窗口里还会再冒出来一批命中 —— 期望命中数 ≈ states x
+//   2^18 步 / 2^32 (32 位判据的期望间距就是 2^32)。
+//   余量按最坏的那条路 (32 位, 47,104 states) 定: 期望 2.9 条, 20 档 = Poisson(2.9)
+//   冒到 21 次的概率 ~3e-13, 按 100 天 ~4800 轮算期望 1e-9 次越界写; 10 档 (冒到 11
+//   次 ~2.5e-4, 100 天里期望撞一次) 太薄, 比 20 档再多对这么小的概率已无意义 ——
+//   两条路统一取 20 档。
+//   ⚠ 这个余量随 states 线性走: 40 位路改成 W=32 (376,832 states) 后同一窗口只期望
+//     0.09 条 (仍然是全覆盖, 因为 40 位判据的间距是 2^40), 边那边你要是加大
+//     RHO_EDGE_WALKERS 就必须跟着加余量, 见该常量的注释。
 constexpr unsigned int edge_max_edges = dp_buffer_size - 20; // 每轮最多收这么多条边
 
 __device__ EdgeBuffer* edge_device_buffer = nullptr;
@@ -1907,14 +1923,17 @@ __global__ void rho_w()
         }
         // 周期性返回, 让 rho_play 能定期落盘 (意外关机最多丢这一段):
         //   每 2^18 批 poll 一次外部 break_flag;
-        //   第 2^24 批无条件返回 (W=4 时 = 2^26 = 67,108,864 点/线程)。
+        //   第 2^24 批无条件返回 (= 每条 walker 2^24 步, 与 W 无关)。
         // 时长对齐: 时间目标取 CPU 侧 play() 同一件事的周期 —— 0 号线程 (W0=2)
         //   在 count_try = 2^30 批 (= 2^31 点) 时 pause 落盘 (blockchain.cpp),
-        //   按其 ~1.29M pts/s 约 30 分钟。GPU 侧 2^24 批 x 4 = 2^26 点/线程,
-        //   生产几何 (grid 92 = 8 warps/SM) 实测 37,499 pts/s => 1789 s = 29.8 分钟,
-        //   两边落盘间隔对齐到同一档 (改成 2^23 批时只有 14.9 分钟, 差一倍)。
-        //   起点漫游沿用同一档: 2^26 点/线程下每条 walker 平均命中 2^26/2^32 次
-        //   32 位 DP, 一轮的边数远小于缓冲区上限, 落盘节奏同样是 ~30 分钟一档。
+        //   按其 ~1.29M pts/s 约 30 分钟。
+        //   ⚠ CPU 侧那 30 分钟与 GPU 侧**不再对齐**: W=4 时单 walker 8,485 步/秒
+        //   => 2^24 步 = 1,977 s = 33 分钟 (当年就是照这个对齐的); 生产改成 W=32
+        //   后单 walker 只有 1,979 步/秒 => 2^24 步 = 8,478 s = 2.35 小时, 比 CPU 侧
+        //   的 pause 慢 4.7 倍。两条线程各有各的落盘节奏 (barrier 只包含 CPU 线程,
+        //   见 play() 的 std::barrier(n_tasks)), 所以只是 GPU 侧落盘变粗, 不互相阻塞。
+        //   起点漫游 (W=4) 仍是 ~30 分钟一档: 2^26 点/线程下每条 walker 平均命中
+        //   2^26/2^32 次 32 位 DP, 一轮的边数远小于缓冲区上限。
         // 注意: 内层判断被外层 (count_rho & 0x3FFFF) == 0 短路, 所以 2^24 必须
         //       是 2^18 的整数倍 (2^24 = 64 x 2^18, 成立), 否则这一支永远不会被求值。
         // 注意: count_rho 是批数, 而 printf 打的是点数, 两套单位不要混。
@@ -2209,9 +2228,11 @@ void save_RhoStates_dev(int total_points, const std::string& name)
 constexpr size_t kDraftedHeaderBytes = 24;
 constexpr size_t kDraftedRecordBytes = 72;
 
-// 当前生产几何下"最近一轮写下的前段"有多少条: 92 x 128 x 4 = 47104。
-// RhoState2.txt 里 0..47103 是最近一轮 (写盘的那个进程) 的落盘状态, 47104.. 是更早的
+// 当前生产几何下"最近一轮写下的前段"有多少条: 92 x 128 x RHO_GPU_WALKERS
+// (W=4 时 47104, W=32 时 376832 —— 与 total_points 同一个数)。
+// RhoState2.txt 里 0..前段-1 是最近一轮 (写盘的那个进程) 的落盘状态, 之后是更早的
 // 一轮写的、之后每次写盘都原样保留的冻结段 (见 save_RhoStates_dev_fast 保留尾部的说明)。
+// ⚠ rho_rewalk_probe 的 ref.load 上限写在下面 (400000), 改 W 大到 3 以上时注意别被截。
 constexpr int kRhoState2FrontRecords = 92 * 128 * RHO_GPU_WALKERS;
 
 // (m,n) 参照集合。开放寻址线性探测, 建完只查不插。
@@ -2384,14 +2405,28 @@ void rho_rewalk_probe()
         adds[i].from(adds_pub[0][i]);
     }
     const int N = (int)starts.size();
+    if (N <= 0) {
+        cprintf("rewalk: 已征召库里没有活记录 (全墓碑), 中止\n");
+        return;
+    }
     std::vector<RhoPoint_dev> s((size_t)N);
     for (int k = 0; k < N; k++) {
         s[k].from(starts[k]);
     }
+    // fun_add_w<W> 一批要吃满 W 个 walker (s[0..W-1]), 而"尾部非墓碑记录"可能不足
+    // W 条 (已征召库通常只有十几条活的): 补齐到 W 份, 补出来的那几个只是陪跑,
+    // 报告循环一律只到 N, 不参与统计。以前 W=4 时几乎总能凑够 4 条, 加大 W 之后就
+    // 不是"几乎"了 —— 缺一个数就是越界读。
+    if (N < RHO_GPU_WALKERS) {
+        s.resize((size_t)RHO_GPU_WALKERS);
+        for (int k = N; k < RHO_GPU_WALKERS; k++) s[k] = s[0];
+    }
 
     // 上限取 2^27 = 134217728 步: 单个点最多跨 5 轮的剩余部分, 一轮的上限是
-    // 2^24 批 (rho_w 的自动返回点), 所以 5 x 2^24 = 83886080 步足够覆盖,
-    // 2^27 只是留一倍余量 (W=4 批量求逆, 实测约 1.3M 步/秒 => 上限约 100 秒)。
+    // 2^24 批 (rho_w 的自动返回点, 与 W 无关), 所以 8 x 2^24 = 2^27 足够覆盖。
+    // ⚠ 耗时按**单 walker** 速度算: W=4 时 8,485 步/秒 => 上限约 4.4 小时;
+    //   生产 W=32 后单 walker 只有 ~1,979 步/秒 => 上限约 18.8 小时。实际命中
+    //   通常落在 1e7 步以内 (约 1.4 小时), 上限只是保证不会死循环。
     const uint64_t max_steps = 1ULL << 27;
     std::vector<RewalkWalk> out((size_t)N);
 
@@ -2548,7 +2583,9 @@ void init_RhoStates_test(int total_points)
 // 那批 walker 各自走完自己的 2^32 期望距离, 还要几天, 期间只出不进。
 static void dp32_edge_session(int gridSize, int blockSize, int total_points)
 {
-    constexpr int W = RHO_GPU_WALKERS;
+    // 与 rho_play_impl 里 EDGE 那一支同一个常量 (那边按 threads x W 算出的
+    // total_points 传进来, 两边必须一致)。
+    constexpr int W = RHO_EDGE_WALKERS;
 
     // ---- 全量库 (只读, 起点都从这儿取) ----
     // drf_path 传 nullptr = 只载这一个库: 全量库是语料的只读快照, 没有墓碑/销账那套账。
@@ -2813,8 +2850,9 @@ static void rho_play_impl()
     int gridSize = 0;
     int blockSize = 0;
     get_optimal_block_size(gridSize, blockSize);
-    // 每线程 W 个 walker, 状态总数 = 线程数 * W
-    constexpr int W = RHO_GPU_WALKERS;
+    // 每线程 W 个 walker, 状态总数 = 线程数 * W。两条路分开定档 (要的东西不同,
+    // 见 RHO_GPU_WALKERS / RHO_EDGE_WALKERS 的注释); 其余骨架完全共用。
+    constexpr int W = EDGE ? RHO_EDGE_WALKERS : RHO_GPU_WALKERS;
     const int threads = gridSize * blockSize;
     const int total_points = threads * W;
 
@@ -2835,16 +2873,21 @@ static void rho_play_impl()
         // persistent = true: 启动时回读 D:\RhoReserve.txt (货源游标 + 留用队员)。
         // 不落盘的话游标重启归零, 头几批点跟上一次 run 逐字节重复 —— 重复的那批 DP
         // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
+        // ⚠ 来源配成 Random (当前配置) 时 rho.cpp 会把这条通道整个关掉: 既不回读也不
+        //   写盘, 那份存档原样留着给将来的 Dp/Special 用 (见 init_reserve_pool 的注释)。
         init_reserve_pool(dp_buffer_size, true);
-        // 32 位 DP 库 (瘦索引: 源库 + 已征召库)。3 类货源就是从这儿取点的, 所以先载
-        // 索引; 载不进来这一类就回退随机点 (见 rho.cpp 的 reserve_load_dp)。
-        // 载入结果印在控制台上 (见 dp32_store_init), 不写生产日志。
-        if (!dp32_store_init()) {
-            cprintf("%s : Dp32 库不可用, 3 类货源(来源 3)回退随机点\n", get_time().c_str());
+        // 32 位 DP 库 (瘦索引: 源库 + 已征召库)。只有 3 类货源 (Dp) 从这儿取点,
+        // 所以只在来源配成 Dp 时载索引; 载不进来这一类就回退随机点 (见 rho.cpp 的
+        // reserve_load_dp)。载入结果印在控制台上 (见 dp32_store_init), 不写生产日志。
+        // 来源配成 Random (当前配置) 时整段跳过 —— 库归起点漫游路用, 生产路不碰。
+        if (reserve_configured_source() == ReserveSource::Dp) {
+            if (!dp32_store_init()) {
+                cprintf("%s : Dp32 库不可用, 3 类货源(来源 3)回退随机点\n", get_time().c_str());
+            }
+            // 库载进来之后, 先把存档里"已经取走、又被征召掉"的那几个 3 类队员销一次账 ——
+            // 被征召的队员不进存档, 只能从"游标推过、槽位空着"反推出来 (见 rho.cpp)。
+            reserve_retire_consumed();
         }
-        // 库载进来之后, 先把存档里"已经取走、又被征召掉"的那几个 3 类队员销一次账 ——
-        // 被征召的队员不进存档, 只能从"游标推过、槽位空着"反推出来 (见 rho.cpp)。
-        reserve_retire_consumed();
         uint64_t round_no = 0;
         while (!gameover) {
             break_rho(false);
