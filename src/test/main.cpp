@@ -1581,10 +1581,136 @@ void test_112_helper() {
 
 #include <csignal>
 
+// ---------------------------------------------------------------------------
+// 进程单例: 同一时刻只允许一个 test_bitcoin 进程
+//
+// 为什么要这个: 本程序的生产状态全在 D:\ 下那几个固定文件里 (iLog.txt /
+// RhoState2.txt / RhoReserve.txt / Dp32Edge.txt / Dp32EdgeState.txt ...), 而且是
+// **每轮整份重写**。两个实例同时跑, 后启动的那个会拿自己的状态覆盖前一个的落盘,
+// 边表还会互相穿插, 结果两边的进度一起作废 —— 而文件本身看不出是谁写坏的。
+//
+// 实现用操作系统内核对象的独占, 不用"锁文件 + 手工删":
+//   Windows: 命名互斥体。进程消失 (正常退出 / Ctrl+C / 被 TerminateProcess) 时
+//            内核自动关闭句柄、释放占有, **不存在残留锁**, 收工后可以立刻重启。
+//   POSIX:   在 /tmp 的锁文件上加 flock(LOCK_EX | LOCK_NB), fd 随进程关闭一起释放。
+//
+// 名字固定 (不带 PID / 时间戳 / 构建类型): Debug 与 Release、不同构建目录跑起来写的是
+// **同一批** D:\ 文件, 所以必须互斥。Local\ 前缀 = 按登录会话隔离, 同一台机器上另一个
+// 用户再跑一份互不影响。
+//
+// 覆盖范围是整个进程: 生产 (play), 以及 perf / rhoperf / validate 三个常驻入口都算 ——
+// 后两个虽然没有生产副作用, 但它们也要读 D:\RhoState2.txt 等文件, 让它们和正在跑的
+// 生产实例并存没有意义, 还容易让人误读"两边同时跑"的结果。
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
+namespace {
+
+class ProcessSingleton
+{
+public:
+    ProcessSingleton(const ProcessSingleton&) = delete;
+    ProcessSingleton& operator=(const ProcessSingleton&) = delete;
+
+    ProcessSingleton()
+    {
+#ifdef _WIN32
+        // 返回 nullptr 时把错误码取出来 (GetLastError 会被随后的调用冲掉)
+        m_handle = (void*)::CreateMutexW(nullptr, TRUE, kMutexName);
+        const unsigned long err = m_handle == nullptr ? (unsigned long)::GetLastError() : 0;
+        if (m_handle == nullptr) {
+            // 建不出来 (权限 / 句柄耗尽) 不当作"已有实例": 宁可放开, 也不无故拒绝启动。
+            std::cout << "单例: 创建互斥体失败 (GetLastError=" << err
+                      << "), 不做单例限制, 继续启动" << std::endl;
+            m_acquired = true;
+            return;
+        }
+        if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+            // 别人先建的: 我们只是又开了一个句柄, 关掉它 (不释放别人的占有)
+            ::CloseHandle((HANDLE)m_handle);
+            m_handle = nullptr;
+            m_acquired = false;
+            return;
+        }
+        // 我们建的 => 同时已经持有它 (bInitialOwner = TRUE), 一直持有到进程结束
+        m_acquired = true;
+#else
+        m_fd = ::open(kLockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (m_fd < 0) {
+            m_acquired = true; // 打不开锁文件就不设限, 同 Windows 那一支的口径
+            return;
+        }
+        if (::flock(m_fd, LOCK_EX | LOCK_NB) != 0) {
+            ::close(m_fd);
+            m_fd = -1;
+            m_acquired = false;
+            return;
+        }
+        m_acquired = true;
+#endif
+    }
+
+    ~ProcessSingleton()
+    {
+#ifdef _WIN32
+        if (m_handle != nullptr) ::CloseHandle((HANDLE)m_handle);
+#else
+        // 不 unlink 锁文件: 留着这个 inode 给下一个实例加锁, 避免
+        // "删文件 + 别人刚好打开" 的经典竞态。文件本身是空的, 留在 /tmp 无害。
+        if (m_fd >= 0) ::close(m_fd);
+#endif
+    }
+
+    // true = 本进程是当前唯一的实例 (或无法判定, 见上); false = 已有实例在跑
+    bool acquired() const { return m_acquired; }
+
+private:
+#ifdef _WIN32
+    static constexpr const wchar_t* kMutexName = L"Local\\bitcoin-rho-test-singleton";
+    void* m_handle = nullptr; // HANDLE (用 void* 收着, 免得这个类型名散到别处)
+#else
+    static constexpr const char* kLockPath = "/tmp/bitcoin-rho-test-singleton.lock";
+    int m_fd = -1;
+#endif
+    bool m_acquired = false;
+};
+
+} // namespace
+
 void validate_test();
 void perf_test();
 int main(int argc, char* argv[])
 {
+    // 单例必须在 INIT 之前: INIT 的构造函数就会打开 D:\iLog.txt (append), 而下面
+    // 三个常驻入口 (perf / rhoperf / validate) 也都要读 D:\ 下的状态文件。
+    ProcessSingleton singleton;
+    if (!singleton.acquired()) {
+        std::cout << "已有一个 test_bitcoin 进程在运行 (单例标识 "
+#ifdef _WIN32
+                     "Local\\bitcoin-rho-test-singleton"
+#else
+                     "/tmp/bitcoin-rho-test-singleton.lock"
+#endif
+                     " 已被占用), 本实例退出。\n"
+                     "同一时刻只允许一个实例: 两个进程同写 D:\\ 下的状态文件会互相覆盖。\n"
+                     "确认是不是上一份还没退干净 (Ctrl+C 之后它要先写完盘); 或者到任务管理器里\n"
+                     "结束那个 test_bitcoin.exe 再启动。"
+                  << std::endl;
+        return 1;
+    }
+
     // 运行模式：1=仅CPU单线程(无CUDA) 2=multiple=1,CPU 1/4核 3=multiple=2,CPU 1/2核(默认)
     //           4=CPU 核数-2 线程(blockSize 与模式无关, 见 cuda.cu 的 get_optimal_block_size)
     // 用法: test_bitcoin 3  或  test_bitcoin.exe -m 4
