@@ -113,15 +113,30 @@ bool parse_coef(const std::string& s, uint64_t& v)
     return parse_dec(s, v);
 }
 
-// secp256k1_pubkey -> 65 字节非压缩编码。注意 libsecp256k1 的 pubkey.data 本来就是
-// x||y 的大端 64 字节 (bc 的 create/check 直接 memcmp 前 32 字节比 x 就是这个原因),
-// 所以不用走 secp256k1_ec_pubkey_serialize。
+// secp256k1_pubkey -> 65 字节 (0x04 || pubkey.data[0..63])。
+//
+// 注意 ser 里装的**不是**标准 SEC 编码: secp256k1_pubkey.data 就是库内部的
+// secp256k1_ge_storage (每坐标 4 个 uint64 limb, 见 secp256k1.c 的 pubkey_load /
+// pubkey_save 里的 STATIC_ASSERT(sizeof(ge_storage) == 64)), 不是大端 x||y。
+// 这么存是为了让设备侧 k40_to_affine 直接 memcpy 进 uint256_t (与 RhoPoint_dev::from
+// 同一套约定), 主机侧要拿回 pubkey 必须用下面的 k40_from_start **memcpy 还原**,
+// 绝不能走 secp256k1_ec_pubkey_parse (那会把 limb 当成大端坐标解, 点直接落到曲线外,
+// parse 返回 0 —— 报错 "cannot build stride point" 就是这里来的)。
 void start_from_pub(const secp256k1_pubkey& pk, K40Start& out)
 {
     out.ser[0] = 0x04;
     std::memcpy(out.ser + 1, pk.data, 32);
     std::memcpy(out.ser + 33, pk.data + 32, 32);
     out.infinity = false;
+}
+
+// 上面 start_from_pub 的逆: 65 字节 -> secp256k1_pubkey (纯 memcpy, 不做曲线校验)。
+// 无穷远点无法表示成 secp256k1_pubkey, 返回 false 由调用方分开处理。
+bool k40_from_start(const K40Start& s, secp256k1_pubkey& pk)
+{
+    if (s.infinity) return false;
+    std::memcpy(pk.data, s.ser + 1, 64);
+    return true;
 }
 
 // 起点 -> 文件名里能用的短标签 ("+" 换成 "_")
@@ -264,10 +279,10 @@ bool k40_mul(const K40Start& base, uint64_t m, K40Start& out)
         return true;
     }
     secp256k1_pubkey pk;
-    if (!secp256k1_ec_pubkey_parse(ctx, &pk, base.ser, sizeof(base.ser))) return false;
+    if (!k40_from_start(base, pk)) return false;
     unsigned char s[32];
     be32(s, m);
-    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &pk, s)) return false; // m·Q (m 超出群阶会失败)
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &pk, s)) return false; // m·Q (m 为 0 或 >= 群阶会失败)
     start_from_pub(pk, out);
     return true;
 }
@@ -290,8 +305,8 @@ bool k40_build_bases(const K40Start& p0, const K40Start& base, uint64_t cursor,
             continue;
         }
         secp256k1_pubkey pk_p0, pk_mq, sum;
-        if (!secp256k1_ec_pubkey_parse(ctx, &pk_p0, p0.ser, sizeof(p0.ser))) return false;
-        if (!secp256k1_ec_pubkey_parse(ctx, &pk_mq, mq.ser, sizeof(mq.ser))) return false;
+        if (!k40_from_start(p0, pk_p0)) return false;
+        if (!k40_from_start(mq, pk_mq)) return false;
         const secp256k1_pubkey* ins[2] = {&pk_p0, &pk_mq};
         if (!secp256k1_ec_pubkey_combine(ctx, &sum, ins, 2)) return false;
         start_from_pub(sum, out[(size_t)row]);
