@@ -44,9 +44,9 @@ void rho_rewalk_probe()
     throw std::runtime_error("CUDA support is not enabled in this build.");
 }
 
-// 实验田 kg40 (沿 k·G 固定加数链路扫 40 位可分点) 是纯 GPU 入口, 非 CUDA 构建里
-// 没有设备侧实现, 同样只求能链接上。
-void kg40_play(const std::string&)
+// 实验田 k40 (沿固定加数链路扫 40 位可分点; use_mvp 形参选基准点 Q = G 或 MVP) 是纯
+// GPU 入口, 非 CUDA 构建里没有设备侧实现, 同样只求能链接上。
+void k40_play(const std::string&, bool)
 {
     throw std::runtime_error("CUDA support is not enabled in this build.");
 }

@@ -35,28 +35,34 @@
 // ---------------------------------------------------------------------------
 
 // ===========================================================================
-// 试验 1: kg40 —— 沿 k·G 固定加数链路扫 40 位可分点 (主机侧)
+// 试验 1: k40 —— 沿固定加数链路扫 40 位可分点 (主机侧)
 //
-// 目标: 枚举 k = 1, 2, 3, ... , 把 x(k·G) 低 40 位全 0 的"可分点"连同它的 k
+// 目标: 枚举 k = 1, 2, 3, ... , 把 x(k·Q) 低 40 位全 0 的"可分点"连同它的 k
 // 记下来 (DP 定义与生产一致, 即 cuda.cu 的 distinguishable: 低 40 位为 0, 索引
-// = 第 40..103 位)。设备侧在 rpc/cuda_lab.cu 的 kg40_play(): 每个 walker 走的
+// = 第 40..103 位)。设备侧在 rpc/cuda_lab.cu 的 k40_play(): 每个 walker 走的
 // 是一条等差子链 (固定加数 = 步长点), 合起来不重不漏地覆盖一段连续的 k。
 //
+// ==== 基准点 Q: k40_play 的形参 use_mvp (见 rpc/common.h) ====
+//   use_mvp = false -> Q = G   (扫 k·G, 原来的 kg40; 落盘 D:\Kg40_<起点>.*)
+//   use_mvp = true  -> Q = MVP (扫 k·MVP;                落盘 D:\Kmvp40_<起点>.*)
+// 两档的几何/存盘/断点逻辑完全一样, 唯一差别就是本文件挑哪个点当 Q, 以及文件名
+// 前缀 (所以 k·MVP 那条链绝不会覆盖 Kg40_* 的存档)。
+//
 // 本文件只管四件纯主机的事, 不碰设备:
-//   1) 起点描述串的解析与 P0 = a·MVP + b·G 的构造;
+//   1) 基准点 Q 与起点描述串里 P0 = a·MVP + b·G 的构造;
 //   2) 起点 -> 文件名 的映射 (不同起点落不同文件);
 //   3) 段首点 (每个 block 一段) 的构造, 给设备侧的串行建链当种子;
 //   4) 断点游标 (k) 的读写 + DP 记录 ("<k> <索引>" 每行一条) 的追加落盘。
 //
-// 起点写法 ("起点"决定从哪个点开始数, 记下来的 k 始终是"从起点往后数了几个 G"):
-//   0            P0 = 无穷远点 (= 0·G), 等价于从 1·G 开始
+// 起点写法 ("起点"决定从哪个点开始数, 记下来的 k 始终是"从起点往后数了几个 Q"):
+//   0            P0 = 无穷远点 (= 0), 此时被检点就是 m·Q
 //   1mvp         P0 = 1·MVP
 //   <a>mvp       P0 = a·MVP          (a 可省略 = 1)
 //   <b>g         P0 = b·G
 //   <a>mvp+<b>g  P0 = a·MVP + b·G    (b 后面的 g 可省略)
-// 大小写不敏感。第 m 个点 (m >= 1) 是 P0 + m·G, 记下来的 k 就是 m。
-// 于是: "0" 的第一个被检点是 1·G (k=1); "7g" 的 P0 = 7·G, 第一个被检点是 8·G,
-// k 记 8 —— k 一律是"从 P0 起又加了几个 G", 不含起点本身的偏移。
+// 大小写不敏感。第 m 个点 (m >= 1) 是 P0 + m·Q, 记下来的 k 就是 m。
+// 于是 Q=G 时: "0" 的第一个被检点是 1·G (k=1); "7g" 的 P0 = 7·G, 第一个被检点
+// 是 8·G, k 记 8 —— k 一律是"从 P0 起又加了几个 Q", 不含起点本身的偏移。
 // ===========================================================================
 
 // pk_mvp 定义在 rpc/blockchain.cpp (生产里原本是 static, 为让实验田能拿 MVP 的
@@ -110,7 +116,7 @@ bool parse_coef(const std::string& s, uint64_t& v)
 // secp256k1_pubkey -> 65 字节非压缩编码。注意 libsecp256k1 的 pubkey.data 本来就是
 // x||y 的大端 64 字节 (bc 的 create/check 直接 memcmp 前 32 字节比 x 就是这个原因),
 // 所以不用走 secp256k1_ec_pubkey_serialize。
-void start_from_pub(const secp256k1_pubkey& pk, Kg40Start& out)
+void start_from_pub(const secp256k1_pubkey& pk, K40Start& out)
 {
     out.ser[0] = 0x04;
     std::memcpy(out.ser + 1, pk.data, 32);
@@ -121,7 +127,7 @@ void start_from_pub(const secp256k1_pubkey& pk, Kg40Start& out)
 // 起点 -> 文件名里能用的短标签 ("+" 换成 "_")
 std::string file_tag(uint64_t a_mvp, uint64_t b_g)
 {
-    std::string t = kg40_spec_tag(a_mvp, b_g);
+    std::string t = k40_spec_tag(a_mvp, b_g);
     for (char& c : t) {
         if (c == '+') c = '_';
     }
@@ -130,7 +136,33 @@ std::string file_tag(uint64_t a_mvp, uint64_t b_g)
 
 } // namespace
 
-bool kg40_parse_spec(const std::string& spec, uint64_t& a_mvp, uint64_t& b_g)
+std::string k40_file_prefix(bool use_mvp)
+{
+    return use_mvp ? "Kmvp40_" : "Kg40_";
+}
+
+std::string k40_chain_tag(bool use_mvp)
+{
+    return use_mvp ? "MVP" : "G";
+}
+
+// 基准点 Q。Q=G 用标量 1 直接生成; Q=MVP 直接拿生产那个公钥 (pk_mvp 定义在
+// rpc/blockchain.cpp, 为让实验田能拿到 MVP 的倍数点已去掉 static)。
+bool k40_base_point(bool use_mvp, K40Start& out)
+{
+    if (use_mvp) {
+        start_from_pub(pk_mvp, out);
+        return true;
+    }
+    unsigned char one[32];
+    be32(one, 1);
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &pk, one)) return false;
+    start_from_pub(pk, out);
+    return true;
+}
+
+bool k40_parse_spec(const std::string& spec, uint64_t& a_mvp, uint64_t& b_g)
 {
     a_mvp = 0;
     b_g = 0;
@@ -171,7 +203,7 @@ bool kg40_parse_spec(const std::string& spec, uint64_t& a_mvp, uint64_t& b_g)
     return false; // 光秃秃的数字 (除 "0" 外) 说不清是 mvp 还是 g
 }
 
-std::string kg40_spec_tag(uint64_t a_mvp, uint64_t b_g)
+std::string k40_spec_tag(uint64_t a_mvp, uint64_t b_g)
 {
     if (a_mvp == 0 && b_g == 0) return "0";
     std::string t;
@@ -183,21 +215,21 @@ std::string kg40_spec_tag(uint64_t a_mvp, uint64_t b_g)
     return t;
 }
 
-std::string kg40_dp_file(uint64_t a_mvp, uint64_t b_g)
+std::string k40_dp_file(bool use_mvp, uint64_t a_mvp, uint64_t b_g)
 {
-    return "D:\\Kg40_" + file_tag(a_mvp, b_g) + ".txt";
+    return "D:\\" + k40_file_prefix(use_mvp) + file_tag(a_mvp, b_g) + ".txt";
 }
 
-std::string kg40_state_file(uint64_t a_mvp, uint64_t b_g)
+std::string k40_state_file(bool use_mvp, uint64_t a_mvp, uint64_t b_g)
 {
-    return "D:\\Kg40_" + file_tag(a_mvp, b_g) + ".state";
+    return "D:\\" + k40_file_prefix(use_mvp) + file_tag(a_mvp, b_g) + ".state";
 }
 
-bool kg40_make_start(uint64_t a_mvp, uint64_t b_g, Kg40Start& out)
+bool k40_make_start(uint64_t a_mvp, uint64_t b_g, K40Start& out)
 {
-    out = Kg40Start();
+    out = K40Start();
     if (a_mvp == 0 && b_g == 0) {
-        out.infinity = true; // 0·G = 无穷远点: 设备侧从 1·G 开始数的语义靠 m>=1 保证
+        out.infinity = true; // 0 = 无穷远点: 设备侧从 m>=1 开始数的语义靠 m>=1 保证
         return true;
     }
     secp256k1_pubkey pk;
@@ -224,32 +256,50 @@ bool kg40_make_start(uint64_t a_mvp, uint64_t b_g, Kg40Start& out)
     return true;
 }
 
-bool kg40_build_bases(const Kg40Start& p0, uint64_t cursor, uint64_t walkers_per_row,
-                      int rows, std::vector<Kg40Start>& out)
+bool k40_mul(const K40Start& base, uint64_t m, K40Start& out)
+{
+    out = K40Start();
+    if (m == 0) {
+        out.infinity = true;
+        return true;
+    }
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(ctx, &pk, base.ser, sizeof(base.ser))) return false;
+    unsigned char s[32];
+    be32(s, m);
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &pk, s)) return false; // m·Q (m 超出群阶会失败)
+    start_from_pub(pk, out);
+    return true;
+}
+
+bool k40_build_bases(const K40Start& p0, const K40Start& base, uint64_t cursor,
+                     uint64_t walkers_per_row, int rows, std::vector<K40Start>& out)
 {
     if (rows <= 0 || walkers_per_row == 0) return false;
     if (cursor >= (1ULL << 62)) return false; // 免得下面加法绕回
 
-    out.assign((size_t)rows, Kg40Start());
+    out.assign((size_t)rows, K40Start());
     for (int row = 0; row < rows; ++row) {
         // 第 row 行的第 0 个 walker 对应 m = cursor + row·walkers_per_row + 1 (m>=1 恒成立)
         const uint64_t m = cursor + (uint64_t)row * walkers_per_row + 1;
-        unsigned char s[32];
-        be32(s, m);
-        secp256k1_pubkey pk;
+        K40Start mq;
+        if (!k40_mul(base, m, mq)) return false;
         if (p0.infinity) {
-            // P0 = ∞, P0 + m·G = m·G
-            if (!secp256k1_ec_pubkey_create(ctx, &pk, s)) return false;
-        } else {
-            if (!secp256k1_ec_pubkey_parse(ctx, &pk, p0.ser, sizeof(p0.ser))) return false;
-            if (!secp256k1_ec_pubkey_tweak_add(ctx, &pk, s)) return false;
+            // P0 = ∞ => P0 + m·Q = m·Q
+            out[(size_t)row] = mq;
+            continue;
         }
-        start_from_pub(pk, out[(size_t)row]);
+        secp256k1_pubkey pk_p0, pk_mq, sum;
+        if (!secp256k1_ec_pubkey_parse(ctx, &pk_p0, p0.ser, sizeof(p0.ser))) return false;
+        if (!secp256k1_ec_pubkey_parse(ctx, &pk_mq, mq.ser, sizeof(mq.ser))) return false;
+        const secp256k1_pubkey* ins[2] = {&pk_p0, &pk_mq};
+        if (!secp256k1_ec_pubkey_combine(ctx, &sum, ins, 2)) return false;
+        start_from_pub(sum, out[(size_t)row]);
     }
     return true;
 }
 
-uint64_t kg40_load_cursor(const std::string& file)
+uint64_t k40_load_cursor(const std::string& file)
 {
     std::ifstream ifs(file);
     if (!ifs) return 0;
@@ -268,17 +318,19 @@ uint64_t kg40_load_cursor(const std::string& file)
     return 0;
 }
 
-bool kg40_save_cursor(const std::string& file, uint64_t cursor)
+bool k40_save_cursor(const std::string& file, uint64_t cursor, bool use_mvp)
 {
     std::ofstream ofs(file, std::ios::trunc);
     if (!ofs) return false;
-    ofs << "# kg40 断点: 已覆盖的 k 上界 (下一轮从 cursor+1·G 起)\n" << cursor << "\n";
+    ofs << "# k40 断点 (Q=" << k40_chain_tag(use_mvp)
+        << "): 已覆盖的 k 上界 (下一轮从 cursor+1 个 Q 起)\n"
+        << cursor << "\n";
     ofs.flush();
     return (bool)ofs;
 }
 
-bool kg40_append_dps(const std::string& file, uint64_t a_mvp, uint64_t b_g,
-                     const std::vector<uint64_t>& ks, const std::vector<uint64_t>& idxs)
+bool k40_append_dps(const std::string& file, bool use_mvp, uint64_t a_mvp, uint64_t b_g,
+                    const std::vector<uint64_t>& ks, const std::vector<uint64_t>& idxs)
 {
     if (ks.empty()) return true;
     if (ks.size() != idxs.size()) return false;
@@ -291,8 +343,9 @@ bool kg40_append_dps(const std::string& file, uint64_t a_mvp, uint64_t b_g,
     std::ofstream ofs(file, std::ios::app);
     if (!ofs) return false;
     if (need_header) {
-        ofs << "# kg40 起点 P0 = " << kg40_spec_tag(a_mvp, b_g) << " (0 = 无穷远)\n"
-            << "# 每行: <k> <索引>  => x(P0 + k*G) 低 40 位为 0, 索引 = 第 40..103 位\n";
+        ofs << "# k40 起点 P0 = " << k40_spec_tag(a_mvp, b_g)
+            << " (0 = 无穷远), 基准点 Q = " << k40_chain_tag(use_mvp) << "\n"
+            << "# 每行: <k> <索引>  => x(P0 + k*Q) 低 40 位为 0, 索引 = 第 40..103 位\n";
     }
     for (size_t i = 0; i < ks.size(); ++i) {
         ofs << ks[i] << ' ' << idxs[i] << '\n';

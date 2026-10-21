@@ -456,64 +456,91 @@ void perf_test_rho_affine_walkers();
 // play、不动设备内存。验证成形后再考虑往生产路径搬。新入口在这里声明。
 // ---------------------------------------------------------------------------
 
-// ---- 试验 1: kg40 -----------------------------------------------------------
+// ---- 试验 1: k40 ------------------------------------------------------------
 //
-// 枚举 k = 1, 2, 3, ... 把 x(k·G) 的 40 位可分点连同它的 k 记下来。
-// 纯 GPU (设备侧实现在 rpc/cuda_lab.cu, 由 cuda.cu 末尾 #include 进来); 主机侧
-// (起点解析、文件名、断点游标、DP 落盘) 在 rpc/rho_lab.cpp。
+// 沿固定加数链路扫 40 位可分点: 枚举 k = 1, 2, 3, ..., 把 x(k·Q) 低 40 位全 0 的
+// 点连同它的 k 记下来。纯 GPU (设备侧在 rpc/cuda_lab.cu, 由 cuda.cu 末尾 #include
+// 进来); 主机侧 (起点解析、文件名、断点游标、DP 落盘) 在 rpc/rho_lab.cpp。
 //
-// 怎么跑 (没有命令行开关, 是手动切换): 把 blockchain.cpp 的 work() 里那行线程
-//   threads.emplace_back(kg40_play, std::string("0"));
-// 留着就行 (它本来就顶掉了生产那一路 rho_play); 要换起点就改这个字符串字面量。
-//   <起点> 写法:
-//     0            P0 = 无穷远点 (等价于从 1·G 开始数)
+// ==== 基准点 Q: 第二个形参 use_mvp ====
+//   k40_play(spec, false)  Q = G    扫 k·G    —— 原来的 kg40, 落盘 D:\Kg40_<起点>.*
+//   k40_play(spec, true)   Q = MVP  扫 k·MVP  —— 落盘 D:\Kmvp40_<起点>.* (不碰 Kg40_*)
+// 两档除了 Q 完全同构: 第 m 个被检点永远是 P0 + m·Q, 记下来的 k 就是 m。
+// 设备侧内核对这个区别**完全无感** —— 主机把 Q 与 stride_k·Q 分别送进两个
+// __constant__ 符号, 内核只管"每步加一个常量点"。所以换链不用改 CMake、不用
+// 动内核。
+//
+// 为什么是普通形参不是模板参数: use_mvp 在函数体里只传给 k40_chain_tag / k40_base_point /
+// k40_dp_file / k40_save_cursor / k40_append_dps 这些**普通函数**, 内核一个分支都不看它
+// (内核只读那两个 __constant__)。所以模板实例化带不来任何性能收益, 只会多一份符号;
+// 做成形参反倒读得清楚。
+//
+// 怎么跑 (没有命令行开关, 是手动切换): 把 blockchain.cpp 的 play() 里那行线程
+//   threads.emplace_back(k40_play, std::string("0"), false);
+// 留着就行; 第三项改 true 就换成扫 k·MVP, 第一项换起点描述串。
+//   <起点> 写法 (P0 = a·MVP + b·G, 与 Q 无关):
+//     0            P0 = 无穷远点 (此时被检点 = m·Q)
 //     1mvp         P0 = 1·MVP            (MVP = blockchain.cpp 的 pk_mvp)
 //     <a>mvp       P0 = a·MVP             (a 可省略 = 1)
 //     <b>g         P0 = b·G
 //     <a>mvp+<b>g  P0 = a·MVP + b·G       (b 后的 g 可省略), 大小写不敏感
-//   第 m 个点 (m>=1) 是 P0 + m·G, DP 记下来的 k 就是 m (从 P0 起又加了几个 G;
-//   起点本身的 a/b 偏移不算进 k)。所以 "0" 的第一个被检点是 1·G (k=1),
-//   "7g" 的第一个被检点是 8·G (k=8)。
+//   第 m 个点 (m>=1) 是 P0 + m·Q, DP 记下来的 k 就是 m (从 P0 起又加了几个 Q;
+//   起点本身的 a/b 偏移不算进 k)。所以 Q=G 时 "0" 的第一个被检点是 1·G (k=1),
+//   "7g" 的第一个被检点是 8·G (k=8); Q=MVP 时 "0" 的第一个被检点是 1·MVP。
 //
-// 落盘 (每个起点一套, 互不覆盖):
-//   D:\Kg40_<起点>.txt     每行 "<k> <索引>", 追加写, 首行是 # 注释
-//   D:\Kg40_<起点>.state   断点游标 (已覆盖的 k 上界), 每轮覆盖写
+// 落盘 (每个起点一套; 两档前缀不同, 所以也不会互相覆盖):
+//   D:\<prefix><起点>.txt     每行 "<k> <索引>", 追加写, 首行是 # 注释
+//   D:\<prefix><起点>.state   断点游标 (已覆盖的 k 上界), 每轮覆盖写
+//   prefix = "Kg40_" (use_mvp=false) / "Kmvp40_" (use_mvp=true)
 // 把 .state 删掉就从 k=0 重来。
 // 起点标签里的 '+' 在文件名里写成 '_', 例: 3mvp+7g -> D:\Kg40_3mvp_7g.txt。
 
-// 起点 P0: 65 字节非压缩编码 (0x04||x||y) + 无穷远点标记
-struct Kg40Start {
+// 起点 P0 / 基准点 Q: 65 字节非压缩编码 (0x04||x||y) + 无穷远点标记
+struct K40Start {
     unsigned char ser[65];
     bool infinity;
 };
 
+// 落盘文件名前缀 ("Kg40_" / "Kmvp40_") 与链名标签 ("G" / "MVP")。
+// 两档的存档互不覆盖就靠这个前缀。
+std::string k40_file_prefix(bool use_mvp);
+std::string k40_chain_tag(bool use_mvp);
+
+// 基准点 Q: use_mvp = false -> G, true -> MVP (= blockchain.cpp 的 pk_mvp)。
+bool k40_base_point(bool use_mvp, K40Start& out);
+
 // 解析起点描述串 (见上), 成功返回 true
-bool kg40_parse_spec(const std::string& spec, uint64_t& a_mvp, uint64_t& b_g);
+bool k40_parse_spec(const std::string& spec, uint64_t& a_mvp, uint64_t& b_g);
 
 // 规范化的起点标签 ("0" / "1mvp" / "3mvp+7g")
-std::string kg40_spec_tag(uint64_t a_mvp, uint64_t b_g);
+std::string k40_spec_tag(uint64_t a_mvp, uint64_t b_g);
 
-// 落盘路径
-std::string kg40_dp_file(uint64_t a_mvp, uint64_t b_g);
-std::string kg40_state_file(uint64_t a_mvp, uint64_t b_g);
+// 落盘路径 (带 use_mvp 对应的前缀)
+std::string k40_dp_file(bool use_mvp, uint64_t a_mvp, uint64_t b_g);
+std::string k40_state_file(bool use_mvp, uint64_t a_mvp, uint64_t b_g);
 
-// P0 = a·MVP + b·G (a=b=0 -> 无穷远点)
-bool kg40_make_start(uint64_t a_mvp, uint64_t b_g, Kg40Start& out);
+// P0 = a·MVP + b·G (a=b=0 -> 无穷远点); 与基准点 Q 无关
+bool k40_make_start(uint64_t a_mvp, uint64_t b_g, K40Start& out);
 
-// 段首点: out[row] = P0 + (cursor + row·walkers_per_row + 1)·G, row = 0..rows-1
+// m·Q (标量乘); m = 0 -> 无穷远点。stride_k·Q 与段首点都走它。
+bool k40_mul(const K40Start& base, uint64_t m, K40Start& out);
+
+// 段首点: out[row] = P0 + (cursor + row·walkers_per_row + 1)·Q, row = 0..rows-1
 // (调用方传 walkers_per_row = block_size·W, rows = grid)
-bool kg40_build_bases(const Kg40Start& p0, uint64_t cursor, uint64_t walkers_per_row,
-                      int rows, std::vector<Kg40Start>& out);
+bool k40_build_bases(const K40Start& p0, const K40Start& base, uint64_t cursor,
+                     uint64_t walkers_per_row, int rows, std::vector<K40Start>& out);
 
 // 断点游标读写 (文件不存在 / 读不出来 -> 0)
-uint64_t kg40_load_cursor(const std::string& file);
-bool kg40_save_cursor(const std::string& file, uint64_t cursor);
+uint64_t k40_load_cursor(const std::string& file);
+bool k40_save_cursor(const std::string& file, uint64_t cursor, bool use_mvp);
 
 // DP 追加落盘: 第 i 条是 "ks[i] idxs[i]" (十进制, 每行一条)
-bool kg40_append_dps(const std::string& file, uint64_t a_mvp, uint64_t b_g,
-                     const std::vector<uint64_t>& ks, const std::vector<uint64_t>& idxs);
+bool k40_append_dps(const std::string& file, bool use_mvp, uint64_t a_mvp, uint64_t b_g,
+                    const std::vector<uint64_t>& ks, const std::vector<uint64_t>& idxs);
 
-// 定义在 rpc/cuda_lab.cu: 跑 kg40 (GPU)。非 CUDA 构建里 cuda_stub.cpp 有抛异常的桩。
-void kg40_play(const std::string& spec);
+// 定义在 rpc/cuda_lab.cu: 跑 k40 (GPU)。非 CUDA 构建里 cuda_stub.cpp 有抛异常的桩。
+// use_mvp = false 扫 k·G, true 扫 k·MVP (基准点 Q 的选择, 见上)。
+// 可以直接当函数指针传给 std::thread: std::thread(k40_play, spec, use_mvp)。
+void k40_play(const std::string& spec, bool use_mvp = false);
 
 #endif // BITCOIN_RPC_COMMON_H

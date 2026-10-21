@@ -3047,7 +3047,7 @@ void break_rho(bool f);
 
 static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
-// 去掉 static: rpc/rho_lab.cpp 的 kg40 要拿它的倍数当起点 (extern 声明在那边)。
+// 去掉 static: rpc/rho_lab.cpp 的 k40 要拿它的倍数当起点/当基准点 (extern 声明在那边)。
 secp256k1_pubkey pk_mvp;
 
 RhoPoint adds_pub[2][256] = {0};
@@ -4843,10 +4843,12 @@ void play() {
         // 32 位 DP 起点漫游
         threads.emplace_back(dp32_edge_play); 
 
-        // 实验田 kg40 (沿固定加数链路扫 40 位可分点) 
+        // 实验田 k40 (沿固定加数链路扫 40 位可分点).
+        // 第二个形参 use_mvp 选基准点: false = 扫 k*G, true = 扫 k*MVP
+        // (两条链存盘文件名前缀不同: Kg40_* / Kmvp40_*)。
         // 起点描述串的写法见 src/rpc/common.h
-        // 的 "试验 1: kg40" 一节 (例: "0" / "1mvp" / "7g" / "3mvp+7g")。
-        //threads.emplace_back(kg40_play, std::string("0"));
+        // 的 "试验 1: k40" 一节 (例: "0" / "1mvp" / "7g" / "3mvp+7g")。
+        //threads.emplace_back(k40_play, std::string("0"), false);
     }
     for (auto& t : threads) {
         t.join();
