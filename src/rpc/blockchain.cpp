@@ -5470,6 +5470,37 @@ static RPCHelpMan testmvp()
                     // 反而把后面真正的短回路/碰撞挡住了。
                     uint64_t n_idx_dup_diff = 0;
 
+                    // 一条 40 位 DP 记录进账: 索引去重 + 碰撞/短回路判定。
+                    // 返回值: 0 = 收下 (或只是索引撞了); 2 = 真碰撞 (bingo 解出, 已落 key);
+                    //         3 = 短回路 (同一份记录第二次出现)。
+                    // 主语料与 k40 两条链共用这一份账, 所以跨文件/跨链的碰撞也在这里判。
+                    auto noteDp = [&](uint64_t dp_index, const SecPair& sp) -> int {
+                        auto iter = dpMap.find(dp_index);
+                        if (iter == dpMap.end()) {
+                            dpMap[dp_index] = sp;
+                            return 0;
+                        }
+                        CKey k;
+                        const BingoResult br = bingo(ctx, k, sp, iter->second);
+                        if (br == BingoResult::Solved) {
+                            // 真碰撞: 两份记录是同一个 x 的两种写法 (同点或反号)
+                            save_key(k);
+                            unspent.pushKV("str", "!!!!bingo!!!!");
+                            return 2;
+                        }
+                        if (br == BingoResult::SameRecord) {
+                            // 同一份记录的第二次出现 —— 这才是"短回路", 也正是这个
+                            // 工具本来要手工去重的东西
+                            unspent.pushKV("str", "!!!!short circulation!!!!");
+                            unspent.pushKV("str2", std::to_string(dp_index));
+                            return 3;
+                        }
+                        // NotCollision: 只是索引撞了, 两个点不是同一个 (x 不同), 既不是
+                        // 碰撞也不是短回路 —— 继续扫, 不再在这儿假报 short circulation
+                        n_idx_dup_diff++;
+                        return 0;
+                    };
+
                     // 处理单个DP文件流：解析每条记录(三行一组)并入dpMap，检测碰撞
                     // 返回值: 0=正常读完(EOF); 非0=遇到错误或碰撞(应停止后续处理)
                     auto processDPStream = [&](std::istream& ifs) -> int {
@@ -5490,30 +5521,121 @@ static RPCHelpMan testmvp()
                                 unspent.pushKV("str2", HexStr(x_tmp.data) + " : " + HexStr(sp.m) + " : " + HexStr(sp.n));
                                 return 1;
                             }
-                            auto iter = dpMap.find(dp_index);
-                            if (iter != dpMap.end()) {
-                                CKey k;
-                                const BingoResult br = bingo(ctx, k, sp, iter->second);
-                                if (br == BingoResult::Solved) {
-                                    // 真碰撞: 两份记录是同一个 x 的两种写法 (同点或反号)
-                                    save_key(k);
-                                    unspent.pushKV("str", "!!!!bingo!!!!");
-                                    return 2;
-                                }
-                                if (br == BingoResult::SameRecord) {
-                                    // 同一份记录的第二次出现 —— 这才是"短回路", 也正是这个
-                                    // 工具本来要手工去重的东西
-                                    unspent.pushKV("str", "!!!!short circulation!!!!");
-                                    unspent.pushKV("str2", std::to_string(dp_index));
-                                    return 3;
-                                }
-                                // NotCollision: 只是索引撞了, 两个点不是同一个 (x 不同), 既不是
-                                // 碰撞也不是短回路 —— 继续扫, 不再在这儿假报 short circulation
-                                n_idx_dup_diff++;
-                            } else {
-                                dpMap[dp_index] = sp;
-                            }
+                            if (const int r = noteDp(dp_index, sp); r != 0) return r;
                         }
+                        return 0;
+                    };
+
+                    // ---- k40 两条链的 DP 表 ----
+                    // D:\Kg40_<起点>.txt / D:\Kmvp40_<起点>.txt 是 kg40 试验田的产物, 每行
+                    // "<k> <索引>", 含义是 x(P0 + k·Q) 的低 40 位全 0、索引 = 第 40..103 位。
+                    // 这里逐行现算复核, 同时把记录还原成 (m, n) —— P0 + k·Q 就是
+                    //     Q = G   : m = b + k, n = a
+                    //     Q = MVP : m = b,     n = a + k
+                    // (P0 = a·MVP + b·G, a = a_mvp, b = b_g; 见 common.h 的 "试验 1: k40")。
+                    // 还原之后这些记录就能进同一张 dpMap: 两条链 (或链与 40 位语料) 落到同一个
+                    // x 上就是一次真实的碰撞候选, 与 ta2 == 1 原本的口径完全一致 —— bingo 自己
+                    // 会判同点/反号, 解出 k 就落盘。
+                    uint64_t n_k40_files = 0, n_k40_lines = 0, n_k40_bad = 0, n_k40_kdup = 0;
+                    std::string first_k40_bad;
+                    auto processK40File = [&](const std::string& path) -> int {
+                        std::ifstream ifs(path);
+                        if (!ifs.is_open()) return 0;   // 没有这条链的存档: 不算错
+                        uint64_t a_mvp = 0, b_g = 0;    // 头注释里读回来; 缺省 "0" = P0 无穷远
+                        bool use_mvp = false;           // 缺省 Q = G (改名前的老文件没有 Q 一项)
+                        std::string line;
+                        uint64_t n_line = 0, n_bad = 0, n_dup = 0, kprev = 0, kmax = 0;
+                        bool have_prev = false;
+                        std::set<uint64_t> seen_k;
+                        auto bad = [&](const std::string& why) {
+                            if (first_k40_bad.empty()) first_k40_bad = path + ": " + why;
+                            n_bad++;
+                        };
+                        while (std::getline(ifs, line)) {
+                            while (!line.empty() &&
+                                   (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+                                line.pop_back();
+                            }
+                            if (line.empty()) continue;
+                            if (line[0] == '#') {
+                                // "# k40 起点 P0 = <tag> (0 = 无穷远), 基准点 Q = G|MVP"
+                                const size_t p = line.find("P0 = ");
+                                if (p != std::string::npos) {
+                                    size_t b = p + 5, e = b;
+                                    while (e < line.size() && line[e] != ' ' && line[e] != '(') ++e;
+                                    uint64_t a = 0, g = 0;
+                                    if (k40_parse_spec(line.substr(b, e - b), a, g)) {
+                                        a_mvp = a;
+                                        b_g = g;
+                                    } else {
+                                        bad("起点标签看不懂: " + line.substr(b, e - b));
+                                    }
+                                }
+                                const size_t q = line.find("Q = ");
+                                if (q != std::string::npos) {
+                                    size_t b = q + 4, e = b;
+                                    while (e < line.size() && line[e] != ' ' && line[e] != ',') ++e;
+                                    use_mvp = (line.substr(b, e - b) == "MVP");
+                                }
+                                continue;
+                            }
+                            unsigned long long k = 0, idx = 0;
+                            if (sscanf(line.c_str(), "%llu %llu", &k, &idx) != 2) {
+                                bad("列数不对: " + line.substr(0, 60));
+                                continue;
+                            }
+                            n_line++;
+                            if (!have_prev) {
+                                kprev = kmax = (uint64_t)k;
+                                have_prev = true;
+                            } else {
+                                if ((uint64_t)k <= kprev) bad("k 不是严格递增: " + std::to_string(k));
+                                kprev = (uint64_t)k;
+                                if ((uint64_t)k > kmax) kmax = (uint64_t)k;
+                            }
+                            if (!seen_k.insert((uint64_t)k).second) n_dup++;
+
+                            // 还原成 (m, n) 并现算 x = m*G + n*MVP
+                            const uint64_t mv = b_g + (use_mvp ? 0 : (uint64_t)k);
+                            const uint64_t nv = a_mvp + (use_mvp ? (uint64_t)k : 0);
+                            if (mv == 0 && nv == 0) {
+                                bad("k=" + std::to_string(k) + " 落到无穷远点");
+                                continue;
+                            }
+                            SecPair sp;
+                            memset(&sp, 0, sizeof(sp));
+                            set_int(sp.m, (int64_t)mv);
+                            set_int(sp.n, (int64_t)nv);
+                            secp256k1_pubkey x_tmp;
+                            create(ctx, &x_tmp, sp.m, sp.n);
+                            const uint64_t got = distinguishable(x_tmp);
+                            if (got != (uint64_t)idx) {
+                                bad("k=" + std::to_string(k) + " 不是 40 位 DP (记录索引 " +
+                                    std::to_string(idx) + ", 实算 " + std::to_string(got) + ")");
+                                continue;
+                            }
+                            if (const int r = noteDp((uint64_t)idx, sp); r != 0) return r;
+                        }
+                        // 断点游标 (.state) 是"已覆盖的 k 上界", 必须 >= 表里最大的 k;
+                        // 反过来说明表和游标不是同一次 run 的 (被换过 / 手改过), 值得叫一声。
+                        std::string st = path;
+                        if (st.size() > 4 && st.compare(st.size() - 4, 4, ".txt") == 0) {
+                            st.resize(st.size() - 4);
+                            st += ".state";
+                        }
+                        const uint64_t cursor = k40_load_cursor(st);
+                        const std::string fname = fs::PathToString(fs::u8path(path).filename());
+                        cprintf("testmvp 8 1: %s: %llu 条 (Q=%s, P0=%s), 格式错/非 40 位 DP %llu 条, "
+                                "重复 k %llu 条, k 上界 %llu, 游标 %llu%s\n",
+                                fname.c_str(), (unsigned long long)n_line,
+                                use_mvp ? "MVP" : "G", k40_spec_tag(a_mvp, b_g).c_str(),
+                                (unsigned long long)n_bad, (unsigned long long)n_dup,
+                                (unsigned long long)kmax, (unsigned long long)cursor,
+                                (cursor >= kmax) ? "" : "  ⚠ 游标 < 表内最大 k");
+                        n_k40_files++;
+                        n_k40_lines += n_line;
+                        n_k40_bad += n_bad;
+                        n_k40_kdup += n_dup;
                         return 0;
                     };
 
@@ -5525,6 +5647,38 @@ static RPCHelpMan testmvp()
                         if (_dplog.ifs.is_open()) {
                             if (processDPStream(_dplog.ifs) != 0) {
                                 stop = true;
+                            }
+                        }
+                    }
+
+                    // 2) k40 两条链的 DP 表: D:\Kg40_<起点>.txt / D:\Kmvp40_<起点>.txt
+                    //    文件名里的 <起点> 由生成时决定 (现在跑的是 "0"), 所以枚举而不是写死;
+                    //    起点标签与基准点 Q 都从每个文件的头注释里读回来, 与文件名无关。
+                    //    与主文件共用 dpMap: 两条链之间、链与语料之间的碰撞都会在这里判。
+                    if (!stop) {
+                        std::vector<fs::path> k40_files;
+                        std::error_code ec;
+                        const fs::path root = fs::u8path("D:\\");
+                        if (std::filesystem::exists(root, ec)) {
+                            for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end;
+                                 it.increment(ec)) {
+                                // 单条状态查询失败不该让整个枚举停下, 所以它用自己的 error_code
+                                std::error_code fec;
+                                if (!it->is_regular_file(fec)) continue;
+                                const std::string fname = fs::PathToString(it->path().filename());
+                                if (!fname.starts_with("Kg40_") && !fname.starts_with("Kmvp40_")) continue;
+                                if (!fname.ends_with(".txt")) continue;
+                                k40_files.push_back(it->path());
+                            }
+                        }
+                        std::sort(k40_files.begin(), k40_files.end());
+                        if (k40_files.empty()) {
+                            cprintf("testmvp 8 1: D:\\ 下没有 Kg40_*.txt / Kmvp40_*.txt, 跳过\n");
+                        }
+                        for (const auto& f : k40_files) {
+                            if (processK40File(fs::PathToString(f)) != 0) {
+                                stop = true;
+                                break;
                             }
                         }
                     }
@@ -5577,10 +5731,22 @@ static RPCHelpMan testmvp()
                     */
                     unspent.pushKV("num", dpMap.size());
                     unspent.pushKV("idx_dup_diff", n_idx_dup_diff);
+                    unspent.pushKV("k40_files", n_k40_files);
+                    unspent.pushKV("k40_lines", n_k40_lines);
+                    unspent.pushKV("k40_bad", n_k40_bad);
+                    unspent.pushKV("k40_kdup", n_k40_kdup);
+                    if (!first_k40_bad.empty()) {
+                        unspent.pushKV("k40_first_bad", first_k40_bad);
+                    }
                     if (n_idx_dup_diff != 0) {
                         cprintf("testmvp 8 1: 索引相同但非同一份记录 %llu 条 (不是短回路, 已跳过)\n",
                                 (unsigned long long)n_idx_dup_diff);
                     }
+                    cprintf("testmvp 8 1: 索引去重 %llu 条 (其中 k40 %llu 条来自 %llu 个文件, "
+                            "非 40 位 DP %llu 条, 重复 k %llu 条)\n",
+                            (unsigned long long)dpMap.size(), (unsigned long long)n_k40_lines,
+                            (unsigned long long)n_k40_files, (unsigned long long)n_k40_bad,
+                            (unsigned long long)n_k40_kdup);
                 } else if (ta2 == 2) {
                     // 校验 D:\Dp32Edge.txt 里的每条边确实是 32 位 DP (ta2 == 1 的 32 位兄弟)。
                     // 一行 "起点索引 终点索引 终点m 终点n": 由 (m, n) 现算 x = m*G + n*MVP,
