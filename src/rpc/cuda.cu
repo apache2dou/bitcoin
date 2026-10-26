@@ -339,6 +339,54 @@ __host__ __device__ uint256_t mul_mod(const uint256_t& a, const uint256_t& b)
     return reduce_product(t);
 }
 
+// 域模平方: r = a*a mod p —— 与 mul_mod(a, a) **逐位相同**, 只是少做 28 次乘法。
+//
+// 为什么值得单独写: 8 肢体的满宽乘法要做 64 次 32x32->64, 而平方按
+// (a0 + a1·2^32 + ...)^2 = Σ a_i² 2^(64i) + 2·Σ_{i<j} a_i a_j 2^(32(i+j))
+// 拆开之后只剩 28 次 (上半三角) + 8 次 (对角线) = 36 次, 省掉 28 次 IMAD.WIDE。
+// 热路径里每点的乘法中约 1/3 是平方 (step_apply 里的 lambda² 必是平方, 倍点
+// 分支的 3X² 也是), 所以这是纯赚的减法, 不改任何数值口径。
+//
+// 实现要点 (两趟, 只用一块 16 肢缓冲, 不额外占 local):
+//   1) 上半三角 (i<j) 累加 -> t; 第 i 轮把进位写进 t[i+8], 那一格此前不可能被
+//      写过 (前几轮最大只到 i'+8 <= i+7), 所以赋值就是累加。
+//   2) 一遍扫过 t: 先翻倍, 再在 2i / 2i+1 两格分别加 a_i² 的低/高 32 位,
+//      进位顺路往后带。(i 与 i+1 共享同一个 a_i², 全展开后编译器会 CSE 成一次乘法)
+//   两条"必定成立"的边界, 靠推导而不是靠检查 (与 mul_mod 的 t[i+8] 赋值同款):
+//     · 上半三角翻倍后 < a² < 2^512  =>  第 2 趟扫完不溢出;
+//     · Σ a_i² 2^(64i) < 2^512        =>  最后也不会多出一位。
+//
+// 定长循环、无数据相关的进位链: 展开后所有下标都是编译期常量, 不会把 t[] 降级到
+// 本地内存 (见 reduce_product 上面那条历史教训)。正确性由 validate_sqr_mod 与
+// mul_mod 逐肢体对拍 (含全 0 / 全 f / p / p-1 等边界)。
+__host__ __device__ static uint256_t sqr_mod(const uint256_t& a)
+{
+    // ---- 1) 上半三角 (i < j): 28 次乘法 ----
+    uint32_t t[16];
+    for (int i = 0; i < 16; ++i) t[i] = 0;
+    for (int i = 0; i < 7; ++i) {          // i = 7 没有 j > 7
+        uint64_t carry = 0;
+        const uint64_t ai = a.limb[i];
+        for (int j = i + 1; j < 8; ++j) {
+            const uint64_t cur = ai * a.limb[j] + t[i + j] + carry;
+            t[i + j] = (uint32_t)cur;
+            carry = cur >> 32;
+        }
+        t[i + 8] = (uint32_t)carry;
+    }
+
+    // ---- 2) 翻倍 + 加对角线: 8 次乘法 (展开后 i 与 i+1 共用一次) ----
+    uint32_t cy = 0;
+    for (int i = 0; i < 16; ++i) {
+        const uint64_t w = (uint64_t)a.limb[i >> 1] * a.limb[i >> 1];
+        const uint64_t v = ((uint64_t)t[i] << 1) + cy +
+                           (((i & 1) == 0) ? (uint32_t)w : (w >> 32));
+        t[i] = (uint32_t)v;
+        cy = (uint32_t)(v >> 32);
+    }
+    return reduce_product(t);
+}
+
 __host__ __device__ uint256_t mod_add(const uint256_t& a, const uint256_t& b, const uint256_t& m)
 {
     uint256_t result = a;
@@ -871,10 +919,12 @@ __host__ __device__ static void step_apply(AffinePoint& P, const uint256_t& inv_
     }
 
     // λ = num / den; mode 1 的 num = 3X², mode 0 的 num = Qy - Py
-    const uint256_t num = (mode == 1) ? mul_mod(mul_mod(P.x, P.x), three_mod)
+    // 两处自乘都走 sqr_mod (36 次乘法, 比 mul_mod(a,a) 省 28 次 IMAD.WIDE),
+    // 结果与 mul_mod(a, a) 逐位相同, 见 sqr_mod 的注释与 validate_sqr_mod。
+    const uint256_t num = (mode == 1) ? mul_mod(sqr_mod(P.x), three_mod)
                                       : mod_sub(Q.y, P.y);
     const uint256_t lambda = mul_mod(num, inv_den);
-    const uint256_t lambda_sq = mul_mod(lambda, lambda);
+    const uint256_t lambda_sq = sqr_mod(lambda);
 
     AffinePoint R;
     R.x = (mode == 1) ? mod_sub(lambda_sq, mod_add(P.x, P.x, p))
@@ -3502,6 +3552,79 @@ static bool host_check_reduce_product()
     return all_ok;
 }
 
+// sqr_mod 与 mul_mod(a, a) 逐肢体对拍 —— 两者在数学上必须完全相同, 而写法是
+// 两套独立的累加结构 (上半三角翻倍 vs 全满宽学校乘法), 所以这是一次真对拍, 不是
+// 同义反复。生产路径两个分支都靠它: 一般加法的 lambda²、倍点的 3X²。
+//   输入: tid % 5 走 5 个边界 (全 0 / 全 f / p / p-1 / 交替), 其余走伪随机。
+static __host__ __device__ uint256_t sqr_mod_probe(unsigned int tid)
+{
+    uint256_t x;
+    switch (tid % 5u) {
+    case 0:                                   // 全 0
+        for (int i = 0; i < 8; ++i) x.limb[i] = 0;
+        break;
+    case 1:                                   // 全 f (上半三角/diagonal 都顶到上限)
+        for (int i = 0; i < 8; ++i) x.limb[i] = 0xFFFFFFFFu;
+        break;
+    case 2:                                   // 交替 0 / f (进位链最长的那种形状)
+        for (int i = 0; i < 8; ++i) x.limb[i] = (i & 1) ? 0xFFFFFFFFu : 0u;
+        break;
+    case 3:                                   // p-1
+        x = uint256_t{{0xFFFFFC2E, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
+                       0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF}};
+        break;
+    default: {                                // 伪随机 (splitmix 风格, 设备/主机都要纯算术)
+        uint64_t s = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)tid << 32) ^ (uint64_t)tid;
+        for (int i = 0; i < 8; ++i) {
+            s += 0x9E3779B97F4A7C15ULL;
+            s ^= s >> 30;
+            s *= 0xBF58476D1CE4E5B9ULL;
+            s ^= s >> 27;
+            x.limb[i] = (uint32_t)(s >> 32);
+        }
+        break;
+    }
+    }
+    return x;
+}
+
+__global__ void validate_sqr_mod()
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint256_t x = sqr_mod_probe(tid);
+
+    const uint256_t got = sqr_mod(x);
+    const uint256_t want = mul_mod(x, x);
+
+    for (int i = 0; i < 8; ++i) DEV_ASSERT(got.limb[i] == want.limb[i]);
+    DEV_ASSERT(!is_ge(got, p));   // 归约结果必须 < p
+}
+
+// host 侧对拍 + 差异打印 (与 host_check_reduce_product 同款: 设备端 printf 会交错)
+static bool host_check_sqr_mod()
+{
+    bool all_ok = true;
+    for (unsigned int k = 0; k < 8; ++k) {
+        const uint256_t x = sqr_mod_probe(k);
+        const uint256_t got = sqr_mod(x);
+        const uint256_t want = mul_mod(x, x);
+        bool ok = !is_ge(got, p);
+        for (int i = 0; i < 8; ++i)
+            if (got.limb[i] != want.limb[i]) ok = false;
+        if (!ok) {
+            all_ok = false;
+            printf("  [sqr case %u] BAD\n           x    =", k);
+            for (int i = 7; i >= 0; --i) printf("%08x", x.limb[i]);
+            printf("\n           sqr  =");
+            for (int i = 7; i >= 0; --i) printf("%08x", got.limb[i]);
+            printf("\n           mul  =");
+            for (int i = 7; i >= 0; --i) printf("%08x", want.limb[i]);
+            printf("\n");
+        }
+    }
+    return all_ok;
+}
+
 void validate_test()
 {
     enable_blocking_sync();
@@ -3526,6 +3649,16 @@ void validate_test()
     validate_reduce_product<<<8, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
     stage_ok("validate_reduce_product");
+
+    // 模平方 sqr_mod 与 mul_mod(a, a) 对拍 (边界 + 随机)。生产路径的 lambda²
+    // 与倍点的 3X² 都走它, 两套累加结构必须逐位一致。
+    if (!host_check_sqr_mod()) {
+        printf("validate FAILED: host_check_sqr_mod\n");
+        exit(EXIT_FAILURE);
+    }
+    validate_sqr_mod<<<8, 256>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    stage_ok("validate_sqr_mod");
 
     // 单 walker 步进 vs 链后继对拍 + DP 缓冲写入/溢出路径
     validate_multi<<<10, 256>>>();
