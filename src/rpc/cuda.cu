@@ -1305,16 +1305,25 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 constexpr int RHO_GPU_WALKERS = 32;
 
 // 起点漫游 (32 位判据, dp32_edge_play) 的每线程 walker 数 —— 与生产路**分开定档**。
-// 它的产出率同样是"整卡吞吐 / 2^32", 所以方向上也该加 W (W=16 比 W=4 快 67%),
-// 但它的每轮上限是 edge_max_edges 条边, 而断流窗口 (break_flag 置起到各线程散场)
-// 里冒出来的命中数随 states 线性涨:
-//   W=4  47,104 states  一个窗口期望 2.9 条  20 档余量下越界概率 3e-13/轮 (现状)
-//   W=16 188,416        期望 11.5 条         20 档余量下 6e-4/轮 (每天 ~0.09 次)
-//   W=32 376,832        期望 23 条           20 档余量下 0.13/轮 (必崩)
-// 这就是边缓冲容量 (edge_pool_size) 与 20 档余量按 47,104 states 推出来的直接后果。
-// 要加大 W, 先把余量一起加 (W=16 加 32 档, W=32 加 52 档), 见 edge_pool_size 那段。
-// 这里先保持 4。
-constexpr int RHO_EDGE_WALKERS = 4;
+// 它的产出率是"整卡吞吐 / 2^32", 只看总吞吐这一列, 所以和生产路一样往大取:
+//   W=4 399.7M  ->  W=8 539.1M  ->  W=16 665.7M  ->  W=32 745.7M pts/s
+// 即 W=32 比 W=4 快 1.87 倍, 边产出率同比例 (0.093 -> 0.174 边/秒)。
+//
+// ⚠ 但它被**断流窗口**卡住, 不能只改这一个数: 每轮上限是 edge_max_edges = 90 条边,
+//   而 break_flag 置起后各线程要走到下一个 2^18 批的检查点才散场, 这段窗口里还会再
+//   冒出一批命中, 且期望值随 states (= 线程数 x W) 线性涨:
+//     W=4   47,104 states   期望  2.9 条   -> 20 档余量下越界概率 3e-13/轮 (旧配置)
+//     W=32 376,832 states   期望 23.0 条   -> 20 档余量下 0.13/轮 (必崩)
+//   所以加 W 必须同时加 edge_pool_size (缓冲容量), 见那边的推导。
+//
+// 其余联动项 (都已核对过, 不需要跟着改):
+//   · dp_buffer_size (110) 是**生产路**的槽位数, 同时决定 RhoStates_reserve 常量内存、
+//     rho.cpp 的预备队账本条数、D:\RhoReserve.txt 的 "slots" 校验 —— 两边已解耦,
+//     edge 用自己的一套设备内存 (edge_states_dev / edge_src_dev), 不碰 dp_buffer_size。
+//   · total_points = threads x W 由 rho_play_impl 按 EDGE 分档算出并传进来,
+//     dp32_edge_session 用同一个常量, 两处一致。
+//   · kRhoState2FrontRecords 与 rewalk 探针用的是 RHO_GPU_WALKERS (生产路), 不受影响。
+constexpr int RHO_EDGE_WALKERS = 32;
 
 // 生产几何的每 SM warp 数 —— 单线程速度与总吞吐的**权衡档位**, 不是极值:
 // 8 -> 12 这一步总吞吐 +22% 而每线程 -19%, 已经换不过来; 单看总吞吐 24 才是极值,
@@ -1501,9 +1510,10 @@ __device__ RhoPoint_dev* RhoStates_dev = nullptr;
 //                      继续走 —— 也就是"走到下一个 32 位 DP 就换下一个起点"。
 //
 // 起点池尺寸口径与预备队同构: 池位下标 = 边记录下标 = 这一轮被征用的起点位 (和
-// note_reserve_dps 那条"记录下标 = 被征调的槽位"是同一个约定), 每轮上限也照抄
-// dp_buffer_size - 20; 池容量与缓冲容量同为一个 dp_buffer_size, 余量的道理见下面
-// edge_pool_size 那段。
+// note_reserve_dps 那条"记录下标 = 被征调的槽位"是同一个约定)。每轮上限 edge_max_edges。
+// ⚠ 缓冲容量与池容量**必须相等** (同一个下标两用), 但**不再等于 dp_buffer_size**:
+//    生产路的 110 是按 40 位判据 (窗口期望 0.09 条) 定的, 32 位判据的期望是它的
+//    256 倍, 两边合不了一个数。解耦之后 edge 自己有 edge_pool_size, 见下面那段。
 struct EdgeBuffer {
     uint64_t d;      // 终点 (32 位 DP 索引)
     SecPair sp;      // 终点 (m, n), 与 DpBuffer 同构, 沿用 transfer 口径
@@ -1511,25 +1521,32 @@ struct EdgeBuffer {
 };
 static_assert(sizeof(EdgeBuffer) == 80, "EdgeBuffer layout changed");
 
-// 空槽哨兵: 库走完 / 几何变大补不满时用它。换到空槽的 walker 照旧往前走, 但它
-// 不再记账 (边记录里没有起点可记) —— 停机条件由主机按"还有没有活槽"判。
+// 空槽哨兵: 库走完 / 几何变大补不满时用它。换到空槽的 walker 照旧往前走 —— 它照样
+// 会撞上 32 位 DP, 而且**照样记账** (记录里 src 列就是这个哨兵, 含义是"终点可复算,
+// 但追溯不到来源")。停机条件由主机按"还有没有活槽"判, 不看命中数。
 static constexpr uint64_t EDGE_SRC_NONE = (uint64_t)-1;
 
-constexpr size_t edge_pool_size = dp_buffer_size; // 起点池 / 边缓冲容量 (与 DP 缓冲同大小)
+// 每轮最多收这么多条边 (与生产路的 dp_buffer_size - 20 同一个数, 纯巧合: 它只是
+// "一轮落一批"的量级选择)。断流窗口的余量不在这里, 在 edge_window_slack。
+constexpr unsigned int edge_max_edges = dp_buffer_size - 20;   // = 90
 
-// 两条路的缓冲容量都是 dp_buffer_size, 写入上限 max_size 都是 dp_buffer_size - 20;
-// 那 20 档余量留给"标志已置起但还没散场"的窗口:
-//   add_dp_to_buffer 是 *counter >= max_size 才置 break_flag, 而各线程要走到下一个 2^18
-//   批的检查点才看得到它, 这段窗口里还会再冒出来一批命中 —— 期望命中数 ≈ states x
-//   2^18 步 / 2^32 (32 位判据的期望间距就是 2^32)。
-//   余量按最坏的那条路 (32 位, 47,104 states) 定: 期望 2.9 条, 20 档 = Poisson(2.9)
-//   冒到 21 次的概率 ~3e-13, 按 100 天 ~4800 轮算期望 1e-9 次越界写; 10 档 (冒到 11
-//   次 ~2.5e-4, 100 天里期望撞一次) 太薄, 比 20 档再多对这么小的概率已无意义 ——
-//   两条路统一取 20 档。
-//   ⚠ 这个余量随 states 线性走: 40 位路改成 W=32 (376,832 states) 后同一窗口只期望
-//     0.09 条 (仍然是全覆盖, 因为 40 位判据的间距是 2^40), 边那边你要是加大
-//     RHO_EDGE_WALKERS 就必须跟着加余量, 见该常量的注释。
-constexpr unsigned int edge_max_edges = dp_buffer_size - 20; // 每轮最多收这么多条边
+// 断流窗口余量 (档数)。窗口 = break_flag 置起到各线程走到下一个 2^18 批检查点,
+// 这段里还会再冒出一批命中:
+//   期望 λ = states x 2^18 / 2^32,  states = 92 x 128 x RHO_EDGE_WALKERS
+//          = 376,832 x 2^18 / 2^32 = 23.0 条 (W=32)
+// 越界 = 这 23 条里冒到第 slack+1 条以上 (第 90 条之后又写满 slack+1 格):
+//   slack 20 -> 0.13/轮    (必崩, 这就是为什么不能只改 W)
+//   slack 32 -> 7.5e-9/轮  (~2.7e-5/天, 100 天期望 3e-3 次)
+//   slack 52 -> 1.9e-9/轮
+//   slack 64 -> 1.4e-14/轮 (选这一档: 100 天期望 4e-9 次, 比"再大"已经没有意义)
+// 代价只有内存: 154 x 80 B 的边缓冲 + 154 x 144 B 的起点池 ≈ 34 KB, 可忽略。
+constexpr unsigned int edge_window_slack = 64;
+
+// 起点池 / 边缓冲容量。下标两用 (edge_device_buffer[i] 与 edge_starts_dev[i] 一一对应),
+// 所以两者必须相等; 且必须 >= edge_max_edges (每轮最多用掉这么多池位)。
+constexpr size_t edge_pool_size = (size_t)edge_max_edges + edge_window_slack;   // = 154
+static_assert(edge_pool_size > edge_max_edges, "edge pool capacity must exceed per-round write limit");
+static_assert(edge_pool_size < 4096, "edge pool capacity suspiciously large: check edge_window_slack");
 
 __device__ EdgeBuffer* edge_device_buffer = nullptr;
 __device__ unsigned int edge_buffer_count = 0;
@@ -1566,7 +1583,8 @@ __device__ unsigned long long g_validate_fail = 0;
 //   index 被征调了" (见 rho.cpp 的 note_reserve_dps)。
 // EDGE=true (起点漫游路径): 多记一个起点索引 (slot 槽当前用的那个), 并把 slot 换到
 //   起点池的第 index 个新起点; 池位取空 (空槽) 时槽位标成 EDGE_SRC_NONE, 该 walker
-//   从此不再记账。slot 是 walker 槽号 (idx*W + k) —— 设备侧本来不知道自己的槽号,
+//   之后仍然记账, 只是记录的 src 列写成哨兵 (追溯不到来源)。slot 是 walker 槽号
+//   (idx*W + k) —— 设备侧本来不知道自己的槽号,
 //   所以必须由调用方 (内核) 在命中当场传进来。
 //
 // BufT 由实参推出 (DpBuffer / EdgeBuffer), 两条路只有这一个函数。
@@ -1579,15 +1597,21 @@ __device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
     unsigned int* counter = EDGE ? &edge_buffer_count : &dp_buffer_count;
     unsigned int index = atomicAdd(counter, 1);
 
-    // 调用方保证不越界: 生产传 max_size = dp_buffer_size - 20; 漫游传 edge_max_edges
-    // (同一个数), 两条路的缓冲容量都是 dp_buffer_size —— 差的 20 档就是留给下面这个
-    // break_flag 到各线程散场之间的窗口的, 见 edge_pool_size 那段。
+    // 调用方保证不越界 —— 缓冲容量与余量两边**各算各的**, 不要照抄:
+    //   生产 (EDGE=false): 容量 dp_buffer_size (110), 上限 dp_buffer_size - 20 (90),
+    //                      余量 20 档; 40 位判据的窗口期望只有 0.09 条 (376,832 states)。
+    //   漫游 (EDGE=true) : 容量 edge_pool_size (154), 上限 edge_max_edges (90),
+    //                      余量 edge_window_slack (64 档); 32 位判据的窗口期望 23 条。
+    //   index 由 atomicAdd 取, 可以越过 max_size (break_flag 要等内核走到下一个检查点
+    //   才被看到), 越出的那些就是靠上面的余量接住的; 越出余量 = 越界写。
     buffer[index].d = d;
     transfer(buffer[index].sp.m , (const unsigned char*)&r.m);
     transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
 
     if constexpr (EDGE) {
-        // 记下"这条边从哪个 32 位 DP 出发的", 再换下一个起点
+        // 记下"这条边从哪个 32 位 DP 出发的", 再换下一个起点。
+        // 空槽 (库见底) 的池位里放的是主机现生成的随机点 (见 dp32_edge_session 铺池),
+        // 换过去就是一条独立轨迹; src 那一列照旧写哨兵 = 追溯不到来源。
         buffer[index].src = edge_src_dev[slot];
         r = edge_starts_dev[index];
         edge_src_dev[slot] = edge_starts_src_dev[index];
@@ -1753,18 +1777,30 @@ public:
             CHECK_CUDA(cudaMemcpy(host_buffer.data(), m_dev_buffer,
                                   current_count * sizeof(EdgeBuffer), cudaMemcpyDeviceToHost));
 
+            // 顺手数一下 src 是哨兵的边 (空槽 = 随机起点)。它不等于"本轮随机起点的个数":
+            // 一个随机起点没走到下一个 DP 就不会产生边, 所以这里数的是落盘的实际行数。
+            m_last_src_none = 0;
             for (const auto& e : host_buffer) {
                 _saveEdge(e.src, e.d, e.sp);
+                if (e.src == EDGE_SRC_NONE) m_last_src_none++;
             }
             reset_counters();
+        } else {
+            m_last_src_none = 0;
         }
 
-        std::cout << get_time() << " : saved " << current_count << " edge." << std::endl;
+        std::cout << get_time() << " : saved " << current_count << " edge."
+                  << (m_last_src_none != 0 ? " (" + std::to_string(m_last_src_none) + " from random starts)" : "")
+                  << std::endl;
         return current_count;
     }
 
+    // 上一次 save_edges() 里 src 是哨兵 (空槽/随机起点) 的边数
+    unsigned int last_src_none() const { return m_last_src_none; }
+
 private:
     EdgeBuffer* m_dev_buffer = nullptr;
+    unsigned int m_last_src_none = 0;
 };
 
 // 数一个文本文件的行数 —— 只用于对账与报告 (每次收工时报"本次新增多少条边", 以及
@@ -1959,12 +1995,15 @@ __global__ void rho_w()
             const uint64_t d = EDGE ? distinguishable32(s[k].x.x) : distinguishable(s[k].x.x);
             if (d != 0) {
                 if constexpr (EDGE) {
-                    // 空槽上的命中不记账: 它没有起点可记 (库走完 / 本轮补不满)。
-                    if (edge_src_dev[idx * W + k] != EDGE_SRC_NONE) {
-                        count_dp++;
-                        add_dp_to_buffer<true>(d, s[k], edge_device_buffer, edge_max_edges,
-                                               (unsigned int)(idx * W + k));
-                    }
+                    // 空槽 (起点索引 = EDGE_SRC_NONE) 上的命中**也记账**。
+                    // 记录里的 src 列就是 EDGE_SRC_NONE, 落盘时写成 2^64-1 —— 含义是
+                    // "这个终点确实是 32 位 DP (m, n) 现算得出、索引对得上), 但追溯不到
+                    // 它是从库里的哪个起点走过来的"。丢掉它等于白丢一条可用的 DP 记录,
+                    // 而碰撞判定只关心终点那个 x, 不关心来源 —— 所以留着。
+                    // 空槽只在库见底 / 几何变大补不满时才出现, 是收尾期的事。
+                    count_dp++;
+                    add_dp_to_buffer<true>(d, s[k], edge_device_buffer, edge_max_edges,
+                                           (unsigned int)(idx * W + k));
                 } else {
                     count_dp++;
                     add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 20);
@@ -2616,12 +2655,17 @@ void init_RhoStates_test(int total_points)
 // -> 落账 -> 落状态), 只是判据换成 32 位、换的是起点而不是预备队、落的是边表。
 //
 // 设备侧 (与 RhoStates_dev / RhoStates_reserve / dp_device_buffer 平行, 互不相干):
-//   edge_states_dev[total_points]   每槽当前点
-//   edge_src_dev[total_points]      每槽当前起点索引 (EDGE_SRC_NONE = 空槽, 不再记账)
-//   edge_starts_dev[110]            起点池: 池位 i 就是 library[cursor + i]
-//   edge_starts_src_dev[110]        池位 -> 库索引
-//   edge_device_buffer[110]         本轮的边 (容量 110 = dp_buffer_size, 每轮上限 90 =
-//                                   edge_max_edges, 差的 20 档是断流窗口余量)
+//   edge_states_dev[total_points]   每槽当前点 (total_points = threads x RHO_EDGE_WALKERS)
+//   edge_src_dev[total_points]      每槽当前起点索引 (EDGE_SRC_NONE = 空槽)
+//   edge_starts_dev[edge_pool_size] 起点池: 池位 i 就是 library[cursor + i]
+//   edge_starts_src_dev[edge_pool_size]  池位 -> 库索引
+//   edge_device_buffer[edge_pool_size]   本轮的边 (容量 154, 每轮上限 90 = edge_max_edges,
+//                                   差的 64 档是断流窗口余量, 推导见 edge_window_slack)
+//
+// 状态文件规模随 W 线性涨 (W=32 时 376,832 条 = 1,507,328 行 / ~105 MB), 每轮整份重写,
+// 所以这里必须走 save_RhoStates_dev_fast (并行格式化 + 大块 write, 实测 ~1.5 s);
+// 老的 saveRhoState 每行一次 std::endl 刷新 + 先把旧文件整个读进 vector<string>,
+// 同一份数据要 ~8-10 s, 还额外吃 150 MB 堆。
 //
 // 主机侧只有两件账:
 //   cursor          库游标 = 下一个要发出去的库**位置** (从状态文件的起点索引列恢复:
@@ -2717,7 +2761,8 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     //
     // 这里必须把**索引换算成位置**: 索引值是 x 的 bit 32..95, 能到 9e17, 直接拿它当游标
     // 会一步冲过 lib_total 被下面的兜底夹住, 之后每轮铺池取 library[lib_total + i] 全是
-    // 越界空槽 —— 每个槽命中一次就退役, 只减不增, 重启一次整支舰队就走死。
+    // 越界空槽 (随机起点), 库里的 DP 一条都不会再被派出去 —— 扫描悄悄退化成随机游走,
+    // 边表全带哨兵 src, 而且不会有任何报错。
     // 换算: 全量库按索引升序 (见 common.h), 位置就是下界下标, 二分即可。只在启动时做
     // 一次, 不加热路径。
     auto library_position_of = [&](uint64_t index, uint64_t& pos) -> bool {
@@ -2780,9 +2825,12 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     if (got < total_points) {
         // 首次运行 (got == 0), 或上次写到一半被杀 (尾部缺几条), 或改了几何 (条数变了)。
         // 缺的槽从**库游标处**补: 已恢复槽的起点索引在库里的位置都 < cursor, 与游标自洽,
-        // 不会被重复派发; 库也补不满的槽标成空槽, 命中一次即退役。
+        // 不会被重复派发。库也补不满的槽用 RhoPoint::rand() 补随机点 (= 空槽: 走、命中
+        // 照记, 但记录的 src 列是哨兵, 追溯不到来源)。随机点单点约 0.045 ms, 且只在库
+        // 见底时才出现。
         cprintf("%s : %s 恢复 %d/%d 槽, 其余从库游标 %llu 处补起点\n", get_time().c_str(),
                 DP32_EDGE_STATE_FILE, got, total_points, (unsigned long long)cursor);
+        int n_rand = 0;
         for (int i = got; i < total_points; i++) {
             RhoPoint p;
             uint64_t idx = 0;
@@ -2791,9 +2839,16 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
                 src_host[i] = idx;
                 cursor++;
             } else {
-                states_host[i] = RhoPoint_dev();
+                RhoPoint r;
+                r.rand();
+                states_host[i].from(r);
                 src_host[i] = EDGE_SRC_NONE;
+                n_rand++;
             }
+        }
+        if (n_rand != 0) {
+            cprintf("%s : 其中 %d 个槽补的是随机点 (库已见底): 它们照常走、命中照记, 但 src 列写哨兵\n",
+                    get_time().c_str(), n_rand);
         }
     }
     CHECK_CUDA(cudaMemcpy(states_dev, states_host.data(), total_points * sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
@@ -2810,9 +2865,10 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
 
     uint64_t round_no = 0;
     uint64_t total_edges = 0;   // 累计记下的边数 (= 边文件新增的行数; 游标不是这个数)
+    uint64_t total_rand_starts = 0;  // 累计 src 写哨兵的边数 (= 来自随机起点的边)
     if (alive == 0) {
-        // 库已见底且所有槽都已退役 —— 这是"跑完了"的重启态, 不要再空转一整轮 (半小时),
-        // 因为空槽上的命中不记账, 也永远不会有 hit 把这一轮提前打断。
+        // 库已见底且所有槽都已退役 —— 这是"跑完了"的重启态, 不要再空转一整轮 (半小时)。
+        // 停机按"还有没有活槽"判, 不看命中数: 没有活槽就不再有派发, 边表停在这里。
         cprintf("%s : 库已见底且所有槽都已退役, 直接收工 (本轮不空转)\n", get_time().c_str());
         ilog_line("dp32_edge_play: done already, exit.");
     }
@@ -2822,6 +2878,10 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         // 铺起点池 (与 init_RhoStates_reserve 同一时序位: 每轮开始重铺一次池子)。
         // 注意**不动 cursor** —— 池子是个窗口, 只有真被用掉的那 n 个池位才推游标,
         // 所以下一轮的窗口是 library[cursor + n ...], 上一轮没用到的池位会被重新列出。
+        // 库已经见底的那些池位用 RhoPoint::rand() 补 (空槽: 走、命中照记, src 写哨兵)。
+        // 每轮重新生成, 不复用上一轮的点。
+        // 实际产生多少条"随机起点"的边由 EdgeManager::last_src_none() 数 (池位可能没走到
+        // 下一个 DP, 那就不产生边)。
         for (size_t i = 0; i < edge_pool_size; i++) {
             RhoPoint p;
             uint64_t idx = 0;
@@ -2829,7 +2889,9 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
                 pool_host[i].from(p);
                 pool_src_host[i] = idx;
             } else {
-                pool_host[i] = RhoPoint_dev();
+                RhoPoint r;
+                r.rand();
+                pool_host[i].from(r);
                 pool_src_host[i] = EDGE_SRC_NONE;
             }
         }
@@ -2846,27 +2908,39 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         // 次序: 先落边 (边文件的尾巴就是账), 再落状态 —— 理由见 EdgeManager::save_edges
         const unsigned int edges = edge_manager.save_edges();
         total_edges += edges;
-        const uint64_t avail = (cursor < lib_total) ? (lib_total - cursor) : 0;
-        const uint64_t revived = std::min<uint64_t>(edges, avail);
-        alive = alive - edges + revived;   // 命中 n 条 = n 个槽换点, 其中 revived 个拿到真起点
+        total_rand_starts += (uint64_t)edge_manager.last_src_none();
+        // 游标按"被用掉的池位数"推进: 每条记录恰好占一个池位, 池位 i 的起点是
+        // library[cursor + i] —— 所以 cursor += edges 与记录里带不带 src 无关。
         cursor += edges;
 
         unsigned long long batches = 0;
         CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
         accum_round_rate("dp32edge", round_no, secs, batches, total_points, W, gridSize, blockSize, edges);
 
-        // 状态落盘: 文本 4 行/条, "x / m / n / 起点索引" (与 RhoState 格式逐字一致)
+        // 状态落盘: 文本 4 行/条, "x / m / n / 起点索引" (与 RhoState 格式逐字一致)。
+        // 走 fast 版: W=32 时是 376,832 条 / 1,507,328 行 / ~105 MB, 每轮都要整份重写,
+        // saveRhoState 那套 (每行 endl 刷新 + 先读旧文件进 vector<string>) 要 8-10 s
+        // 并额外吃 150 MB 堆; fast 版并行格式化 + 大块 write, ~1.5 s。
+        // 语义逐字一致 (times 那一列同样写 src_host[i], 同样保留 num*4 行之后的尾部)。
         CHECK_CUDA(cudaMemcpy(states_host.data(), states_dev,
                               total_points * sizeof(RhoPoint_dev), cudaMemcpyDeviceToHost));
         CHECK_CUDA(cudaMemcpy(src_host.data(), src_dev,
                               total_points * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        // 活槽数**直接数回读的 src_host**, 不再用 "alive - edges + revived" 推:
+        // 自从空槽上的命中也开始记账之后, edges 里混着"本来就没起点"的那几条, 按
+        // 条数做减法会把它们当成"死了一个槽"多减一次。回读是权威值, 而且是 O(n),
+        // 比一个可能算错的公式便宜。(n = 376,832, 与旁边的状态转换同一个量级。)
+        alive = 0;
+        for (int i = 0; i < total_points; i++) {
+            if (src_host[i] != EDGE_SRC_NONE) alive++;
+        }
         {
             std::vector<RhoState> rsv(total_points);
             for (int i = 0; i < total_points; i++) {
                 states_host[i].to(rsv[i]);
-                rsv[i].times = src_host[i];
+                rsv[i].times = src_host[i];   // 这一格存的是起点索引, 不是步数
             }
-            saveRhoState(rsv.data(), total_points, DP32_EDGE_STATE_FILE);
+            save_RhoStates_dev_fast(rsv.data(), total_points, DP32_EDGE_STATE_FILE);
         }
         round_no++;
 
@@ -2883,10 +2957,12 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     CHECK_CUDA(cudaFree(src_dev));
     CHECK_CUDA(cudaFree(pool_dev));
     CHECK_CUDA(cudaFree(pool_src_dev));
-    cprintf("%s : dp32 起点漫游结束: 本次新增 %llu 条边, 游标 %llu/%llu, 活槽 %llu/%d\n",
+    cprintf("%s : dp32 起点漫游结束: 本次新增 %llu 条边, 游标 %llu/%llu, 活槽 %llu/%d"
+            " (其中 %llu 条边来自随机起点, src 列为哨兵)\n",
             get_time().c_str(), (unsigned long long)total_edges,
             (unsigned long long)cursor, (unsigned long long)lib_total,
-            (unsigned long long)alive, total_points);
+            (unsigned long long)alive, total_points,
+            (unsigned long long)total_rand_starts);
 }
 
 // rho_play 与 dp32_edge_play 共用的一份实现 —— 只有"判据 / 换什么点 / 落什么账"这三件

@@ -5765,6 +5765,15 @@ static RPCHelpMan testmvp()
 
                     std::map<uint64_t, SecPair> dstMap;   // 终点索引 -> 该终点的 (m, n)
                     uint64_t n_lines = 0, n_bad = 0, n_src_unknown = 0, n_dst_dup = 0;
+                    // 起点那一列是 EDGE_SRC_NONE (= 2^64-1) 的边数。这类边来自**空槽**:
+                    // 库已见底时主机用 RhoPoint::rand() 补随机起点, 走的是一条真实轨迹,
+                    // 命中照记, 但追溯不到它是从库里哪个 32 位 DP 出发的 —— 所以起点列
+                    // 只能写哨兵。它与"起点索引在库里查不到"(n_src_unknown) 是两回事:
+                    // 后者说明库被重建/状态对不上, 前者是设计如此。
+                    // 注: 这里的 2^64-1 与 cuda.cu 的 EDGE_SRC_NONE 是同一个值 (两个翻译
+                    // 单元, 各自定义; 改一边必须改另一边)。
+                    constexpr uint64_t kEdgeSrcNone = (uint64_t)-1;
+                    uint64_t n_src_none = 0;
                     // 重复终点里 x 真的相同的有几条 (= 真碰撞候选), 其中 bingo 解不出 k 的有几条。
                     // x 相同 ⇒ 同点/反号必居其一, bingo 本该必解得出; 唯独"精确孪生" (m,n)/(-m,-n)
                     // 那种写法两边都化成 0 (同一个点的两种写法而已, 对 k 不含信息) 会落在这里 ——
@@ -5817,9 +5826,15 @@ static RPCHelpMan testmvp()
                             continue;
                         }
 
-                        // 起点索引必须在全量库里: 那一列就是拿来跟踪"这条边从哪个 DP 出发"的
+                        // 起点索引: 两种情形分开计数 ——
+                        //   src == 2^64-1 : 空槽 (随机起点), 设计如此, 只数不改;
+                        //   其他但库里查不到 : 库被重建过 / 状态对不上, 这是真异常。
                         uint32_t slot = 0;
-                        if (all_lib.src_find(src, slot) == Dp32Hit::Absent) n_src_unknown++;
+                        if (src == kEdgeSrcNone) {
+                            n_src_none++;
+                        } else if (all_lib.src_find(src, slot) == Dp32Hit::Absent) {
+                            n_src_unknown++;
+                        }
 
                         // 终点碰撞: 索引相同只说明 x 的 bit 32..95 相同, **不等于**同一个点,
                         // 所以先确认 x (只比前 32 字节, y 允许反号)。x 相同只有两种情形,
@@ -5850,22 +5865,26 @@ static RPCHelpMan testmvp()
                         }
                     }
 
-                    cprintf("Dp32Edge 校验: %llu 行, 非 32 位 DP %llu 条, 起点不在库里 %llu 条, "
-                            "同终点碰撞 %llu 条 (其中 x 相同 %llu 条, x 相同但解不出 %llu 条), "
-                            "终点去重 %llu\n",
+                    cprintf("Dp32Edge 校验: %llu 行, 非 32 位 DP %llu 条, 空槽起点(随机, 2^64-1) %llu 条, "
+                            "起点不在库里 %llu 条, 同终点碰撞 %llu 条 (其中 x 相同 %llu 条, "
+                            "x 相同但解不出 %llu 条), 终点去重 %llu\n",
                             (unsigned long long)n_lines, (unsigned long long)n_bad,
-                            (unsigned long long)n_src_unknown, (unsigned long long)n_dst_dup,
+                            (unsigned long long)n_src_none, (unsigned long long)n_src_unknown,
+                            (unsigned long long)n_dst_dup,
                             (unsigned long long)n_x_same, (unsigned long long)n_x_nosol,
                             (unsigned long long)dstMap.size());
-                    unspent.pushKV("str", strprintf("lines %llu, not_32dp %llu, src_not_in_lib %llu, "
+                    unspent.pushKV("str", strprintf("lines %llu, not_32dp %llu, src_none %llu, "
+                                                    "src_not_in_lib %llu, "
                                                     "dst_collision %llu, x_same %llu, x_same_nosol %llu, "
                                                     "dst_unique %llu",
                                                     (unsigned long long)n_lines, (unsigned long long)n_bad,
+                                                    (unsigned long long)n_src_none,
                                                     (unsigned long long)n_src_unknown,
                                                     (unsigned long long)n_dst_dup,
                                                     (unsigned long long)n_x_same,
                                                     (unsigned long long)n_x_nosol,
                                                     (unsigned long long)dstMap.size()));
+                    unspent.pushKV("src_none", n_src_none);
                     unspent.pushKV("str2", first_bad);
                     unspent.pushKV("num", n_lines);
                 } /* else {
