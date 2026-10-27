@@ -1757,10 +1757,13 @@ public:
     }
 
     // 取回这一轮的边并追加落盘。返回条数 —— 库游标要按它推进: 每条边恰好用掉起点池
-    // 的一个池位, 池位 i 的起点 = library[cursor + i], 所以 cursor += n。
+    // 的一个池位, 所以 cursor += n。池位 i 的起点是 library[cursor + i] 只在
+    // cursor + i < 库条数 时成立, 越界的池位是主机现生成的随机点 (src 写哨兵)。
     //
     // 落盘次序 (先边, 后状态) 是设计的一部分。两边各自代表什么:
-    //   边文件   = 已经发生过的派发 (事实), 一条行就是一次派发;
+    //   边文件   = 已经发生过的边 (事实), 一条行就是一条边; 其中起点列是哨兵的
+    //              那几条来自空槽的随机起点, 不消耗库位置 (见 dp32_edge_session),
+    //              所以"行数"不等于"派发数", 对账要分两个口径数 (见 count_edge_lines);
     //   状态文件 = 现在站在哪里 (游标就是从它第 4 列取 max + 1 恢复的)。
     // 先把事实记全再记位置:
     //   在两步之间崩 -> 边多出 n 条, 而状态还停在上一轮, 重启后游标退回去把池位**重发
@@ -1803,19 +1806,39 @@ private:
     unsigned int m_last_src_none = 0;
 };
 
-// 数一个文本文件的行数 —— 只用于对账与报告 (每次收工时报"本次新增多少条边", 以及
-// 与状态文件推出的游标互校)。它**不等于**库游标: 补种发出去的号不记边, 所以
-//   边文件行数 = 游标 - 累计补种数
-// 库游标的恢复口径在 dp32_edge_session (从状态文件的起点索引列取 max + 1)。
+// 边表的行数统计 —— 只用于对账与报告 (每次收工时报"本次新增多少条边", 以及
+// 与状态文件推出的游标互校)。**必须分两个口径数**, 不能只数总行数:
+//   真实边 real     起点列 != EDGE_SRC_NONE, 即真被派发出去的库位置, 恒 <= 库条数
+//   随机边 random_  起点列 == EDGE_SRC_NONE, 即空槽随机起点命中的边, 不消耗库位置
+//   总行数 total    两者之和
+// 库游标只跟**真实边**对得上 —— 库见底之后随机起点的边会继续往表里加, 拿总行数去比
+// 游标就会误报"边文件比游标多, 状态被回滚"。
+// 另外真实边数也不等于游标: 启动补种发出去的号不记边, 所以
+//   真实边数 = 游标 - 累计补种数
+// 库游标的恢复口径在 dp32_edge_session (从状态文件的起点索引列取位置 + 1)。
 // 文件不存在 / 打不开都算 0 行。
-static uint64_t count_lines(const std::string& name)
+struct EdgeFileLines {
+    uint64_t total = 0;    // 总行数
+    uint64_t real = 0;     // 起点列是真实库索引的行数
+    uint64_t random_ = 0;  // 起点列是哨兵 (2^64-1) 的行数
+};
+
+static EdgeFileLines count_edge_lines(const std::string& name)
 {
+    EdgeFileLines r;
     std::ifstream ifs(name);
-    if (!ifs.is_open()) return 0;
-    uint64_t n = 0;
+    if (!ifs.is_open()) return r;
     std::string line;
-    while (std::getline(ifs, line)) n++;
-    return n;
+    while (std::getline(ifs, line)) {
+        if (line.empty()) continue;
+        r.total++;
+        // 列序 "起点 终点 m n", 只要第一列; 哨兵写出来是十进制 2^64-1。
+        // 不 parse 整行 (后面还有四个大字段), strtoull 碰到空格就停。
+        const unsigned long long v = std::strtoull(line.c_str(), nullptr, 10);
+        if ((uint64_t)v == EDGE_SRC_NONE) r.random_++;
+        else r.real++;
+    }
+    return r;
 }
 
 // 每轮性能对账的累加器 —— 只在内存里记账, 收工时打一行汇总 (见 flush_round_rate)。
@@ -2757,7 +2780,7 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     // 位置的槽在那一轮里不会再把它换掉), 于是
     //     游标 = (max(活槽起点索引) 在库里的位置) + 1
     // 是精确值, 不必额外存一份游标。(拿行数当游标会恒差一个"启动补种数": 补种发的号
-    // 不会记成边 —— 边文件行数 = 游标 - 补种数。)
+    // 不会记成边 —— 真实起点边数 = 游标 - 补种数; 随机起点的边也不进这个式子。)
     //
     // 这里必须把**索引换算成位置**: 索引值是 x 的 bit 32..95, 能到 9e17, 直接拿它当游标
     // 会一步冲过 lib_total 被下面的兜底夹住, 之后每轮铺池取 library[lib_total + i] 全是
@@ -2804,17 +2827,21 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
             }
         }
     }
-    const uint64_t edge_lines = count_lines(DP32_EDGE_FILE);
-    if (got == 0 && edge_lines != 0) {
+    // 边表对账只拿**真实起点**的边比游标: 随机起点 (哨兵 src) 的边不消耗库位置,
+    // 库见底之后会继续往表里加, 混进来就会误报"状态被回滚"。
+    const EdgeFileLines elines = count_edge_lines(DP32_EDGE_FILE);
+    if (got == 0 && elines.total != 0) {
         // 状态没了而边还在: 只能从头重发 (会重复走掉已经走过的号, 但绝不会漏号)。
-        cprintf("%s : %s 无记录但 %s 已有 %llu 行, 游标从 0 重发 (会重复走)\n",
+        cprintf("%s : %s 无记录但 %s 已有 %llu 行 (真实起点 %llu / 随机起点 %llu), "
+                "游标从 0 重发 (会重复走)\n",
                 get_time().c_str(), DP32_EDGE_STATE_FILE, DP32_EDGE_FILE,
-                (unsigned long long)edge_lines);
-    } else if (edge_lines > cursor) {
-        // 边数只可能 <= 派发数 (每条边 = 一次派发, 补种不记边)。真超了就是状态被回滚
-        // 过: 叫一声, 仍按状态口径走 —— 宁可重复, 不可漏号。
-        cprintf("%s : 边文件 %llu 行 > 状态推出的游标 %llu, 状态似被回滚, 按状态走\n",
-                get_time().c_str(), (unsigned long long)edge_lines, (unsigned long long)cursor);
+                (unsigned long long)elines.total, (unsigned long long)elines.real,
+                (unsigned long long)elines.random_);
+    } else if (elines.real > cursor) {
+        // 真实起点边数只可能 <= 派发数 (每条真实边 = 一次派发, 补种不记边)。真超了就是
+        // 状态被回滚过: 叫一声, 仍按状态口径走 —— 宁可重复, 不可漏号。
+        cprintf("%s : 边文件真实起点边 %llu 条 > 状态推出的游标 %llu, 状态似被回滚, 按状态走\n",
+                get_time().c_str(), (unsigned long long)elines.real, (unsigned long long)cursor);
     }
     // 兜底: 上面按"库内位置 + 1"算, 结构上不可能越界; 留着防的是以后有人改了恢复口径。
     if (cursor > lib_total) {
@@ -2911,6 +2938,9 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         total_rand_starts += (uint64_t)edge_manager.last_src_none();
         // 游标按"被用掉的池位数"推进: 每条记录恰好占一个池位, 池位 i 的起点是
         // library[cursor + i] —— 所以 cursor += edges 与记录里带不带 src 无关。
+        // 库见底之后那些池位是主机现生成的随机点, cursor 会因此越过 lib_total;
+        // 那只是计数偏高, 不影响正确性 (真实池位始终是 cursor 之前那一段连续的 0..n-1),
+        // 收工报告时按库条数夹一下 (见函数末尾的 cursor_lib)。
         cursor += edges;
 
         unsigned long long batches = 0;
@@ -2957,12 +2987,16 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     CHECK_CUDA(cudaFree(src_dev));
     CHECK_CUDA(cudaFree(pool_dev));
     CHECK_CUDA(cudaFree(pool_src_dev));
-    cprintf("%s : dp32 起点漫游结束: 本次新增 %llu 条边, 游标 %llu/%llu, 活槽 %llu/%d"
-            " (其中 %llu 条边来自随机起点, src 列为哨兵)\n",
+    // 收工报的游标要夹回库尾: 库见底之后那些轮次的池位全是随机点, 但 cursor 仍按
+    // 被用掉的池位数往前推, 会涨到 lib_total + 随机起点边数 —— 打出来就是超过 100%
+    // 的假进度。真实派发进度恒 <= 库条数。
+    const uint64_t cursor_lib = (cursor < lib_total) ? cursor : lib_total;
+    cprintf("%s : dp32 起点漫游结束: 本次新增 %llu 条边 (其中 %llu 条来自随机起点), "
+            "游标 %llu/%llu, 活槽 %llu/%d\n",
             get_time().c_str(), (unsigned long long)total_edges,
-            (unsigned long long)cursor, (unsigned long long)lib_total,
-            (unsigned long long)alive, total_points,
-            (unsigned long long)total_rand_starts);
+            (unsigned long long)total_rand_starts,
+            (unsigned long long)cursor_lib, (unsigned long long)lib_total,
+            (unsigned long long)alive, total_points);
 }
 
 // rho_play 与 dp32_edge_play 共用的一份实现 —— 只有"判据 / 换什么点 / 落什么账"这三件
