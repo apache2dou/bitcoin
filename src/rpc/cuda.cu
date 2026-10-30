@@ -401,7 +401,10 @@ __host__ __device__ uint256_t mod_add(const uint256_t& a, const uint256_t& b, co
     return result;
 }
 
-__host__ __device__ uint256_t mod_sub(const uint256_t& a, const uint256_t& b)
+// 模**域素数 p** 的减法: a - b (mod p)。
+// ⚠ 名字里的 _p 是硬约束: 借位时加的是全局常量 p, 不是形参。群阶 N 上的减法
+//   **不能**用它 (modinv32 / lambda 那些式子在 mod N 下, 差 p-N 且静默错)。
+__host__ __device__ uint256_t mod_sub_p(const uint256_t& a, const uint256_t& b)
 {
     uint256_t result = a;
 
@@ -417,19 +420,21 @@ __host__ __device__ uint256_t mod_sub(const uint256_t& a, const uint256_t& b)
 
 // ================== safegcd 模逆 (移植自 libsecp256k1 的 modinv32_impl.h) ==================
 // Bernstein-Yang divsteps 算法: 纯 int32/int64 整数运算, 无 CPU 专有指令, 天然适配 CUDA。
-// - 设备端与主机端默认都走变量时间版本 divsteps30_var: 平均 ~11 轮收敛,
-//   并用 ctz 把连续的除 2 步骤批量处理, 纯算术开销约为常量时间版本的 1/4。
-//   rho 每一步点加都要做一次模逆, 模逆是热路径上最大的单项成本, 故优先选变量时间版本。
-//   代价: 同一 warp 内各线程轮数略有差异会有一定发散, 但轮数集中在 11 附近,
-//         远小于常量时间版本固定多出来的那 9 轮开销。
-// - 定义 USE_CONSTTIME_MODINV=1 可切回常量时间版本 (30 步完全无分支, warp 绝对无发散),
-//   用于在真实多线程场景下做 A/B 对比。
-#ifndef USE_CONSTTIME_MODINV
-#define USE_CONSTTIME_MODINV 0
-#endif
-#if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
-#include <intrin.h>
-#endif
+//
+// **只留常量时间版本**: 固定 20 轮 x 30 divsteps (共 600 步), 每一步都靠掩码选通 ——
+// 全函数无分支、无查表、无 warp 发散。rho 每一步点加都要做一次模逆, 模逆是热路径上
+// 最大的单项成本, 而这个版本在 GPU 上反而是快的那个。
+//
+// 已删除的变量时间版本 (ctz 批量处理连续的除 2 步 + 收敛即 break + 变长 limb) 纯算术
+// 步骤确实更少 (~543 divsteps vs 600), 但在生产几何 (8 warps/SM) 下反而慢:
+//   ① `modinv32_inv256[(f>>1)&127]` 是**发散下标读 __constant__**, warp 内 32 个
+//      不同地址要串行 replay;
+//   ② 收敛轮数因线程而异, warp 跑最慢那条。
+// 实测 (W=32, block=128, grid=92, 每变体 2 次, 同会话交替, k=2 为生产几何):
+//    变量时间  k=0 122,381 / 121,350    k=2 545.6M / 543.4M
+//    常量时间  k=0 122,268 / 122,688    k=2 558.6M / 559.7M
+//  => k=2 +2.7% (两簇不重叠), k=0 打平 (+0.5%, 在 0.8% 漂移内)。
+//  k=0 打平说明每点的纯算术开销相当, 差异全部来自 warp 级效应。
 
 struct signed30 {
     int32_t v[9];
@@ -449,23 +454,7 @@ CONSTANT modinv32_modinfo_s modinfo_p = {
     {{-0x3D1, -4, 0, 0, 0, 0, 0, 0, 65536}},
     0x2DDACACF};
 
-__host__ __device__ static inline uint32_t ctz32(uint32_t x)
-{
-#if defined(__CUDA_ARCH__)
-    /* __ctz 仅 CUDA 12.2+ 提供; __ffs 返回最低置位位(1-based), 所有版本均可用。
-       调用处保证 x != 0 (divsteps30_var 的哨兵位使 g|mask 恒非零)。 */
-    return (uint32_t)__ffs((int)x) - 1;
-#elif defined(_MSC_VER)
-    unsigned long i;
-    _BitScanForward(&i, x);
-    return (uint32_t)i;
-#else
-    return (uint32_t)__builtin_ctz(x);
-#endif
-}
-
-#if USE_CONSTTIME_MODINV
-// 常量时间版本: 计算 30 个 divsteps 的转移矩阵 (完全无分支, warp 友好)
+// 计算 30 个 divsteps 的转移矩阵 (完全无分支, warp 友好)
 __host__ __device__ static int32_t divsteps30(int32_t zeta, uint32_t f0, uint32_t g0, trans2x2* t)
 {
     uint32_t u = 1, v = 0, q = 0, r = 1;
@@ -493,63 +482,6 @@ __host__ __device__ static int32_t divsteps30(int32_t zeta, uint32_t f0, uint32_
     t->q = (int32_t)q;
     t->r = (int32_t)r;
     return zeta;
-}
-#endif // USE_CONSTTIME_MODINV
-
-// modinv32_inv256[i] = -(2*i+1)^-1 (mod 256)
-// 设备端用常量数组; 主机端退化为普通常量数组
-CONSTANT uint8_t modinv32_inv256[128] = {
-    0xFF, 0x55, 0x33, 0x49, 0xC7, 0x5D, 0x3B, 0x11, 0x0F, 0xE5, 0xC3, 0x59,
-    0xD7, 0xED, 0xCB, 0x21, 0x1F, 0x75, 0x53, 0x69, 0xE7, 0x7D, 0x5B, 0x31,
-    0x2F, 0x05, 0xE3, 0x79, 0xF7, 0x0D, 0xEB, 0x41, 0x3F, 0x95, 0x73, 0x89,
-    0x07, 0x9D, 0x7B, 0x51, 0x4F, 0x25, 0x03, 0x99, 0x17, 0x2D, 0x0B, 0x61,
-    0x5F, 0xB5, 0x93, 0xA9, 0x27, 0xBD, 0x9B, 0x71, 0x6F, 0x45, 0x23, 0xB9,
-    0x37, 0x4D, 0x2B, 0x81, 0x7F, 0xD5, 0xB3, 0xC9, 0x47, 0xDD, 0xBB, 0x91,
-    0x8F, 0x65, 0x43, 0xD9, 0x57, 0x6D, 0x4B, 0xA1, 0x9F, 0xF5, 0xD3, 0xE9,
-    0x67, 0xFD, 0xDB, 0xB1, 0xAF, 0x85, 0x63, 0xF9, 0x77, 0x8D, 0x6B, 0xC1,
-    0xBF, 0x15, 0xF3, 0x09, 0x87, 0x1D, 0xFB, 0xD1, 0xCF, 0xA5, 0x83, 0x19,
-    0x97, 0xAD, 0x8B, 0xE1, 0xDF, 0x35, 0x13, 0x29, 0xA7, 0x3D, 0x1B, 0xF1,
-    0xEF, 0xC5, 0xA3, 0x39, 0xB7, 0xCD, 0xAB, 0x01
-};
-
-// 变量时间版本: 计算 30 个 divsteps 的转移矩阵 (利用 ctz 批量处理除 2 步骤)
-__host__ __device__ static int32_t divsteps30_var(int32_t eta, uint32_t f0, uint32_t g0, trans2x2* t)
-{
-    uint32_t u = 1, v = 0, q = 0, r = 1;
-    uint32_t f = f0, g = g0, m;
-    uint16_t w;
-    int i = 30, limit, zeros;
-    for (;;) {
-        /* 借助哨兵位, 最多统计到第 i 位 */
-        zeros = (int)ctz32(g | (UINT32_MAX << i));
-        /* 连续 zeros 个 divsteps 都只是 g 除以 2, 一并完成 */
-        g >>= zeros;
-        u <<= zeros;
-        v <<= zeros;
-        eta -= zeros;
-        i -= zeros;
-        if (i == 0) break;
-        /* eta 为负时, 交换 (f,g) 并取相反数 */
-        if (eta < 0) {
-            uint32_t tmp;
-            eta = -eta;
-            tmp = f; f = g; g = 0u - tmp; /* 无符号取负等价写法, 避免 MSVC C4146 */
-            tmp = u; u = q; q = 0u - tmp;
-            tmp = v; v = r; r = 0u - tmp;
-        }
-        /* 消去 g 的低端比特, 上限为 min(i, eta+1, 8) 位 (查表仅支持 8 位) */
-        limit = ((int)eta + 1) > i ? i : ((int)eta + 1);
-        m = (UINT32_MAX >> (32 - limit)) & 255U;
-        w = (uint16_t)((g * modinv32_inv256[(f >> 1) & 127]) & m);
-        g += f * w;
-        q += u * w;
-        r += v * w;
-    }
-    t->u = (int32_t)u;
-    t->v = (int32_t)v;
-    t->q = (int32_t)q;
-    t->r = (int32_t)r;
-    return eta;
 }
 
 // 计算 (t/2^30) * [d, e] mod modulus
@@ -592,8 +524,7 @@ __host__ __device__ static void update_de_30(signed30* d, signed30* e, const tra
     e->v[8] = (int32_t)ce;
 }
 
-#if USE_CONSTTIME_MODINV
-// 计算 (t/2^30) * [f, g] (固定 9 limbs, 配合常量时间版本)
+// 计算 (t/2^30) * [f, g] (固定 9 limbs)
 __host__ __device__ static void update_fg_30(signed30* f, signed30* g, const trans2x2* t)
 {
     const int32_t M30 = (int32_t)0x3FFFFFFF;
@@ -617,33 +548,6 @@ __host__ __device__ static void update_fg_30(signed30* f, signed30* g, const tra
     }
     f->v[8] = (int32_t)cf;
     g->v[8] = (int32_t)cg;
-}
-#endif // USE_CONSTTIME_MODINV
-
-// 计算 (t/2^30) * [f, g] (变长 limbs, 配合变量时间版本)
-__host__ __device__ static void update_fg_30_var(int len, signed30* f, signed30* g, const trans2x2* t)
-{
-    const int32_t M30 = (int32_t)0x3FFFFFFF;
-    const int32_t u = t->u, v = t->v, q = t->q, r = t->r;
-    int32_t fi, gi;
-    int64_t cf, cg;
-
-    fi = f->v[0];
-    gi = g->v[0];
-    cf = (int64_t)u * fi + (int64_t)v * gi;
-    cg = (int64_t)q * fi + (int64_t)r * gi;
-    cf >>= 30;
-    cg >>= 30;
-    for (int i = 1; i < len; ++i) {
-        fi = f->v[i];
-        gi = g->v[i];
-        cf += (int64_t)u * fi + (int64_t)v * gi;
-        cg += (int64_t)q * fi + (int64_t)r * gi;
-        f->v[i - 1] = (int32_t)cf & M30; cf >>= 30;
-        g->v[i - 1] = (int32_t)cg & M30; cg >>= 30;
-    }
-    f->v[len - 1] = (int32_t)cf;
-    g->v[len - 1] = (int32_t)cg;
 }
 
 // 将 (-2*modulus, modulus) 范围的输入规格化到 [0, modulus), sign<0 时先取反
@@ -716,8 +620,8 @@ __host__ __device__ static void normalize_30(signed30* r, int32_t sign, const mo
     r->v[8] = r8;
 }
 
-#if USE_CONSTTIME_MODINV
-// 常量时间版本: 固定 20 轮 x 30 divsteps (590 步对 256 位输入已足够)
+// 固定 20 轮 x 30 divsteps (600 步对 256 位输入已足够; 变量时间版只需 ~543 步,
+// 但在 GPU 上反而更慢 —— 原因见文件上方那一段。)
 __host__ __device__ static void modinv32(signed30* x, const modinv32_modinfo_s* modinfo)
 {
     signed30 d = {{0, 0, 0, 0, 0, 0, 0, 0, 0}};
@@ -734,57 +638,6 @@ __host__ __device__ static void modinv32(signed30* x, const modinv32_modinfo_s* 
     }
     normalize_30(&d, f.v[8], modinfo);
     *x = d;
-}
-#endif // USE_CONSTTIME_MODINV
-
-// 变量时间版本: 平均约 11 轮即可收敛
-__host__ __device__ static void modinv32_var(signed30* x, const modinv32_modinfo_s* modinfo)
-{
-    signed30 d = {{0, 0, 0, 0, 0, 0, 0, 0, 0}};
-    signed30 e = {{1, 0, 0, 0, 0, 0, 0, 0, 0}};
-    signed30 f = modinfo->modulus;
-    signed30 g = *x;
-    int j, len = 9;
-    int32_t eta = -1;
-    int32_t cond, fn, gn;
-
-    for (;;) {
-        trans2x2 t;
-        eta = divsteps30_var(eta, (uint32_t)f.v[0], (uint32_t)g.v[0], &t);
-        update_de_30(&d, &e, &t, modinfo);
-        update_fg_30_var(len, &f, &g, &t);
-        /* g 最低 limb 为 0 时, 检查是否整个 g 为 0 (收敛) */
-        if (g.v[0] == 0) {
-            cond = 0;
-            for (j = 1; j < len; ++j) {
-                cond |= g.v[j];
-            }
-            if (cond == 0) break;
-        }
-        /* 最高 limb 为 0 或 -1 时缩短长度, 符号位并入下一 limb */
-        fn = f.v[len - 1];
-        gn = g.v[len - 1];
-        cond = ((int32_t)len - 2) >> 31;
-        cond |= fn ^ (fn >> 31);
-        cond |= gn ^ (gn >> 31);
-        if (cond == 0) {
-            f.v[len - 2] |= (uint32_t)fn << 30;
-            g.v[len - 2] |= (uint32_t)gn << 30;
-            --len;
-        }
-    }
-    normalize_30(&d, f.v[len - 1], modinfo);
-    *x = d;
-}
-
-// 设备端与主机端统一走变量时间版本 (见文件上方 USE_CONSTTIME_MODINV 的说明)
-__host__ __device__ static void modinv32_auto(signed30* x, const modinv32_modinfo_s* modinfo)
-{
-#if USE_CONSTTIME_MODINV
-    modinv32(x, modinfo);
-#else
-    modinv32_var(x, modinfo);
-#endif
 }
 
 // uint256 (8x32 limbs) -> signed30 (9x30 limbs), 输入须为非负且 < 2^256
@@ -829,7 +682,7 @@ __host__ __device__ uint256_t mod_inv_p(const uint256_t& a)
 {
     signed30 s;
     u256_to_s30(&s, a);
-    modinv32_auto(&s, &modinfo_p);
+    modinv32(&s, &modinfo_p);
     uint256_t inv;
     s30_to_u256(&inv, &s);
     return inv;
@@ -889,7 +742,7 @@ __host__ __device__ static int step_prepare(const AffinePoint& P, const AffinePo
         *den = uint256_t{{1}};
         return 3;
     }
-    uint256_t x_diff = mod_sub(Q.x, P.x);
+    uint256_t x_diff = mod_sub_p(Q.x, P.x);
     if (is_zero(x_diff)) {
         uint256_t y_sum = mod_add(P.y, Q.y, p);
         if (is_zero(y_sum)) {
@@ -922,14 +775,14 @@ __host__ __device__ static void step_apply(AffinePoint& P, const uint256_t& inv_
     // 两处自乘都走 sqr_mod (36 次乘法, 比 mul_mod(a,a) 省 28 次 IMAD.WIDE),
     // 结果与 mul_mod(a, a) 逐位相同, 见 sqr_mod 的注释与 validate_sqr_mod。
     const uint256_t num = (mode == 1) ? mul_mod(sqr_mod(P.x), three_mod)
-                                      : mod_sub(Q.y, P.y);
+                                      : mod_sub_p(Q.y, P.y);
     const uint256_t lambda = mul_mod(num, inv_den);
     const uint256_t lambda_sq = sqr_mod(lambda);
 
     AffinePoint R;
-    R.x = (mode == 1) ? mod_sub(lambda_sq, mod_add(P.x, P.x, p))
-                      : mod_sub(mod_sub(lambda_sq, P.x), Q.x);
-    R.y = mod_sub(mul_mod(lambda, mod_sub(P.x, R.x)), P.y);
+    R.x = (mode == 1) ? mod_sub_p(lambda_sq, mod_add(P.x, P.x, p))
+                      : mod_sub_p(mod_sub_p(lambda_sq, P.x), Q.x);
+    R.y = mod_sub_p(mul_mod(lambda, mod_sub_p(P.x, R.x)), P.y);
     R.infinity = false;
     P = R;
 }
@@ -1070,9 +923,10 @@ static_assert(sizeof(RhoPoint_dev) % 16 == 0, "array stride must be 16B or only 
 __device__ RhoPoint_dev adds_pub_dev[256];
 
 constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
-// DP 命中后的**预备队** (按缓冲区槽位下标一取出, 一人一个)。
+// DP 命中后的**预备队** (按"换起点次数"一取出, 一人一个; GLV 之后一条记录
+// 不一定换起点 —— 只有 p 自己命中的那条才换, 见 reset_start_point)。
 // 它和 RhoStates_dev 不是一回事: 这个数组不参与迭代, 只在某个 walker 命中可区分点
-// 时取出对应槽位的一份独立点, 把该 walker 原地顶替掉 (见 add_dp_to_buffer)。
+// 时取出对应槽位的一份独立点, 把该 walker 原地顶替掉 (见 reset_start_point)。
 // 池里的点从哪儿来 (来源与账本) 全在 rpc/rho.cpp, 见 common.h 的 ReserveSource。
 __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 
@@ -1140,7 +994,8 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 // 寄存器恒 76 (W>=2) 说明生产核不溢出; local ≈ 128B + 208B*W
 // (= 状态 144B + den 32B + prefix 32B 每 walker 一份), 随 W 线性
 // (W<=8 精确吻合, W=16/32 略高: 3472/6832 —— 给编译器留的重排余量)。
-// 这张表用 RHO_PROD_ATTRS=1 rhoperf 就能重打, 不必为每个 W 各编译一次。
+// ⚠ 这张表是历史实测的存档: 重打它的仪器 (RHO_PROD_ATTRS) 已经删掉了。
+//   要重新量得自己加一段 cudaFuncGetAttributes 循环, 不要再照这里找开关。
 //
 // 成本随 states = threads*W 线性增长 (生产核实测 grid 276x128 = 35,328 线程, W>=2 恒定):
 //   W     states     设备态     文本态    落盘(每轮)
@@ -1255,7 +1110,7 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 //   micro (block=128, cycles/op, 依赖链口径):
 //        mul_mod        509.8 (4 warps/SM)    750.5 (16 warps/SM)
 //        mod_inv_p   39,255.9                69,205.5
-//        mod_sub        142.5                  174.0
+//        mod_sub_p      142.5                  174.0
 //        mod_add        147.5                  187.3
 //   W=4 每点 5.25 次 mul_mod + 0.25 次 mod_inv (前缀 3 次/批 + 回代 6 次/批 + 每点 3 次):
 //        5.25*509.8 + 0.25*39255.9 = 2,678 + 9,814 = 12,492 cyc
@@ -1330,21 +1185,167 @@ constexpr int RHO_EDGE_WALKERS = 32;
 // 但那要牺牲 2.1x 的单线程速度。定档依据见上面那节 [prod] 的交换比表。
 constexpr int RHO_PROD_WARPS_PER_SM = 8;
 
-// 可区分点 (DP) 判断 (设备端): x 的低 40 位 (bit 0..39) 全 0 即为 DP,
+// ================== GLV 自同构 (x -> beta*x) 的三个轨道代表 ==================
+//
+// secp256k1 是 j = 0 的曲线 (y^2 = x^3 + 7) 且 p ≡ 1 (mod 3), 自同构群阶为 6:
+//     phi: (x, y) -> (beta*x, y),     beta^3 = 1 (mod p),  beta != 1
+// 群上它就是数乘 lambda (lambda^3 = 1 mod N, 见 libsecp256k1 的 scalar_lambda.h)。
+//
+// 应用口径 (本文件与 k40 / edge 三条路统一):
+//   walker 踩着 p 走完一步之后, 再算出 p2 = beta*p、p3 = beta^2*p, **分别**做 DP
+//   判定; 三个里凡是命中的都各自记一条。
+//   **游走规则不变**: 只有 p 自己不命中才继续走; 只有 p 命中才换起点。
+//
+// ⚠ 记录里必须存**那个命中点自己的** (m, n), 不是 walker 脚下的 p 的 (m, n):
+//   群上 phi(P) = lambda*P, 所以
+//       p2 = beta*p  的表示是 (lambda   * m, lambda   * n)  (mod N)
+//       p3 = beta^2*p 的表示是 (lambda^2 * m, lambda^2 * n)  (mod N)
+//   存成 p 的 (m, n) 会让 `x == m*G + n*Q` 这条不变式不成立, 离线求解就要靠
+//   再乘一次 lambda^j 去猜 —— 现在记录自洽, 求解读到即用。
+//   缩放只在**命中时**做 (mul_mod_generic 走 512 位逐位归约, 很慢), 不进热路径。
+//
+// 代价 (热路径): 每点 1 次 mul_mod + 1 次 mod_add + 1 次 mod_sub_p。beta^2*x 不必
+//   再乘一次 —— beta^2 + beta + 1 = 0 (mod p)  =>  beta^2*x = -(beta*x + x)
+//   按同机微基准约 +800 cyc/点, 相对 W=32 的 ~20.6k cyc/pt 约 +4%。
+//
+// 记录密度: 3 x 2^-40 每步。生产路 (W=32, 每 walker 2^24 步) 每轮期望 ~17 条;
+//   edge 路每轮上限 90 条、断流窗口期望 69 条 (见 edge_window_slack)。
+//
+// ⚠ 32 位判据 (distinguishable32) 也按同一规则判三个代表; 边记录里的 (m,n) 是
+//   命中代表自己的。DpSource32all.bin 里存的仍是"该点自己 x 的 bit 32..95"。
+//   主机侧对应实现是 glv_orbit_x_host / glv_scale_pair, validate_glv 负责对拍。
+
+// beta = 0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee
+// 肢体与 libsecp256k1 field_impl.h 的 secp256k1_const_beta 逐字相同。
+CONSTANT uint256_t beta_p = {
+    0x719501EEu, 0xC1396C28u, 0x12F58995u, 0x9CF04975u,
+    0xAC3434E9u, 0x6E64479Eu, 0x657C0710u, 0x7AE96A2Bu};
+
+// 轨道三个代表 p, beta*p, beta^2*p 的 x 坐标。只要 1 次域乘:
+//   beta^2 + beta + 1 = 0 (mod p)  =>  beta^2*x = -(beta*x + x)
+__host__ __device__ static void glv_orbit_x(const uint256_t& x, uint256_t* bx, uint256_t* b2x)
+{
+    *bx = mul_mod(beta_p, x);
+    *b2x = mod_sub_p(uint256_t{{0}}, mod_add(*bx, x, p));
+}
+
+// ---------------------------------------------------------------------------
+// 群侧的 lambda^j: 记录 (m,n) -> (lambda^j m, lambda^j n) (mod N)
+//
+// lambda^3 = 1 (mod N), lambda != 1, lambda^2 = N-1-lambda。
+// 与 blockchain.cpp 的 kGlvLambda / kGlvLambda2 逐字节相同 (那边另有 bingo 用)。
+// ---------------------------------------------------------------------------
+CONSTANT uint256_t lambda_n = {
+    0x1B23BD72u, 0xDF02967Cu, 0x20816678u, 0x122E22EAu,
+    0x8812645Au, 0xA5261C02u, 0xC05C30E0u, 0x5363AD4Cu};
+CONSTANT uint256_t lambda2_n = {
+    0xB51283CEu, 0xE0CFC810u, 0x8EC739C2u, 0xA880B9FCu,
+    0x77ED9BA4u, 0x5AD9E3FDu, 0x3FA3CF1Fu, 0xAC9C52B3u};
+
+// r = a*b mod m (a, b < m < 2^256)。
+// **只在 DP 命中时调用** —— 512 位逐位归约, 慢但显然正确 (与 validate 的
+// ref_mod_p 同一套算法, 只是模数可传)。不要放进每步的热路径。
+__host__ __device__ static uint256_t mul_mod_generic(const uint256_t& a, const uint256_t& b,
+                                                     const uint256_t& m)
+{
+    uint32_t t[16];
+    for (int i = 0; i < 16; ++i) t[i] = 0;
+    for (int i = 0; i < 8; ++i) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 8; ++j) {
+            uint64_t cur = (uint64_t)a.limb[i] * b.limb[j] + t[i + j] + carry;
+            t[i + j] = (uint32_t)cur;
+            carry = cur >> 32;
+        }
+        t[i + 8] = (uint32_t)carry;
+    }
+
+    uint32_t r[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int bit = 511; bit >= 0; --bit) {
+        uint32_t carry = (t[bit >> 5] >> (bit & 31)) & 1u;
+        for (int i = 0; i < 9; ++i) {
+            uint32_t nc = r[i] >> 31;
+            r[i] = (r[i] << 1) | carry;
+            carry = nc;
+        }
+        bool ge;
+        if (r[8] != 0) {
+            ge = true;
+        } else {
+            int cmp = 0;
+            for (int i = 7; i >= 0 && cmp == 0; --i) {
+                if (r[i] > m.limb[i]) cmp = 1;
+                else if (r[i] < m.limb[i]) cmp = -1;
+            }
+            ge = (cmp >= 0);
+        }
+        if (ge) {
+            uint64_t borrow = 0;
+            for (int i = 0; i < 8; ++i) {
+                uint64_t cur = (uint64_t)r[i] - m.limb[i] - borrow;
+                r[i] = (uint32_t)cur;
+                borrow = (cur >> 32) ? 1 : 0;
+            }
+            r[8] = (uint32_t)((uint64_t)r[8] - borrow);
+        }
+    }
+    uint256_t out;
+    for (int i = 0; i < 8; ++i) out.limb[i] = r[i];
+    return out;
+}
+
+// 轨道代表 j 自己的 (m, n)。j = 0 原样返回。
+__host__ __device__ static RhoPoint_dev glv_scale_point(const RhoPoint_dev& s, int j)
+{
+    RhoPoint_dev r = s;
+    if (j == 1) {
+        r.m = mul_mod_generic(s.m, lambda_n, N);
+        r.n = mul_mod_generic(s.n, lambda_n, N);
+    } else if (j == 2) {
+        r.m = mul_mod_generic(s.m, lambda2_n, N);
+        r.n = mul_mod_generic(s.n, lambda2_n, N);
+    }
+    return r;
+}
+
+// 64 位链下标 k 的轨道代表: lambda^j * k (mod N), 结果是 256 位。
+__host__ __device__ static uint256_t glv_scale_k64(unsigned long long k, int j)
+{
+    uint256_t kv = {{0}};
+    kv.limb[0] = (uint32_t)k;
+    kv.limb[1] = (uint32_t)(k >> 32);
+    if (j == 0) return kv;
+    return mul_mod_generic(kv, (j == 1) ? lambda_n : lambda2_n, N);
+}
+
+// 可区分点 (DP) 判断 (设备端): x 自己的低 40 位 (bit 0..39) 全 0 即为 DP,
 // 返回其后连续 64 位 (bit 40..103) 作为索引; 否则返回 0。
+// 注意这里**只看传进来的这一个 x** —— GLV 的三个轨道代表由调用方分别送进来
+// (见 glv_dp_indices / glv_dp_indices32)。
 // 约定: 索引 0 与"非 DP"同值 (x 恰为 2^40 的倍数时无法区分, 概率可忽略)。
 __host__ __device__ uint64_t distinguishable(const uint256_t& x)
 {
-    // limb[0] = x bit 0..31, limb[1] 低 8 位 = x bit 32..39
+    // x.limb[0] = bit 0..31,  x.limb[1] 低 8 位 = bit 32..39
     if (x.limb[0] == 0 && (x.limb[1] & 0xFF) == 0) {
-        // limb[1] 高 24 位 -> 索引 bit 0..23  (x bit 40..63)
-        // limb[2] 整体     -> 索引 bit 24..55 (x bit 64..95)
-        // limb[3] 低 8 位  -> 索引 bit 56..63 (x bit 96..103)
+        // x.limb[1] 高 24 位 -> 索引 bit 0..23  (x bit 40..63)
+        // x.limb[2] 整体     -> 索引 bit 24..55 (x bit 64..95)
+        // x.limb[3] 低 8 位  -> 索引 bit 56..63 (x bit 96..103)
         return (uint64_t)(x.limb[1] >> 8) |
                ((uint64_t)x.limb[2] << 24) |
                ((uint64_t)(x.limb[3] & 0xFF) << 56);
     }
     return 0;
+}
+
+// 轨道三个代表的 40 位 DP 索引: dp[0] = p 自己, dp[1] = beta*p, dp[2] = beta^2*p。
+// 0 表示该代表不是 DP。三者各自独立记账; 只有 dp[0] 触发换起点 (见 rho_w)。
+__host__ __device__ static void glv_dp_indices(const uint256_t& x, uint64_t dp[3])
+{
+    uint256_t bx, b2x;
+    glv_orbit_x(x, &bx, &b2x);
+    dp[0] = distinguishable(x);
+    dp[1] = distinguishable(bx);
+    dp[2] = distinguishable(b2x);
 }
 
 // 32 位判据 (起点漫游路径专用): x 的低 32 位 (bit 0..31) 全 0 即为 DP,
@@ -1362,6 +1363,17 @@ __host__ __device__ uint64_t distinguishable32(const uint256_t& x)
         return (uint64_t)x.limb[1] | ((uint64_t)x.limb[2] << 32);
     }
     return 0;
+}
+
+// 轨道三个代表的 32 位 DP 索引 (edge 路专用, 规则与 glv_dp_indices 相同):
+// dp[0] = p 自己, dp[1] = beta*p, dp[2] = beta^2*p; 0 = 该代表不是 DP。
+__host__ __device__ static void glv_dp_indices32(const uint256_t& x, uint64_t dp[3])
+{
+    uint256_t bx, b2x;
+    glv_orbit_x(x, &bx, &b2x);
+    dp[0] = distinguishable32(x);
+    dp[1] = distinguishable32(bx);
+    dp[2] = distinguishable32(b2x);
 }
 
 // ---- 关于"正负折叠" (walk 时按 y 的奇偶把 y 取反, 即把点折成 -P) 的结论: 本项目不省 ----
@@ -1387,7 +1399,7 @@ __host__ __device__ uint64_t distinguishable32(const uint256_t& x)
 // 不产生重复工作量, 也不会因为库里同时有 P 和 -P 而多走一趟。
 //
 // 代价反而实打实: 若每步都折 (唯一能改变游走动力学的位置), 每步多一次
-// mod_sub (y -> p - y, 同机微基准约 142 cyc) 加一次奇偶判断, 相对每点 1e4 cyc 的
+// mod_sub_p (y -> p - y, 同机微基准约 142 cyc) 加一次奇偶判断, 相对每点 1e4 cyc 的
 // 量级 => 净慢 1~2%, 换回 0 收益。若只在命中时折 (只改记录里 y 的代表元), 代价约 0,
 // 但游走一步未变, 收益同样为 0。
 //
@@ -1418,8 +1430,8 @@ __host__ __device__ uint64_t distinguishable32(const uint256_t& x)
 // (前缀积 -> 求一次逆 -> 回代) 把每点模逆成本降到 1/W 次。
 //
 // GPU 特有的三点差异:
-// 1. 模逆是 safegcd 32 位肢版本 (平均 ~11 轮 divsteps), 远比 CPU 的
-//    5x52 版本便宜; 而模乘 (mul_mod) 是 schoolbook 64 次 IMAD + 4 次折叠,
+// 1. 模逆是 safegcd 32 位肢版本 (常量时间, 固定 20 轮 x 30 = 600 divsteps、无分支),
+//    比 CPU 的 5x52 版本便宜; 而模乘 (mul_mod) 是 schoolbook 64 次 IMAD + 4 次折叠,
 //    相对更贵。批量每点多付 ~3 次模乘, 换掉 (1 - 1/W) 次模逆, 划不划算
 //    只有实测能回答 (perf_test_rho_gpu_walkers)。
 // 2. 寄存器压力: 生产核里 s[W]/den[W]/prefix[W] 全落 local memory, 所以 W 到 32
@@ -1491,7 +1503,12 @@ struct DpBuffer {
 
 // 设备端 DP 缓冲区管理
 __device__ DpBuffer* dp_device_buffer = nullptr; // 设备缓冲区指针
-__device__ unsigned int dp_buffer_count = 0;     // 缓冲区当前计数
+__device__ unsigned int dp_buffer_count = 0;     // 缓冲区当前计数 (= 本轮 DP 记录条数)
+// 本轮"换起点"的次数。GLV 之后每个 walker 每步可能记 0~3 条记录, 但只有
+// p 自己命中的那一条才换起点 —— 预备队槽位必须按**换起点次数**消费, 不能按
+// 记录条数消费。计数与记录计数已完全解耦: 记录走 dp_buffer_count (add_dp_to_buffer),
+// 换起点走这个 (reset_start_point)。
+__device__ unsigned int dp_reset_count = 0;
 __device__ volatile bool* break_flag_dev = nullptr;
 bool* break_flag_host = nullptr;                // 主机端指针
 extern bool gameover;
@@ -1502,28 +1519,34 @@ __device__ RhoPoint_dev* RhoStates_dev = nullptr;
 // ---------------------------------------------------------------------------
 // 32 位 DP 起点漫游 (edge) 的设备侧存储 —— 与上面那套 DP 存储平行, 各管各的。
 //
-// 两条路共用 fun_add_w / rho_w / add_dp_to_buffer 的同一份实现, 只差编译期一档:
-//   生产 (EDGE=false): 每走一步判 40 位 DP; 命中 -> 记 (终点 d, m, n) 到
-//                      dp_device_buffer, 该 walker 换成预备队点 RhoStates_reserve[index]。
-//   漫游 (EDGE=true) : 每走一步判 32 位 DP; 命中 -> 记 (起点索引 src, 终点 d, m, n)
-//                      到 edge_device_buffer, 该 walker 换成起点池 edge_starts_dev[index]
-//                      继续走 —— 也就是"走到下一个 32 位 DP 就换下一个起点"。
+// 两条路共用 fun_add_w / rho_w / add_dp_to_buffer / reset_start_point 的同一份实现,
+// 只差编译期一档:
+//   生产 (EDGE=false): 每走一步对 p / beta*p / beta^2*p 各判 40 位 DP, 命中的
+//                      各记一条 (终点 d, m, n) 到 dp_device_buffer; **只有 p 自己
+//                      命中**才把该 walker 换成预备队点 RhoStates_reserve[pi]。
+//   漫游 (EDGE=true) : 同上, 判据换 32 位, 记录 (起点索引 src, 终点 d, m, n) 到
+//                      edge_device_buffer; 同样只有 p 自己命中才换成起点池的
+//                      edge_starts_dev[pi] —— "走到下一个 32 位 DP 就换下一个起点"。
 //
-// 起点池尺寸口径与预备队同构: 池位下标 = 边记录下标 = 这一轮被征用的起点位 (和
-// note_reserve_dps 那条"记录下标 = 被征调的槽位"是同一个约定)。每轮上限 edge_max_edges。
+// 起点池尺寸口径与预备队同构: **池位下标 = 换起点次数** (不是边记录下标)。
+// GLV 之后 beta*p / beta^2*p 命中也记一条边, 但那两条不换起点、不消费池位, 所以
+// 记录条数可以到 edge_max_edges, 而池位消费量只会更少 (见 reset_start_point)。
 // ⚠ 缓冲容量与池容量**必须相等** (同一个下标两用), 但**不再等于 dp_buffer_size**:
 //    生产路的 110 是按 40 位判据 (窗口期望 0.09 条) 定的, 32 位判据的期望是它的
 //    256 倍, 两边合不了一个数。解耦之后 edge 自己有 edge_pool_size, 见下面那段。
 struct EdgeBuffer {
     uint64_t d;      // 终点 (32 位 DP 索引)
     SecPair sp;      // 终点 (m, n), 与 DpBuffer 同构, 沿用 transfer 口径
-    uint64_t src;    // 起点 (32 位 DP 库索引); EDGE_SRC_NONE = 空槽
+    uint64_t src;    // 起点 (32 位 DP 库索引); EDGE_SRC_NONE = 追溯不到来源
 };
 static_assert(sizeof(EdgeBuffer) == 80, "EdgeBuffer layout changed");
 
-// 空槽哨兵: 库走完 / 几何变大补不满时用它。换到空槽的 walker 照旧往前走 —— 它照样
-// 会撞上 32 位 DP, 而且**照样记账** (记录里 src 列就是这个哨兵, 含义是"终点可复算,
-// 但追溯不到来源")。停机条件由主机按"还有没有活槽"判, 不看命中数。
+// "追溯不到来源" 哨兵, src 列会写它的情况**只有两类**:
+//   1) 空槽: 库走完 / 几何变大补不满时, 该池位放的是主机现生成的随机点。换到空槽的
+//      walker 照旧往前走 —— 它照样会撞上 32 位 DP, 而且**照样记账**;
+//   2) GLV 的轨道代表: beta*p / beta^2*p 命中的那两条记录 (dp[1]/dp[2])。那两个点
+//      不在"库里的起点 + 一步接一步"这条链上, 拿 walker 自己的起点去填就是错的。
+// 两类都是"终点可复算, 但追不到来源", 停机条件由主机按"还有没有活槽"判, 不看命中数。
 static constexpr uint64_t EDGE_SRC_NONE = (uint64_t)-1;
 
 // 每轮最多收这么多条边 (与生产路的 dp_buffer_size - 20 同一个数, 纯巧合: 它只是
@@ -1531,25 +1554,30 @@ static constexpr uint64_t EDGE_SRC_NONE = (uint64_t)-1;
 constexpr unsigned int edge_max_edges = dp_buffer_size - 20;   // = 90
 
 // 断流窗口余量 (档数)。窗口 = break_flag 置起到各线程走到下一个 2^18 批检查点,
-// 这段里还会再冒出一批命中:
-//   期望 λ = states x 2^18 / 2^32,  states = 92 x 128 x RHO_EDGE_WALKERS
-//          = 376,832 x 2^18 / 2^32 = 23.0 条 (W=32)
-// 越界 = 这 23 条里冒到第 slack+1 条以上 (第 90 条之后又写满 slack+1 格):
-//   slack 20 -> 0.13/轮    (必崩, 这就是为什么不能只改 W)
-//   slack 32 -> 7.5e-9/轮  (~2.7e-5/天, 100 天期望 3e-3 次)
-//   slack 52 -> 1.9e-9/轮
-//   slack 64 -> 1.4e-14/轮 (选这一档: 100 天期望 4e-9 次, 比"再大"已经没有意义)
-// 代价只有内存: 154 x 80 B 的边缓冲 + 154 x 144 B 的起点池 ≈ 34 KB, 可忽略。
-constexpr unsigned int edge_window_slack = 64;
+// 这段里还会再冒出一批命中。GLV 之后每步判 p / beta*p / beta^2*p 三个代表,
+// 记录率是原来的 3 倍:
+//   期望 λ = 3 x states x 2^18 / 2^32,  states = 92 x 128 x RHO_EDGE_WALKERS
+//          = 3 x 376,832 x 2^18 / 2^32 = 69.0 条 (W=32)
+// 越界 = 这 69 条里冒到第 slack+1 条以上 (第 90 条之后又写满 slack+1 格):
+//   slack  20 -> 0.999.../轮  (必崩)
+//   slack  64 -> 0.70/轮      (旧档位, 3x 之后已经不够)
+//   slack 112 -> 7.4e-7/轮
+//   slack 128 -> 7.5e-11/轮
+//   slack 144 -> 5.6e-16/轮   (选这一档: 100 天 x 约 14400 轮, 期望 < 1e-11 次)
+// 代价只有内存: 234 x 80 B 的边缓冲 + 234 x 144 B 的起点池 ≈ 52 KB, 可忽略。
+constexpr unsigned int edge_window_slack = 144;
 
-// 起点池 / 边缓冲容量。下标两用 (edge_device_buffer[i] 与 edge_starts_dev[i] 一一对应),
-// 所以两者必须相等; 且必须 >= edge_max_edges (每轮最多用掉这么多池位)。
-constexpr size_t edge_pool_size = (size_t)edge_max_edges + edge_window_slack;   // = 154
+// 起点池 / 边缓冲容量。两者都用记录下标寻址前 max_size 格, 越界靠 slack 接住,
+// 所以容量必须相等且 >= edge_max_edges + slack。
+constexpr size_t edge_pool_size = (size_t)edge_max_edges + edge_window_slack;   // = 234
 static_assert(edge_pool_size > edge_max_edges, "edge pool capacity must exceed per-round write limit");
 static_assert(edge_pool_size < 4096, "edge pool capacity suspiciously large: check edge_window_slack");
 
 __device__ EdgeBuffer* edge_device_buffer = nullptr;
 __device__ unsigned int edge_buffer_count = 0;
+// 本轮"换起点"的次数 (池位消费量)。边记录条数 != 池位消费量: GLV 之后
+// beta*p / beta^2*p 命中也记边, 但那两条**不换起点**。主机按这个数推库游标。
+__device__ unsigned int edge_reset_count = 0;
 __device__ RhoPoint_dev* edge_states_dev = nullptr;  // 每槽当前点 (total_points 份)
 __device__ uint64_t* edge_src_dev = nullptr;         // 每槽当前起点索引
 __device__ RhoPoint_dev* edge_starts_dev = nullptr;  // 起点池 (edge_pool_size 份)
@@ -1576,52 +1604,77 @@ __device__ unsigned long long g_validate_fail = 0;
         }                                                                       \
     } while (0)
 
-// 添加 DP / 边到缓冲区 (设备端)。
+// 添加一条 DP / 边到缓冲区 (设备端)。**只记账, 不动 walker 的状态**。
 //
-// EDGE=false (生产路径): 记 (终点 d, m, n), 然后换预备队点 RhoStates_reserve[index]。
-//   index 同时就是这条 DP 记录的下标 —— 主机侧的账本正是靠这一点知道"这一轮槽位
-//   index 被征调了" (见 rho.cpp 的 note_reserve_dps)。
-// EDGE=true (起点漫游路径): 多记一个起点索引 (slot 槽当前用的那个), 并把 slot 换到
-//   起点池的第 index 个新起点; 池位取空 (空槽) 时槽位标成 EDGE_SRC_NONE, 该 walker
-//   之后仍然记账, 只是记录的 src 列写成哨兵 (追溯不到来源)。slot 是 walker 槽号
-//   (idx*W + k) —— 设备侧本来不知道自己的槽号,
-//   所以必须由调用方 (内核) 在命中当场传进来。
+// EDGE=false (生产路径): 记 (终点 d, m, n) 到 dp_device_buffer。
+// EDGE=true (起点漫游路径): 多记一个起点索引到 src 列, 取值由 on_chain 决定:
+//   on_chain = true  -> 该 walker 当前手上的起点 (edge_src_dev[slot])
+//   on_chain = false -> EDGE_SRC_NONE (落盘写成 2^64-1)
+//   后者用于 GLV 的 dp[1]/dp[2] (beta*p / beta^2*p): 那两个点**不在**
+//   "库里的起点 + 一步接一步走" 这条链上, 谁也追不到来源。拿 walker 自己的
+//   起点去填就是撒谎 —— 离线拿那个起点重走一遍也走不到这个点。
+//   slot 是 walker 槽号 (idx*W + k) —— 设备侧本来不知道怎么给自己编号, 必须由
+//   调用方 (内核) 传进来。
 //
 // BufT 由实参推出 (DpBuffer / EdgeBuffer), 两条路只有这一个函数。
+// (m, n) 是**命中那个代表自己的**, 由调用方算好传进 (见 glv_scale_point)。
+//
+// 为什么不再兼任"换起点": 以前靠一个 reset 形参把两件事绑在一起, 是因为记录
+// 下标与预备队槽位共用同一个 atomicAdd 计数。现在两者各有各的计数器
+// (dp_buffer_count / dp_reset_count 与 edge_buffer_count / edge_reset_count),
+// 绑在一起只剩下"传进来的 r 被原地改写"这个副作用 —— 拆到 reset_start_point
+// 之后本函数对 r 是纯读, 调用方也不必再为了保侧拷贝临时点。
 template <bool EDGE = false, typename BufT>
-__device__ void add_dp_to_buffer(uint64_t d, RhoPoint_dev& r,
+__device__ void add_dp_to_buffer(uint64_t d, const RhoPoint_dev& r,
                                  BufT* buffer, unsigned int max_size,
-                                 unsigned int slot = 0)
+                                 unsigned int slot = 0, bool on_chain = true)
 {
-    // 原子递增获取缓冲区位置 (两条路各数各的)
+    // 原子递增获取缓冲区位置 (两条路各数各的) —— 这是**记录**下标
     unsigned int* counter = EDGE ? &edge_buffer_count : &dp_buffer_count;
     unsigned int index = atomicAdd(counter, 1);
 
     // 调用方保证不越界 —— 缓冲容量与余量两边**各算各的**, 不要照抄:
     //   生产 (EDGE=false): 容量 dp_buffer_size (110), 上限 dp_buffer_size - 20 (90),
-    //                      余量 20 档; 40 位判据的窗口期望只有 0.09 条 (376,832 states)。
-    //   漫游 (EDGE=true) : 容量 edge_pool_size (154), 上限 edge_max_edges (90),
-    //                      余量 edge_window_slack (64 档); 32 位判据的窗口期望 23 条。
+    //                      余量 20 档; 40 位判据 x3 代表后窗口期望 0.27 条。
+    //   漫游 (EDGE=true) : 容量 edge_pool_size (234), 上限 edge_max_edges (90),
+    //                      余量 edge_window_slack (144 档); 32 位 x3 后期望 69 条。
     //   index 由 atomicAdd 取, 可以越过 max_size (break_flag 要等内核走到下一个检查点
     //   才被看到), 越出的那些就是靠上面的余量接住的; 越出余量 = 越界写。
     buffer[index].d = d;
     transfer(buffer[index].sp.m , (const unsigned char*)&r.m);
     transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
-
     if constexpr (EDGE) {
-        // 记下"这条边从哪个 32 位 DP 出发的", 再换下一个起点。
-        // 空槽 (库见底) 的池位里放的是主机现生成的随机点 (见 dp32_edge_session 铺池),
-        // 换过去就是一条独立轨迹; src 那一列照旧写哨兵 = 追溯不到来源。
-        buffer[index].src = edge_src_dev[slot];
-        r = edge_starts_dev[index];
-        edge_src_dev[slot] = edge_starts_src_dev[index];
-    } else {
-        // 记录完就走预备队: 这条 walker 由槽位 index 对应的替补点顶上
-        r = RhoStates_reserve[index];
+        // 记下"这条边从哪个 32 位 DP 出发的"。空槽 (库见底) 的池位里放的是主机
+        // 现生成的随机点 (见 dp32_edge_session 铺池), 换过去就是一条独立轨迹;
+        // src 那一列照旧写哨兵 = 追溯不到来源。
+        // on_chain = false (GLV 的 beta*p / beta^2*p 记录) 也写哨兵: 那两个点不在
+        // 从起点出发的那条链上, 见函数头注释。
+        buffer[index].src = on_chain ? edge_src_dev[slot] : EDGE_SRC_NONE;
     }
 
     if (*counter >= max_size)
         *break_flag_dev = true;
+}
+
+// 换起点: 把 r 换成下一份独立起点。**只在这条 walker 自己 (dp[0]) 命中时调用** ——
+// GLV 之后一步可能写 3 条记录, 但 beta*p / beta^2*p 命中的那两条只记账、不换起点,
+// 所以游走动力学与 GLV 之前完全一致 (walker 存活时间不变)。
+//
+// 槽位号取的是**换起点次数** (dp_reset_count / edge_reset_count), 与记录下标无关:
+// 一条 walker 一次命中可能产生 1~3 条记录, 但只消费一个池位。
+// EDGE=true 时顺带把槽位手上的库索引换成新池位带过来的那个 (src 列靠它溯源)。
+template <bool EDGE = false>
+__device__ void reset_start_point(RhoPoint_dev& r, unsigned int slot = 0)
+{
+    if constexpr (EDGE) {
+        const unsigned int pi = atomicAdd(&edge_reset_count, 1u);
+        r = edge_starts_dev[pi];
+        edge_src_dev[slot] = edge_starts_src_dev[pi];
+    } else {
+        // 这条 walker 由第 pi 个替补点顶上 (pi 是"换起点次数", 与记录下标无关)
+        const unsigned int pi = atomicAdd(&dp_reset_count, 1u);
+        r = RhoStates_reserve[pi];
+    }
 }
 
 // 初始化break_flag内存
@@ -1695,15 +1748,19 @@ public:
     {
         unsigned int zero = 0;
         CHECK_CUDA(cudaMemcpyToSymbol(dp_buffer_count, &zero, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemcpyToSymbol(dp_reset_count, &zero, sizeof(unsigned int)));
     }
 
-    // 从设备复制 DP 到主机并保存。返回这一轮的**记录条数** —— 预备队账本要用它
-    // 记账 (记录下标 = 被征调的槽位, 见 rho.cpp 的 note_reserve_dps)。
+    // 从设备复制 DP 到主机并保存。返回这一轮的**记录条数** (性能对账用)。
+    // 预备队账本要用的是 last_reset_count() —— GLV 之后记录条数 != 换起点次数。
     unsigned int save_dps()
     {
-        // 获取当前缓冲区计数
-        unsigned int current_count;
+        // 获取当前缓冲区计数 + 换起点次数
+        unsigned int current_count = 0;
+        unsigned int current_resets = 0;
         CHECK_CUDA(cudaMemcpyFromSymbol(&current_count, dp_buffer_count, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemcpyFromSymbol(&current_resets, dp_reset_count, sizeof(unsigned int)));
+        m_last_resets = current_resets;
 
         if (current_count != 0) {
             // 复制数据到主机
@@ -1722,14 +1779,24 @@ public:
             unsigned int zero = 0;
             CHECK_CUDA(cudaMemcpyToSymbol(dp_buffer_count, &zero, sizeof(unsigned int)));
         }
+        // 换起点计数每轮都要清 (即使这一轮没有记录, 计数也可能是非 0)
+        {
+            unsigned int zero = 0;
+            CHECK_CUDA(cudaMemcpyToSymbol(dp_reset_count, &zero, sizeof(unsigned int)));
+        }
 
-        std::cout << get_time() << " : saved " << current_count << " dp." << std::endl;
+        std::cout << get_time() << " : saved " << current_count << " dp ("
+                  << current_resets << " start resets)." << std::endl;
         return current_count;
     }
+
+    // 上一轮实际换起点的次数 (= 被征调的预备队槽位数)
+    unsigned int last_reset_count() const { return m_last_resets; }
 
 private:
     DpBuffer* m_dp_device_buffer = nullptr;
     size_t buffer_size;
+    unsigned int m_last_resets = 0;
 };
 
 // 起点漫游的边缓冲管理器 —— 与 DpManager 同构, 只是落到 D:\Dp32Edge.txt,
@@ -1754,11 +1821,13 @@ public:
     {
         unsigned int zero = 0;
         CHECK_CUDA(cudaMemcpyToSymbol(edge_buffer_count, &zero, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemcpyToSymbol(edge_reset_count, &zero, sizeof(unsigned int)));
     }
 
-    // 取回这一轮的边并追加落盘。返回条数 —— 库游标要按它推进: 每条边恰好用掉起点池
-    // 的一个池位, 所以 cursor += n。池位 i 的起点是 library[cursor + i] 只在
-    // cursor + i < 库条数 时成立, 越界的池位是主机现生成的随机点 (src 写哨兵)。
+    // 取回这一轮的边并追加落盘。返回条数 (= 本轮边记录行数, 性能对账用)。
+    // ⚠ 库游标**不能**按它推进: GLV 之后 beta*p / beta^2*p 命中也记边但不换起点,
+    //   只有 last_resets() 才是"被用掉的池位数"。池位 i 的起点是 library[cursor + i]
+    //   只在 cursor + i < 库条数 时成立, 越界的池位是主机现生成的随机点 (src 写哨兵)。
     //
     // 落盘次序 (先边, 后状态) 是设计的一部分。两边各自代表什么:
     //   边文件   = 已经发生过的边 (事实), 一条行就是一条边; 其中起点列是哨兵的
@@ -1774,14 +1843,20 @@ public:
     {
         unsigned int current_count = 0;
         CHECK_CUDA(cudaMemcpyFromSymbol(&current_count, edge_buffer_count, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemcpyFromSymbol(&m_last_resets, edge_reset_count, sizeof(unsigned int)));
+        {
+            unsigned int zero = 0;
+            CHECK_CUDA(cudaMemcpyToSymbol(edge_reset_count, &zero, sizeof(unsigned int)));
+        }
 
         if (current_count != 0) {
             std::vector<EdgeBuffer> host_buffer(current_count);
             CHECK_CUDA(cudaMemcpy(host_buffer.data(), m_dev_buffer,
                                   current_count * sizeof(EdgeBuffer), cudaMemcpyDeviceToHost));
 
-            // 顺手数一下 src 是哨兵的边 (空槽 = 随机起点)。它不等于"本轮随机起点的个数":
-            // 一个随机起点没走到下一个 DP 就不会产生边, 所以这里数的是落盘的实际行数。
+            // 顺手数一下 src 是哨兵的边。⚠ **不是**"随机起点的个数": GLV 之后 βp / β²p
+            // 命中写的那两行也带哨兵 (它们不在从起点出发的那条链上), 所以这个数 =
+            // 空槽随机起点的边 + GLV 轨道代表的边。只用作日志, 不参与任何对账。
             m_last_src_none = 0;
             for (const auto& e : host_buffer) {
                 _saveEdge(e.src, e.d, e.sp);
@@ -1793,34 +1868,40 @@ public:
         }
 
         std::cout << get_time() << " : saved " << current_count << " edge."
-                  << (m_last_src_none != 0 ? " (" + std::to_string(m_last_src_none) + " from random starts)" : "")
+                  << (m_last_src_none != 0 ? " (" + std::to_string(m_last_src_none) + " with untraceable src)" : "")
                   << std::endl;
         return current_count;
     }
 
-    // 上一次 save_edges() 里 src 是哨兵 (空槽/随机起点) 的边数
+    // 上一次 save_edges() 里 src 是哨兵 (不消耗库位置) 的边数 —— 含空槽随机起点与
+    // GLV 的 βp/β²p 两类, **不能**直接当成"随机起点个数"读。
     unsigned int last_src_none() const { return m_last_src_none; }
+
+    // 上一次 save_edges() 里实际换起点的次数 = 消耗的池位数 (= 库游标推进量)
+    unsigned int last_resets() const { return m_last_resets; }
 
 private:
     EdgeBuffer* m_dev_buffer = nullptr;
     unsigned int m_last_src_none = 0;
+    unsigned int m_last_resets = 0;
 };
 
 // 边表的行数统计 —— 只用于对账与报告 (每次收工时报"本次新增多少条边", 以及
 // 与状态文件推出的游标互校)。**必须分两个口径数**, 不能只数总行数:
-//   真实边 real     起点列 != EDGE_SRC_NONE, 即真被派发出去的库位置, 恒 <= 库条数
-//   随机边 random_  起点列 == EDGE_SRC_NONE, 即空槽随机起点命中的边, 不消耗库位置
-//   总行数 total    两者之和
-// 库游标只跟**真实边**对得上 —— 库见底之后随机起点的边会继续往表里加, 拿总行数去比
-// 游标就会误报"边文件比游标多, 状态被回滚"。
-// 另外真实边数也不等于游标: 启动补种发出去的号不记边, 所以
-//   真实边数 = 游标 - 累计补种数
+//   可追溯边 real    起点列 != EDGE_SRC_NONE, 即真被派发出去的库坐标走出来的边
+//                     (含 β 代表吗? 不含 —— β 代表一律写哨兵)。恒 <= 库条数
+//   不可追溯边 none  起点列 == EDGE_SRC_NONE: 空槽随机起点的边 + GLV 轨道代表的边
+//   总行数 total     两者之和 (GLV 后一步最多 3 行, 所以 total 可能远大于派发数)
+// 库游标只跟**real** 对得上 (且只能作上界校验): 库见底之后哨兵的边会继续往表里加,
+// 拿总行数去比游标就会误报"边文件比游标多, 状态被回滚"。
+// 另外 real 也不等于游标: 启动补种发出去的号不记边, 所以
+//   real <= 游标 - 累计补种数
 // 库游标的恢复口径在 dp32_edge_session (从状态文件的起点索引列取位置 + 1)。
 // 文件不存在 / 打不开都算 0 行。
 struct EdgeFileLines {
-    uint64_t total = 0;    // 总行数
-    uint64_t real = 0;     // 起点列是真实库索引的行数
-    uint64_t random_ = 0;  // 起点列是哨兵 (2^64-1) 的行数
+    uint64_t total = 0;    // 总行数 (= 边记录条数, GLV 后一步最多 3 条)
+    uint64_t real = 0;     // 起点列是真实库索引的行数 (可追溯)
+    uint64_t random_ = 0;  // 起点列是哨兵 (2^64-1) 的行数 = 空槽随机起点 + GLV 轨道代表
 };
 
 static EdgeFileLines count_edge_lines(const std::string& name)
@@ -1987,7 +2068,8 @@ __host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
 // ================== 多 walker 内核 ==================
 //
 // 每线程推进 W 个 walker, 每批一次批量求逆 (fun_add_w)。状态按
-// idx*W + k 交错存放。命中当场由 add_dp_to_buffer 原地换掉 state。
+// idx*W + k 交错存放。命中当场由 add_dp_to_buffer 记账、
+// reset_start_point 把 state 原地换掉 (两件事分开, 见各自的注释)。
 //
 // 判据与"换点"按 EDGE 编译期分档 (不用运行期标志 —— 热循环里连一个分支都不多):
 //   EDGE=false: 40 位判据 distinguishable   -> dp_device_buffer   + 预备队 RhoStates_reserve
@@ -2015,21 +2097,61 @@ __global__ void rho_w()
         count_rho ++;
 #pragma unroll
         for (int k = 0; k < W; ++k) {
-            const uint64_t d = EDGE ? distinguishable32(s[k].x.x) : distinguishable(s[k].x.x);
-            if (d != 0) {
-                if constexpr (EDGE) {
-                    // 空槽 (起点索引 = EDGE_SRC_NONE) 上的命中**也记账**。
-                    // 记录里的 src 列就是 EDGE_SRC_NONE, 落盘时写成 2^64-1 —— 含义是
-                    // "这个终点确实是 32 位 DP (m, n) 现算得出、索引对得上), 但追溯不到
-                    // 它是从库里的哪个起点走过来的"。丢掉它等于白丢一条可用的 DP 记录,
-                    // 而碰撞判定只关心终点那个 x, 不关心来源 —— 所以留着。
-                    // 空槽只在库见底 / 几何变大补不满时才出现, 是收尾期的事。
+            // GLV: 分别判定 p (dp[0])、beta*p (dp[1])、beta^2*p (dp[2])。
+            // 顺序很重要 —— 先记 dp[1]/dp[2], 最后记 dp[0] 并紧接着换起点,
+            // 这样三条记录拿到的都是**本次步进后**的同一个 (m, n)。
+            uint64_t dp[3];
+            if constexpr (EDGE) glv_dp_indices32(s[k].x.x, dp);
+            else                glv_dp_indices(s[k].x.x, dp);
+
+            // 记录里存的是**命中点自己**的 (m, n): 轨道代表 j 的系数是 lambda^j 乘
+            // 原来的 (m, n) (mod N)。缩放只在命中时做, 不在热路径上。
+            // 换起点只发生在 dp[0] —— 记账与换起点是两个独立的设备函数。
+            if constexpr (EDGE) {
+                const unsigned int slot = (unsigned int)(idx * W + k);
+                // 空槽 (起点索引 = EDGE_SRC_NONE) 上的命中**也记账**。
+                // 记录里的 src 列就是 EDGE_SRC_NONE, 落盘时写成 2^64-1 —— 含义是
+                // "这个终点确实是 32 位 DP (m, n) 现算得出、索引对得上), 但追溯不到
+                // 它是从库里的哪个起点走过来的"。丢掉它等于白丢一条可用的 DP 记录,
+                // 而碰撞判定只关心终点那个 x, 不关心来源 —— 所以留着。
+                //
+                // ⚠ dp[1]/dp[2] (beta*p / beta^2*p) 一律 on_chain=false ⇒ src 也写
+                //   EDGE_SRC_NONE。理由: 边表的语义是"从库里某个 32 位 DP 顺着
+                //   fun_add_w 走出来的下一个 32 位 DP", 而 beta^j*p 根本不在那条链上,
+                //   拿 walker 自己的起点去填, 离线按它重走一遍永远对不上。
+                if (dp[1]) {
                     count_dp++;
-                    add_dp_to_buffer<true>(d, s[k], edge_device_buffer, edge_max_edges,
-                                           (unsigned int)(idx * W + k));
-                } else {
+                    add_dp_to_buffer<true>(dp[1], glv_scale_point(s[k], 1),
+                                           edge_device_buffer, edge_max_edges, slot,
+                                           /*on_chain=*/false);
+                }
+                if (dp[2]) {
                     count_dp++;
-                    add_dp_to_buffer(d, s[k], dp_device_buffer, dp_buffer_size - 20);
+                    add_dp_to_buffer<true>(dp[2], glv_scale_point(s[k], 2),
+                                           edge_device_buffer, edge_max_edges, slot,
+                                           /*on_chain=*/false);
+                }
+                if (dp[0]) {
+                    count_dp++;
+                    add_dp_to_buffer<true>(dp[0], s[k], edge_device_buffer, edge_max_edges,
+                                           slot);
+                    reset_start_point<true>(s[k], slot);
+                }
+            } else {
+                if (dp[1]) {
+                    count_dp++;
+                    add_dp_to_buffer(dp[1], glv_scale_point(s[k], 1),
+                                     dp_device_buffer, dp_buffer_size - 20);
+                }
+                if (dp[2]) {
+                    count_dp++;
+                    add_dp_to_buffer(dp[2], glv_scale_point(s[k], 2),
+                                     dp_device_buffer, dp_buffer_size - 20);
+                }
+                if (dp[0]) {
+                    count_dp++;
+                    add_dp_to_buffer(dp[0], s[k], dp_device_buffer, dp_buffer_size - 20);
+                    reset_start_point(s[k]);
                 }
             }
         }
@@ -2131,7 +2253,7 @@ void init_adds_pub_dev()
 // 预备队: 设备侧只需要这份常量内存
 //
 // 一个 walker 命中可区分点时, 用 RhoStates_reserve 里对应槽位的一份独立点把它的
-// (x, m, n) 整体顶替掉 (见 add_dp_to_buffer), 让它从这份新起点继续走。
+// (x, m, n) 整体顶替掉 (见 reset_start_point), 让它从这份新起点继续走。
 //
 // 池里放什么点 (来源与账本) 全在 rpc/rho.cpp —— 那是纯主机侧的逻辑, 不需要一行
 // CUDA 代码; 设备端只负责收下这一块常量内存。上传走下面这个函数 (唯一的跨 TU 接口),
@@ -2312,9 +2434,10 @@ void save_RhoStates_dev(int total_points, const std::string& name)
 //
 // 要验的一件事: 被征召的那几个预备点, 之后的轨迹到底有没有落在 RhoState2.txt 里。
 //
-// 设备侧的语义 (见 add_dp_to_buffer): 某条 walker 命中 40 位可区分点时, 它的 (x, m, n)
-// 被整体换成 RhoStates_reserve[index] 里那份独立点 (index = 这条 DP 记录的下标); 换完
-// 这条 walker 继续用同一个步进算法往前走, 到轮末由 save_RhoStates_dev 整体落盘。于是:
+// 设备侧的语义 (见 reset_start_point): 某条 walker 命中 40 位可区分点时, 它的
+// (x, m, n) 被整体换成 RhoStates_reserve[pi] 里那份独立点 (pi = 换起点计数, 不是
+// DP 记录下标 —— GLV 之后一步可能记 3 条, 但只换一次起点); 换完这条 walker 继续用
+// 同一个步进算法往前走, 到轮末由 save_RhoStates_dev 整体落盘。于是:
 //
 //   被征召的那份起点 P, 沿 fun_add_w 往前走的轨迹上**必有** RhoState2.txt 里的一条
 //   记录 (= 某一轮轮末的落盘状态) —— 前提是这条 walker 之后再没被换过 (又被征召)。
@@ -2592,7 +2715,7 @@ void rho_rewalk_probe()
                 continue;
             }
             if (distinguishable(s[k].x.x) != 0) {
-                // 真实 walker 走到这里会被 add_dp_to_buffer 再换一次起点, 轨迹断掉,
+                // 真实 walker 走到这里会被 reset_start_point 再换一次起点, 轨迹断掉,
                 // 再往下走就跟生产轨迹不是同一条了 —— 如实报出来, 别冒充"没命中"。
                 out[k].replaced = true;
                 out[k].replaced_step = i;
@@ -2661,8 +2784,9 @@ void init_RhoStates_test(int total_points)
         rho_F(ctx, r);
     }
     // 尾槽 (total_points-1) 是独立填充点, 不接在链上, 专门作 DP 判据的被测样点。
-    // m/n 取自 D:\DistinguishablePoints.txt 的记录 (见 RHO_DP_TEST_*), 所以这个
-    // 点在新判据下确实是可区分点, 其索引必须等于 RHO_DP_TEST_IDX。
+    // m/n 取自 D:\DistinguishablePoints.txt 的记录 (见 RHO_DP_TEST_*): 它自己的 x
+    // 低 40 位为 0, 索引 = RHO_DP_TEST_IDX; 它的 beta*x / beta^2*x 不满足判据。
+    // validate_point_add 末尾会同时核对单点判据与 GLV 三元组。
     set_int256(r.m, RHO_DP_TEST_M);
     set_int256(r.n, RHO_DP_TEST_N);
     create(ctx, &r.x, r.m, r.n);
@@ -2682,8 +2806,8 @@ void init_RhoStates_test(int total_points)
 //   edge_src_dev[total_points]      每槽当前起点索引 (EDGE_SRC_NONE = 空槽)
 //   edge_starts_dev[edge_pool_size] 起点池: 池位 i 就是 library[cursor + i]
 //   edge_starts_src_dev[edge_pool_size]  池位 -> 库索引
-//   edge_device_buffer[edge_pool_size]   本轮的边 (容量 154, 每轮上限 90 = edge_max_edges,
-//                                   差的 64 档是断流窗口余量, 推导见 edge_window_slack)
+//   edge_device_buffer[edge_pool_size]   本轮的边 (容量 234, 每轮上限 90 = edge_max_edges,
+//                                   差的 144 档是断流窗口余量, 推导见 edge_window_slack)
 //
 // 状态文件规模随 W 线性涨 (W=32 时 376,832 条 = 1,507,328 行 / ~105 MB), 每轮整份重写,
 // 所以这里必须走 save_RhoStates_dev_fast (并行格式化 + 大块 write, 实测 ~1.5 s);
@@ -2780,7 +2904,8 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     // 位置的槽在那一轮里不会再把它换掉), 于是
     //     游标 = (max(活槽起点索引) 在库里的位置) + 1
     // 是精确值, 不必额外存一份游标。(拿行数当游标会恒差一个"启动补种数": 补种发的号
-    // 不会记成边 —— 真实起点边数 = 游标 - 补种数; 随机起点的边也不进这个式子。)
+    // 不会记成边 —— 可追溯起点的边数 <= 游标 - 补种数, 只能当上界用; 而且 GLV 之后
+    // 一次派发最多写 3 行、其中 β 那两行带哨兵, 行数跟派发数根本不是一回事。)
     //
     // 这里必须把**索引换算成位置**: 索引值是 x 的 bit 32..95, 能到 9e17, 直接拿它当游标
     // 会一步冲过 lib_total 被下面的兜底夹住, 之后每轮铺池取 library[lib_total + i] 全是
@@ -2827,20 +2952,21 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
             }
         }
     }
-    // 边表对账只拿**真实起点**的边比游标: 随机起点 (哨兵 src) 的边不消耗库位置,
-    // 库见底之后会继续往表里加, 混进来就会误报"状态被回滚"。
+    // 边表对账只拿**可追溯起点**的边比游标: 哨兵 src 的边 (空槽随机起点 + GLV 轨道
+    // 代表) 不消耗库位置, 库见底之后会继续往表里加, 混进来就会误报"状态被回滚"。
     const EdgeFileLines elines = count_edge_lines(DP32_EDGE_FILE);
     if (got == 0 && elines.total != 0) {
         // 状态没了而边还在: 只能从头重发 (会重复走掉已经走过的号, 但绝不会漏号)。
-        cprintf("%s : %s 无记录但 %s 已有 %llu 行 (真实起点 %llu / 随机起点 %llu), "
+        cprintf("%s : %s 无记录但 %s 已有 %llu 行 (可追溯起点 %llu / 哨兵 %llu), "
                 "游标从 0 重发 (会重复走)\n",
                 get_time().c_str(), DP32_EDGE_STATE_FILE, DP32_EDGE_FILE,
                 (unsigned long long)elines.total, (unsigned long long)elines.real,
                 (unsigned long long)elines.random_);
     } else if (elines.real > cursor) {
-        // 真实起点边数只可能 <= 派发数 (每条真实边 = 一次派发, 补种不记边)。真超了就是
-        // 状态被回滚过: 叫一声, 仍按状态口径走 —— 宁可重复, 不可漏号。
-        cprintf("%s : 边文件真实起点边 %llu 条 > 状态推出的游标 %llu, 状态似被回滚, 按状态走\n",
+        // 可追溯起点的边数只能 <= 派发数 (当一次的派发最多对应 j = 0 那一行;
+        // β 代表的两行带哨兵, 不计入 real)。真超了就是状态被回滚过: 叫一声,
+        // 仍按状态口径走 —— 宁可重复, 不可漏号。
+        cprintf("%s : 边文件可追溯起点的边 %llu 条 > 状态推出的游标 %llu, 状态似被回滚, 按状态走\n",
                 get_time().c_str(), (unsigned long long)elines.real, (unsigned long long)cursor);
     }
     // 兜底: 上面按"库内位置 + 1"算, 结构上不可能越界; 留着防的是以后有人改了恢复口径。
@@ -2892,7 +3018,7 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
 
     uint64_t round_no = 0;
     uint64_t total_edges = 0;   // 累计记下的边数 (= 边文件新增的行数; 游标不是这个数)
-    uint64_t total_rand_starts = 0;  // 累计 src 写哨兵的边数 (= 来自随机起点的边)
+    uint64_t total_rand_starts = 0;  // 累计 src 写哨兵的边数 (= 空槽随机起点 + GLV 轨道代表)
     if (alive == 0) {
         // 库已见底且所有槽都已退役 —— 这是"跑完了"的重启态, 不要再空转一整轮 (半小时)。
         // 停机按"还有没有活槽"判, 不看命中数: 没有活槽就不再有派发, 边表停在这里。
@@ -2907,8 +3033,8 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         // 所以下一轮的窗口是 library[cursor + n ...], 上一轮没用到的池位会被重新列出。
         // 库已经见底的那些池位用 RhoPoint::rand() 补 (空槽: 走、命中照记, src 写哨兵)。
         // 每轮重新生成, 不复用上一轮的点。
-        // 实际产生多少条"随机起点"的边由 EdgeManager::last_src_none() 数 (池位可能没走到
-        // 下一个 DP, 那就不产生边)。
+        // 实际产生多少条"哨兵 src"的边由 EdgeManager::last_src_none() 数 (池位可能没走到
+        // 下一个 DP, 那就不产生边; 另外 GLV 的 βp/β²p 那两行也带哨兵, 一并算进去)。
         for (size_t i = 0; i < edge_pool_size; i++) {
             RhoPoint p;
             uint64_t idx = 0;
@@ -2936,12 +3062,12 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         const unsigned int edges = edge_manager.save_edges();
         total_edges += edges;
         total_rand_starts += (uint64_t)edge_manager.last_src_none();
-        // 游标按"被用掉的池位数"推进: 每条记录恰好占一个池位, 池位 i 的起点是
-        // library[cursor + i] —— 所以 cursor += edges 与记录里带不带 src 无关。
-        // 库见底之后那些池位是主机现生成的随机点, cursor 会因此越过 lib_total;
-        // 那只是计数偏高, 不影响正确性 (真实池位始终是 cursor 之前那一段连续的 0..n-1),
-        // 收工报告时按库条数夹一下 (见函数末尾的 cursor_lib)。
-        cursor += edges;
+        // 游标按"被用掉的池位数"推进 —— 也就是**换起点的次数**, 不是边记录条数:
+        // GLV 之后 beta*p / beta^2*p 命中也各记一条边, 但那两条不换起点、不消费池位。
+        // 池位 i 的起点是 library[cursor + i]; 库见底之后那些池位是主机现生成的
+        // 随机点, cursor 会因此越过 lib_total —— 那只是计数偏高, 不影响正确性
+        // (真实池位始终是 cursor 之前那一段连续的 0..n-1), 收工报告时按库条数夹一下。
+        cursor += edge_manager.last_resets();
 
         unsigned long long batches = 0;
         CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
@@ -2991,7 +3117,8 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     // 被用掉的池位数往前推, 会涨到 lib_total + 随机起点边数 —— 打出来就是超过 100%
     // 的假进度。真实派发进度恒 <= 库条数。
     const uint64_t cursor_lib = (cursor < lib_total) ? cursor : lib_total;
-    cprintf("%s : dp32 起点漫游结束: 本次新增 %llu 条边 (其中 %llu 条来自随机起点), "
+    cprintf("%s : dp32 起点漫游结束: 本次新增 %llu 条边 (其中 %llu 条 src 不可追溯: "
+            "空槽随机起点 + GLV 轨道代表), "
             "游标 %llu/%llu, 活槽 %llu/%d\n",
             get_time().c_str(), (unsigned long long)total_edges,
             (unsigned long long)total_rand_starts,
@@ -3058,9 +3185,11 @@ static void rho_play_impl()
             // 等待核函数完成
             CHECK_CUDA(cudaDeviceSynchronize());
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            // 把这一轮的 40 位 DP 条数喂给账本 (记录下标 = 被征调的槽位), 然后落盘
+            // 把这一轮**换起点的次数**喂给账本 (记录条数不等于征调槽位数), 然后落盘
             const unsigned int hits = dp_manager.save_dps();
-            note_reserve_dps(hits);
+            // GLV 之后每条记录不一定消费预备队槽位 —— 只有"p 自己命中"的那几条
+            // 才换了起点, 所以账本按换起点次数记账, 不能按记录条数。
+            note_reserve_dps(dp_manager.last_reset_count());
             unsigned long long batches = 0;
             CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
             accum_round_rate("rho", round_no++, secs, batches, total_points, W, gridSize, blockSize, hits);
@@ -3169,7 +3298,7 @@ __global__ void validate_point_add()
 
     // 测试1.1: G+(-G)
     AffinePoint res_1G;
-    uint256_t _y = mod_sub({0}, G.y);
+    uint256_t _y = mod_sub_p({0}, G.y);
     res_1G.x = G.x;
     res_1G.y = _y;
     res_1G.infinity = false;
@@ -3217,9 +3346,10 @@ __global__ void validate_point_add()
                 DEV_ASSERT(!u256_equal(expect[i].x.x, expect[j].x.x));
     }
 
-    //测试 distinguishable: 低 40 位全 0 才构成 DP, 索引取随后的 64 位 (bit 40..103)。
-    // 构造值先卡住索引拼接的三段边界: bit 40..63 (limb[1]>>8),
-    // bit 64..95 (limb[2]<<24), bit 96..103 ((limb[3]&0xFF)<<56)。
+    //测试 distinguishable: x 自己的低 40 位全 0 才构成 DP, 索引取随后的 64 位
+    // (bit 40..103)。下面各条钉住索引拼接的三段边界:
+    // bit 40..63 (limb[1]>>8), bit 64..95 (limb[2]<<24),
+    // bit 96..103 ((limb[3]&0xFF)<<56)。
     {
         uint256_t v = {{0}};
         DEV_ASSERT(distinguishable(v) == 0);   // 索引 0 与"非 DP"同值
@@ -3227,15 +3357,29 @@ __global__ void validate_point_add()
         DEV_ASSERT(distinguishable(v) == 1);   // 索引 = x 的 bit 40 = 1
         v.limb[3] = 0x000000ABu;               // x 的 bit 96..103
         DEV_ASSERT(distinguishable(v) == (1ULL | (0xABULL << 56)));
+        v.limb[2] = 0x12345678u;               // x 的 bit 64..95 (limb[2] 整段)
+        DEV_ASSERT(distinguishable(v) ==
+                   (1ULL | (0x12345678ULL << 24) | (0xABULL << 56)));
+        v.limb[2] = 0;
         v.limb[1] = 0x00000101u;               // x 的 bit 32 置位 -> 低 40 位非 0
         DEV_ASSERT(distinguishable(v) == 0);
         DEV_ASSERT(distinguishable(RhoStates_dev[0].x.x) == 0);
     }
 
-    // 真实数据正例: 尾槽 (RHOSTATES_TEST_NUM) 是 init_RhoStates_test 按 40 位判据
-    // 从 D:\DistinguishablePoints.txt 填入的可区分点, 索引应与文件记录逐位相符。
-    // (limb[2] 非 0, 补上上面构造值没覆盖到的那段拼接)
+    // 尾槽 (RHOSTATES_TEST_NUM) 是 init_RhoStates_test 从
+    // D:\DistinguishablePoints.txt 填入的历史样点: 它自己的 x 低 40 位为 0, 所以
+    // 按 distinguishable (单点口径) 仍是 40 位 DP, 索引与文件记录逐位相符。
     DEV_ASSERT(distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x.x) == RHO_DP_TEST_IDX);
+
+    // GLV 三元组: 这个样点的 beta*x / beta^2*x 都不满足判据 (离线算过), 所以
+    // dp[0] 命中、dp[1]/dp[2] 为 0 —— 正好覆盖"三个代表独立判定"这条分支。
+    {
+        uint64_t dp[3];
+        glv_dp_indices(RhoStates_dev[RHOSTATES_TEST_NUM].x.x, dp);
+        DEV_ASSERT(dp[0] == RHO_DP_TEST_IDX);
+        DEV_ASSERT(dp[1] == 0);
+        DEV_ASSERT(dp[2] == 0);
+    }
 
     DEV_ASSERT(*break_flag_dev == true);
 }
@@ -3253,13 +3397,16 @@ __global__ void validate_multi()
 
     // DP 缓冲测试: 往缓冲区写 RHODP_TEST_NUM 条记录以验证溢出/break 路径。
     // 索引用尾点的真实索引 (RHO_DP_TEST_IDX), 与尾点自洽。
-    // 必须传尾点的**局部副本**: add_dp_to_buffer 会把传入的点换成 RhoStates_reserve,
-    // 直接传 RhoStates_dev[RHOSTATES_TEST_NUM] 会把尾点改掉, 而 validate_point_add
-    // 还要用尾点做 DP 判据检查 (本内核排在 validate_point_add 之前跑)。
+    // add_dp_to_buffer 现在对点是纯读 (换起点已拆到 reset_start_point), 所以直接传
+    // 尾点也不会改它; 但这里仍然用局部副本, 免得以后又往记账里加写回时把尾点弄脏
+    // (validate_point_add 还要用尾点做 DP 判据检查, 本内核排在它之前跑)。
+    // 换起点那条路也顺带跑一遍: 改的是副本, 同时消费 dp_reset_count、读
+    // RhoStates_reserve[pi] —— 这两件事本身也要有覆盖。
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx < RHODP_TEST_NUM) {
         RhoPoint_dev tail = RhoStates_dev[RHOSTATES_TEST_NUM];
         add_dp_to_buffer(RHO_DP_TEST_IDX, tail, dp_device_buffer, RHODP_TEST_NUM);
+        reset_start_point(tail);
     }
 }
 
@@ -3277,7 +3424,11 @@ __host__ __device__ uint64_t perf_fun_w(RhoPoint_dev* s, const RhoPoint_dev* add
     for (uint64_t i = 0; i < batches; ++i) {
         fun_add_w<W>(s, adds);
         for (int k = 0; k < W; ++k) {
-            if (distinguishable(s[k].x.x) != 0) count_dp++;
+            // 与生产核同口径: 三个代表各判一次, 命中就计数 (benchmark 的指令构成
+            // 必须与 rho_w 一致, 否则给出的参照值不可比)
+            uint64_t dp[3];
+            glv_dp_indices(s[k].x.x, dp);
+            count_dp += (dp[0] != 0) + (dp[1] != 0) + (dp[2] != 0);
         }
     }
     if (count_dp_out) *count_dp_out = count_dp;
@@ -3735,6 +3886,101 @@ static bool host_check_sqr_mod()
     return all_ok;
 }
 
+// ---------------------------------------------------------------------------
+// GLV 轨道自检
+//
+// 三层:
+//   1) 设备端常数代数: beta^3 == 1, beta != 1, beta^2 == -(beta+1);
+//   2) 设备端轨道轮换: (x, beta x, beta^2 x) 与 (beta x, beta^2 x, x) 的
+//      DP 索引三元组必须互为轮换 —— 即"对三个代表分别判定"这件事与从哪个代表
+//      出发无关;
+//   3) host/device 对拍: 设备端 glv_orbit_x (域乘 beta) 与 blockchain.cpp 的
+//      glv_orbit_x_host (记录 (m,n) 各乘 lambda^j 走群运算) 必须逐字节相同。
+//      只有这一层能同时钉死 beta 与 lambda 是一对。
+// ---------------------------------------------------------------------------
+__global__ void validate_glv()
+{
+    const uint256_t one = {{1}};
+    const uint256_t b2 = mul_mod(beta_p, beta_p);
+    DEV_ASSERT(u256_equal(mul_mod(b2, beta_p), one));            // beta^3 = 1
+    DEV_ASSERT(!u256_equal(beta_p, one));
+    DEV_ASSERT(!u256_equal(b2, one));
+    DEV_ASSERT(u256_equal(b2, mod_sub_p(uint256_t{{0}}, mod_add(beta_p, one, p))));
+
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint256_t x = sqr_mod_probe(tid);
+    uint256_t bx, b2x;
+    glv_orbit_x(x, &bx, &b2x);
+    DEV_ASSERT(u256_equal(b2x, mul_mod(b2, x)));   // -(beta+1) == beta^2
+
+    uint64_t ix[3], ib[3], ib2[3];
+    glv_dp_indices(x, ix);
+    glv_dp_indices(bx, ib);
+    glv_dp_indices(b2x, ib2);
+    // 从 beta*x 出发的三元组 = 从 x 出发的三元组左移一位
+    DEV_ASSERT(ib[0] == ix[1] && ib[1] == ix[2] && ib[2] == ix[0]);
+    DEV_ASSERT(ib2[0] == ix[2] && ib2[1] == ix[0] && ib2[2] == ix[1]);
+    // dp[0] 用的就是普通的单点判据
+    DEV_ASSERT(ix[0] == distinguishable(x));
+
+    // 群侧常数: lambda^3 = 1 (mod N), 1 + lambda + lambda^2 = 0 (mod N)
+    {
+        const uint256_t one_n = {{1}};
+        DEV_ASSERT(u256_equal(mul_mod_generic(lambda_n, lambda_n, N), lambda2_n));
+        DEV_ASSERT(u256_equal(mul_mod_generic(lambda2_n, lambda_n, N), one_n));
+        // ⚠ 别写成 mod_sub_p(0, lambda+1) 去验 λ²=N−1−λ: 它只有两个形参, 借位时加的是
+        //   **域素数 p** (点运算全在 mod p 下, 那个函数当初就是为它写的), 这里要 mod N。
+        //   改成加法形式 —— 1 + lambda + lambda^2 ≡ 0 (mod N) —— mod_add 带模数形参。
+        DEV_ASSERT(u256_equal(mod_add(mod_add(lambda_n, one_n, N), lambda2_n, N),
+                              uint256_t{{0}}));
+        DEV_ASSERT(!u256_equal(lambda_n, one_n));
+    }
+
+    // 记录缩放: j = 0 是恒等, 连做两次 j = 1 等于 j = 2 (即 lambda^2)
+    {
+        RhoPoint_dev s;
+        s.m = x;
+        s.n = bx;
+        const RhoPoint_dev s0 = glv_scale_point(s, 0);
+        const RhoPoint_dev s11 = glv_scale_point(glv_scale_point(s, 1), 1);
+        const RhoPoint_dev s2 = glv_scale_point(s, 2);
+        DEV_ASSERT(u256_equal(s0.m, s.m) && u256_equal(s0.n, s.n));
+        DEV_ASSERT(u256_equal(s11.m, s2.m) && u256_equal(s11.n, s2.n));
+        // 64 位链下标走同一套: lambda^0 * 1 = 1, lambda^1 * 1 = lambda
+        DEV_ASSERT(u256_equal(glv_scale_k64(1ULL, 0), one));
+        DEV_ASSERT(u256_equal(glv_scale_k64(1ULL, 1), lambda_n));
+        DEV_ASSERT(u256_equal(glv_scale_k64(1ULL, 2), lambda2_n));
+    }
+}
+
+// host 侧: beta / lambda 对拍 (三个代表的 x 必须逐字节相同)。
+static bool host_check_glv()
+{
+    bool all_ok = true;
+    for (unsigned int t = 0; t < 64; ++t) {
+        RhoPoint r;
+        r.rand();
+        RhoPoint_dev d;
+        d.from(r);
+        uint256_t dev[3];
+        glv_orbit_x(d.x.x, &dev[1], &dev[2]);
+        dev[0] = d.x.x;
+
+        unsigned char host[3][32];
+        glv_orbit_x_host(ctx, r, host);
+        // 逐代表对拍: dev[j] 就是 lambda^j * P 的 x
+        for (int j = 0; j < 3; ++j) {
+            // uint256_t 的 limb[0] 在前, 与 ge_storage (4x64 小端) 逐字节一致
+            if (memcmp(&dev[j], host[j], sizeof(host[j])) != 0) {
+                all_ok = false;
+                printf("  [glv case %u rep %d] host/device orbit MISMATCH\n", t, j);
+            }
+        }
+    }
+    printf("  glv orbit host/device: %s\n", all_ok ? "ok" : "FAILED");
+    return all_ok;
+}
+
 void validate_test()
 {
     enable_blocking_sync();
@@ -3769,6 +4015,17 @@ void validate_test()
     validate_sqr_mod<<<8, 256>>>();
     CHECK_CUDA(cudaDeviceSynchronize());
     stage_ok("validate_sqr_mod");
+
+    // GLV 轨道: beta 常数 + 三个代表不变性 + host/device 轨道对拍 + 记录缩放常数。
+    // host 那半用的是 lambda (群运算), device 这半用的是 beta (域乘), 两边必须给出
+    // 同一个轨道 (三个代表的 x 逐字节相同) —— 这是"记录里的 (m,n) 与索引自洽"的前提。
+    if (!host_check_glv()) {
+        printf("validate FAILED: host_check_glv\n");
+        exit(EXIT_FAILURE);
+    }
+    validate_glv<<<8, 256>>>();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    stage_ok("validate_glv");
 
     // 单 walker 步进 vs 链后继对拍 + DP 缓冲写入/溢出路径
     validate_multi<<<10, 256>>>();

@@ -98,9 +98,9 @@ void break_rho(bool value);
 void rho_play();
 // 定义在 rpc/cuda.cu (BUILD_BITCOIN_CUDA) 或 rpc/cuda_stub.cpp:
 // 32 位 DP 起点漫游。与 rho_play 跑同一个核 rho_w<W,EDGE>、同一份 fun_add_w /
-// add_dp_to_buffer, 区别只有编译期那一档: 判据换成 32 位, 命中后换的是"下一个
-// 起点"(取自 DpSource32all.bin) 而不是预备队, 每条边走出来的 (起点索引, 终点
-// 索引, m, n) 追加到 D:\Dp32Edge.txt, 状态落 D:\Dp32EdgeState.txt (文本)。
+// add_dp_to_buffer / reset_start_point, 区别只有编译期那一档: 判据换成 32 位, 命中后
+// 换的是"下一个起点"(取自 DpSource32all.bin) 而不是预备队, 每条边走出来的 (起点
+// 索引, 终点索引, m, n) 追加到 D:\Dp32Edge.txt, 状态落 D:\Dp32EdgeState.txt (文本)。
 void dp32_edge_play();
 void validate_test();
 void perf_test();
@@ -119,7 +119,7 @@ void rho_affine_prepare();
 // 预备队 (RhoStates_reserve) 的来源与账本
 //
 // 池子的唯一用途: 某个 walker 命中可区分点时, 用池里对应槽位的一份独立点把它的
-// (x, m, n) 整体顶替掉 (见 cuda.cu 的 add_dp_to_buffer), 让它从这份新起点继续走。
+// (x, m, n) 整体顶替掉 (见 cuda.cu 的 reset_start_point), 让它从这份新起点继续走。
 // 换起点跟"进环"无关 —— rho 的目标本来就是让轨迹走进环 (确定性步进 + 状态有限,
 // 轨迹迟早进环), 这里只是给这个 walker 另配一份起点。
 //
@@ -158,8 +158,9 @@ const char*   reserve_source_name(ReserveSource s);
 void init_reserve_pool(size_t slots, bool persistent = false);
 // 每轮开跑前调一次: 账本补员 (纯主机侧) + 把槽位上的点整块传进设备常量内存。
 void init_RhoStates_reserve();
-// 账本记账: 这一轮设备写出去 dp_count 条 DP 记录。记录下标 = 被征调的槽位
-// (add_dp_to_buffer 里 r = RhoStates_reserve[index], index 就是记录下标)。
+// 账本记账: 这一轮设备换起点了 dp_count 次 (注意不是**记录条数** —— GLV 之后一条
+// walker 一次命中可产生 1~3 条记录, 但只消费一个槽位; 设备端由 reset_start_point
+// 的独立计数器 dp_reset_count 数着, 主机用 DpManager::last_reset_count() 取)。
 void note_reserve_dps(unsigned int dp_count);
 // 把货源游标与账本落盘 (游标丢了 = 重启后重复用点, 所以每轮结束后都要落一次)。
 // 只在 init_reserve_pool(.., true) 之后有作用。
@@ -190,7 +191,7 @@ void validate_reserve_prod_config();
 // 一个预备点被征召时, 命中那条 walker 的 (x, m, n) 被整体换成这份点, 它从新起点接着
 // 走, 轮末由 save_RhoStates_dev 落盘。所以这份点的轨迹上**必有** RhoState2.txt 里的
 // 一条记录 (只要这条 walker 之后再没被换过)。这个探针拿已征召库尾部那几条点的原始
-// (m, n) 当起点, 用生产核同一套步进 (fun_add_w, W=4 批量求逆) 往前走, 每步拿 (m, n)
+// (m, n) 当起点, 用生产核同一套步进 (fun_add_w, W=RHO_GPU_WALKERS 批量求逆) 往前走, 每步拿 (m, n)
 // 去 RhoState2.txt 的 (m, n) 集合里查, 把"走了多少步 / 落在第几条"报出来。
 //
 // 只读: 不动设备内存, 不写任何文件, 不启动 play；不消耗/不修改两个 .bin 和账本。
@@ -201,7 +202,7 @@ void rho_rewalk_probe();
 //
 // 判据: "n 位可区分点" = x 的低 n 位全 0 (x.data 按字节小端存坐标, 见 cuda.cu):
 //   * 32 位判据: x 低 32 位全 0, 索引 = x 的 bit 32..95
-//   * 40 位判据: x 低 40 位全 0, 索引 = x 的 bit 40..103 (= distinguishable() 的返回值)
+//   * 40 位判据: x 低 40 位全 0, 索引 = x 的 bit 40..103 (= dp40_index_from_x 的返回值)
 // 源库 DpSource32.bin 是从 data 目录下的 DistinguishablePoints*.txt 语料合并来的
 // (那批语料是 32 位 DP), 合并由离线脚本完成 —— 与全量库 DpSource32all.bin 同一个,
 // 应用内已经没有重建入口。一个点被征召之后在源库**原地立墓碑** (m/n 清零, 槽位不
@@ -210,7 +211,7 @@ void rho_rewalk_probe();
 //
 // 两个库记的是**同一批点**: 源库里被立墓碑的那条, 就是已征召库里追加的那条。什么
 // 时候销这笔账: 拿这个点当起点的那份预备队员**被征召** (它那一记漫步走到 DL 端点,
-// 由 add_dp_to_buffer 换掉) 的时候 —— 见 rho.cpp 的 retire_dp_member。所以 3 类货源
+// 由 reset_start_point 换掉) 的时候 —— 见 rho.cpp 的 retire_dp_member。所以 3 类货源
 // 每被用掉一个, 源库就少一条活的、已征召库多一条, 两库之和不变。
 // 建库那一轮 (离线) 还写过一次已征召库: 语料里本身也是 40 位 DP 的那批不进源库,
 // 直接计入已征召库。运行期的写作口只剩预备点被征召销账这一个。
@@ -232,7 +233,10 @@ constexpr uint32_t    DP32_VERSION       = 1;
 // 方便直接翻看/核对:
 //   Dp32Edge.txt      一行一条边, 空格分隔: "起点索引 终点索引 终点m 终点n"
 //                     (起点索引 = 这条边是从哪个 32 位 DP 出发的, 用于跟踪)。
-//                     一行 = 一次库派发, 所以行数可以拿来跟游标互校。
+//                     ⚠ GLV 之后**一行 ≠ 一次库派发**: 一步同时判 p / βp / β²p 三个
+//                     代表, 最多写 3 行; 而且 β 那两行的起点列写哨兵 (见 cuda.cu 的
+//                     EDGE_SRC_NONE) ⇒ 行数**不能**拿来跟游标互校。能跟游标对上的只有
+//                     "起点列是真实库索引"的那几行, 且它们还需要 <= 游标 (上界校验)。
 //   Dp32EdgeState.txt 每槽 4 行: x / m / n / 起点索引, 与 RhoState 文本格式逐字一致
 //                     (第 4 行的 times 字段在这里被借用来存起点索引: 起点漫游不数
 //                     步数, 所以 times 空着, 直接拿来放索引, 就能白嫖
@@ -365,6 +369,14 @@ bool dp32_store_init();
 // blockchain.cpp)。3 类货源从源库取出记录后用它复核"这条记录确实是 32 位 DP"。
 bool dp32_test(const secp256k1_pubkey& pk, uint64_t& index);
 
+// GLV 三个轨道代表的 host 侧实现 (定义在 blockchain.cpp):
+// out[j] 是记录 (m, n) 乘 lambda^j 之后那个点的 32 字节 x (ge_storage 小端 4x64,
+// 与设备端 uint256_t 逐字节一致), j = 0/1/2。
+// lambda^3 = 1 (mod N); 群上是 phi(P) = lambda*P, 域上就是 x -> beta*x。
+// 设备端把这三个 x 分别送进 DP 判据 (cuda.cu 的 glv_orbit_x), 两边由 validate_glv
+// 逐字节对拍, 保证 beta 与 lambda 是同一个自同构。
+void glv_orbit_x_host(const secp256k1_context* ctx, const SecPair& sp, unsigned char out[3][32]);
+
 // 自测: 合成库的载入/查找/墓碑/同索引多桶 + 6 个坏库用例 + 真库抽样复算。
 // 定义在 blockchain.cpp (要对 x 全值复算, 需要 create)。由 validate_test() 调。
 void validate_dp32_store();
@@ -409,9 +421,10 @@ void validate_dp32_corpus(Dp32CorpusTarget target = Dp32CorpusTarget::TwoLib);
 // 于是按线程分工, 两个常量各自可调 (可用值 1/2/4/8/16/32):
 //   - 线程0 用 RHO_WALKERS0 = 2: 单链速度优先。模式1 (仅CPU单线程)
 //     也只有线程0, 同样是这个宽度;
-//   - 其余线程用 RHO_WALKERS = 16: 吞吐与资源的平衡点 —— W=32 只再快
-//     13%, 单链速度却再砍半, 且 1024/16 = 64 线程上限已覆盖全部运行模式
-//     (最多的模式4 也只要 hw-2 = 14)。
+//   - 其余线程用 RHO_WALKERS = 32: **实测吞吐最大的那一档** (4124k pts/s)。
+//     代价是单链速度衡了一半 (每链 ~129k 步/s) —— 这些线程本来就不看单链速度;
+//     资源上 1024 = 2 + 32 x 31 ⇒ 线程上限 32, 已覆盖全部运行模式 (最多的
+//     模式4 也只要 hw-2 = 14)。
 // ---------------------------------------------------------------------------
 
 // 已显式实例化的最大宽度 (rho.cpp 实例化了 1/2/4/8/16/32, 取别的值会链接失败)
@@ -419,8 +432,8 @@ constexpr int RHO_WALKERS_MAX = 32;
 
 // 线程0 的 walker 数 (单链速度优先, 见上)。
 constexpr int RHO_WALKERS0 = 2;
-// 其余线程的 walker 数 (总吞吐优先)。
-constexpr int RHO_WALKERS = 16;
+// 其余线程的 walker 数 (总吞吐优先, 取实测最大档)。
+constexpr int RHO_WALKERS = 32;
 static_assert(RHO_WALKERS0 >= 1 && RHO_WALKERS0 <= RHO_WALKERS_MAX, "RHO_WALKERS0 超出范围");
 static_assert(RHO_WALKERS >= 1 && RHO_WALKERS <= RHO_WALKERS_MAX, "RHO_WALKERS 超出范围");
 
@@ -494,6 +507,14 @@ void perf_test_rho_affine_walkers();
 //   prefix = "Kg40_" (use_mvp=false) / "Kmvp40_" (use_mvp=true)
 // 把 .state 删掉就从 k=0 重来。
 // 起点标签里的 '+' 在文件名里写成 '_', 例: 3mvp+7g -> D:\Kg40_3mvp_7g.txt。
+//
+// ⚠ GLV 之后 .txt 里的 k 是**命中那个点自己的**链系数, 不再是扫描位置:
+//     p        = k·Q            -> (k,        索引0)
+//     beta·p   = (lambda·k)·Q   -> (lambda·k, 索引1)
+//     beta²·p  = (lambda²·k)·Q  -> (lambda²·k, 索引2)
+// 后两个是 mod N 的 256 位数, 所以 k 列按十进制 256 位写, 而且**不递增**。
+// 只有 P0 = 无穷远时 P 才恰好等于 k·Q (beta^j·P 才还在这条链上), 起点非零时
+// 内核只记 j = 0。.state 的含义一个字没变: 仍是"已覆盖的扫描位置 k 上界"。
 
 // 起点 P0 / 基准点 Q: 65 字节非压缩编码 (0x04||x||y) + 无穷远点标记
 struct K40Start {
@@ -535,8 +556,9 @@ uint64_t k40_load_cursor(const std::string& file);
 bool k40_save_cursor(const std::string& file, uint64_t cursor, bool use_mvp);
 
 // DP 追加落盘: 第 i 条是 "ks[i] idxs[i]" (十进制, 每行一条)
+// ks 是字符串是因为 GLV 后同一个扫描位置可能产出 lambda^j·k (mod N) —— 256 位的数。
 bool k40_append_dps(const std::string& file, bool use_mvp, uint64_t a_mvp, uint64_t b_g,
-                    const std::vector<uint64_t>& ks, const std::vector<uint64_t>& idxs);
+                    const std::vector<std::string>& ks, const std::vector<uint64_t>& idxs);
 
 // 定义在 rpc/cuda_lab.cu: 跑 k40 (GPU)。非 CUDA 构建里 cuda_stub.cpp 有抛异常的桩。
 // use_mvp = false 扫 k·G, true 扫 k·MVP (基准点 Q 的选择, 见上)。

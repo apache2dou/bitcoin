@@ -113,15 +113,17 @@
 
 // 每线程 walker 数: 总吞吐优先, 取实测峰值 (见上)
 constexpr int K40_W = 32;
-// 单轮 DP 回读上限。2^-40 密度下, 一轮 ~2^20 批 x stride_k 个点期望命中不到 1 条,
-// 256 条是纯保险 (计数到上限就置 break_flag, 本轮提前收尾)。
+// 单轮 DP 回读上限。GLV 之后每步判三个轨道代表, 密度是 3 x 2^-40; 一轮
+// ~2^20 批 x stride_k 个点期望命中约 1 条, 256 条仍是纯保险 (计数到上限就置
+// break_flag, 本轮提前收尾)。
 constexpr unsigned int K40_DP_MAX = 256;
 // 设备缓冲容量 = 回读上限 + 20 档余量。口径与生产 add_dp_to_buffer 完全一致 (见
 // cuda.cu 的 edge_pool_size 那段): "计数到上限置起 break_flag" 到 "各线程走到下一个
 // 轮询点看到它" 之间还有一段窗口, 窗口里冒出来的命中照样会写缓冲 —— 这 20 档就是
-// 留给它们的, 少一档就是越界写。生产取 20 是按 32 位判据定的 (窗口期望 ~3 条命中,
-// Poisson(3) 冒到第 21 条的概率 ~1e-11); 本试验用 40 位判据, 密度是它的 1/256,
-// 同一窗口只期望 0.01 条, 照抄 20 档只会更宽。主机只回读前 K40_DP_MAX 条。
+// 留给它们的, 少一档就是越界写。本试验用 40 位判据, 窗口 = stride_k 个 walker
+// 各走 2^14 批, 三个代表全算也只有 376,832 x 2^14 x 3 / 2^40 ≈ 0.02 条,
+// Poisson(0.02) 冒到第 21 条的概率远小于 1e-30, 20 档绰绰有余。
+// 主机只回读前 K40_DP_MAX 条。
 constexpr unsigned int K40_DP_SLOTS = K40_DP_MAX + 20;
 // 每轮批数: 2^20 批 x stride_k ≈ 3.95e11 个 k (按 ~6e8 pts/s 估计约 11 分钟), 也就是
 // 落盘节奏 (~11 分钟一次)。想改只管改这个数, 别的都不用动。
@@ -141,8 +143,16 @@ __constant__ AffinePoint k40_stride_q;
 __device__ unsigned long long k40_min_done;
 // 本轮 DP 记录 (前 K40_DP_MAX 条有效, 再往后是窗口余量)
 __device__ unsigned int k40_dp_count;
-__device__ unsigned long long k40_dp_k[K40_DP_SLOTS];
+// 写入文件的 k: **命中代表自己的**链系数。
+//   j = 0 -> 扫描位置 k
+//   j > 0 -> lambda^j * k (mod N), 是 256 位, 所以文件那一列要按 256 位十进制写。
+// scan_k 是扫描位置 (64 位), 只用来做"本轮覆盖到哪"的过滤/去重, 不写进文件。
+__device__ uint256_t k40_dp_kv[K40_DP_SLOTS];
+__device__ unsigned long long k40_dp_scan_k[K40_DP_SLOTS];
 __device__ unsigned long long k40_dp_idx[K40_DP_SLOTS];
+// 允许记录哪些轨道代表 (bit j)。只有 P0 = 无穷远时 lambda^j*(k*Q) 仍在这条链上
+// (等于 (lambda^j k)*Q), 所以一般 P0 下主机只填 1 (只记 j = 0)。
+__constant__ int k40_orbit_mask = 1;
 
 // K40Start (65 字节非压缩, 大端) -> 设备端 AffinePoint。与 RhoPoint_dev::from
 // 的 x 部分完全一样: pubkey 字节 memcpy 进 uint256_t, limb[0] 自然落到低位字。
@@ -170,14 +180,48 @@ __device__ static void k40_add_affine(AffinePoint& P, const AffinePoint& Q)
 // 与生产 add_dp_to_buffer 同构 —— 原子取位置后**无条件写**, 不做边界判断:
 // 越界由 "计数到 K40_DP_MAX 就置 break_flag" + K40_DP_SLOTS 的 20 档余量一起兜住,
 // 和那边 "max_size + 20 档余量" 是同一套安排。
-__device__ static void k40_dp_record(unsigned long long k, unsigned long long idx)
+__device__ static void k40_dp_record(unsigned long long scan_k, const uint256_t& kv,
+                                     unsigned long long idx)
 {
     const unsigned int slot = atomicAdd(&k40_dp_count, 1u);
-    k40_dp_k[slot] = k;
+    k40_dp_scan_k[slot] = scan_k;
+    k40_dp_kv[slot] = kv;
     k40_dp_idx[slot] = idx;
     if (slot + 1 >= K40_DP_MAX) {
         *break_flag_dev = true;
     }
+}
+
+// 256 位 -> 十进制字符串 (主机侧, 只在落盘时用)。
+static std::string k40_u256_to_dec(const uint256_t& v)
+{
+    uint32_t t[8];
+    bool zero = true;
+    for (int i = 0; i < 8; ++i) {
+        t[i] = v.limb[i];
+        if (t[i] != 0) zero = false;
+    }
+    if (zero) return std::string("0");
+    std::string s;
+    while (!zero) {
+        uint64_t rem = 0;
+        for (int i = 7; i >= 0; --i) {
+            const uint64_t cur = (rem << 32) | t[i];
+            t[i] = (uint32_t)(cur / 10u);
+            rem = cur % 10u;
+        }
+        s.push_back((char)('0' + (int)rem));
+        zero = true;
+        for (int i = 0; i < 8; ++i) {
+            if (t[i] != 0) { zero = false; break; }
+        }
+    }
+    for (size_t i = 0, j = s.size() - 1; i < j; ++i, --j) {
+        const char c = s[i];
+        s[i] = s[j];
+        s[j] = c;
+    }
+    return s;
 }
 
 // 批量求逆: 同一线程 W 个 walker 同时加同一个点 Q。
@@ -237,10 +281,23 @@ __global__ void k40_scan(AffinePoint* states, unsigned long long cursor,
     while (done < n_batches) {
 #pragma unroll
         for (int k = 0; k < W; ++k) {
-            const unsigned long long idx = distinguishable(s[k].x);
-            if (idx != 0) {
-                k40_dp_record(cursor + m_first + (unsigned long long)k + done * stride_k, idx);
-            }
+            // GLV: p / beta*p / beta^2*p 各自判一次, 命中的各记一条。
+            // k40 是固定链, 没有"换起点"这一步 —— 三条记录都只是 (k', 索引)。
+            //
+            // ⚠ k' 是**命中代表自己的**系数, 不是扫描位置 k:
+            //   p        = k*Q          -> 记录 (k,        索引0)
+            //   beta*p   = (lambda k)*Q -> 记录 (lambda k, 索引1)
+            //   beta^2*p = (lambda^2 k)*Q -> 记录 (lambda^2 k, 索引2)
+            // 后两个是 256 位 (mod N), 所以按 uint256_t 记; 扫描位置另存一份
+            // (k40_dp_scan_k) 只用于"本轮覆盖到哪"的过滤。
+            // 只有 P0 = 无穷远时 P = k*Q 才成立, 所以主机按 P0 设 k40_orbit_mask。
+            uint64_t dp[3];
+            glv_dp_indices(s[k].x, dp);
+            const unsigned long long kk =
+                cursor + m_first + (unsigned long long)k + done * stride_k;
+            if (dp[0]) k40_dp_record(kk, glv_scale_k64(kk, 0), dp[0]);
+            if ((k40_orbit_mask & 2) && dp[1]) k40_dp_record(kk, glv_scale_k64(kk, 1), dp[1]);
+            if ((k40_orbit_mask & 4) && dp[2]) k40_dp_record(kk, glv_scale_k64(kk, 2), dp[2]);
         }
         if (done != 0 && (done & K40_POLL_MASK) == 0 && *break_flag_dev) break;
         k40_fun_add_q<W>(s, k40_stride_q);
@@ -283,6 +340,12 @@ void k40_play(const std::string& spec, bool use_mvp)
         return;
     }
     uint64_t cursor = k40_load_cursor(st_file);
+
+    // 轨道代表能不能记: P = P0 + k*Q, 只有 P0 = 无穷远时 P 才恰好是 k*Q,
+    // 这时 phi(P) = (lambda k)*Q 仍落在同一条链上, 记录的 (k' = lambda^j k, 索引)
+    // 才是自洽的。P0 非零时 beta^j*P 不在 k*Q 这条链上, 只能记 j = 0。
+    const int orbit_mask = (p0.infinity && (a_mvp == 0 && b_g == 0)) ? 7 : 1;
+    CHECK_CUDA(cudaMemcpyToSymbol(k40_orbit_mask, &orbit_mask, sizeof(orbit_mask)));
 
     enable_blocking_sync();
     int grid_size = 0, block_size = 0;
@@ -389,23 +452,27 @@ void k40_play(const std::string& spec, bool use_mvp)
 
         unsigned int kept = 0;
         if (ndp > 0) {
-            std::vector<unsigned long long> ks((size_t)ndp), idxs((size_t)ndp);
-            CHECK_CUDA(cudaMemcpyFromSymbol(ks.data(), k40_dp_k,
+            std::vector<unsigned long long> scan_k((size_t)ndp), idxs((size_t)ndp);
+            std::vector<uint256_t> kvs((size_t)ndp);
+            CHECK_CUDA(cudaMemcpyFromSymbol(scan_k.data(), k40_dp_scan_k,
                                             (size_t)ndp * sizeof(unsigned long long)));
+            CHECK_CUDA(cudaMemcpyFromSymbol(kvs.data(), k40_dp_kv,
+                                            (size_t)ndp * sizeof(uint256_t)));
             CHECK_CUDA(cudaMemcpyFromSymbol(idxs.data(), k40_dp_idx,
                                             (size_t)ndp * sizeof(unsigned long long)));
-            std::vector<uint64_t> kk;
+            std::vector<std::string> kk;
             std::vector<uint64_t> ii;
             kk.reserve((size_t)ndp);
             ii.reserve((size_t)ndp);
             for (unsigned int i = 0; i < ndp; ++i) {
-                // 只落 k <= new_cursor 的记录。超出的那几条来自"跑到前面的线程多走的
-                // 那一小段" (中断时各线程停在各自的轮询点上, 最深的多走不到 K40_POLL_MASK
+                // 只落扫描位置 <= new_cursor 的记录。超出的那几条来自"跑到前面的线程多走
+                // 的那一小段" (中断时各线程停在各自的轮询点上, 最深的多走不到 K40_POLL_MASK
                 // 批), 那一段下一轮会重扫、会重新记一遍 —— 现在写下去就是重复行
                 // (k 唯一确定点, 重复只可能来自重扫)。丢掉这几条不丢数据: 一条不差地
                 // 会从重扫里回来, 只是那一小段计算白跑 (2^14/2^20 ≈ 1.6% 的尾巴)。
-                if ((uint64_t)ks[i] <= new_cursor) {
-                    kk.push_back((uint64_t)ks[i]);
+                // ⚠ 过滤看的是**扫描位置** scan_k (64 位), 写下去的是 kv = lambda^j·k。
+                if ((uint64_t)scan_k[i] <= new_cursor) {
+                    kk.push_back(k40_u256_to_dec(kvs[i]));
                     ii.push_back((uint64_t)idxs[i]);
                 }
             }

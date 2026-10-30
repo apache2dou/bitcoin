@@ -3110,67 +3110,6 @@ void set_int(unsigned char* cn, int64_t n) {
     cn[24] = p[7];
 };
 
-int64_t buildLambdaMap(std::multimap<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
-{
-    if (num <= 0)
-        return 0;
-    uint64_t max = 0;
-    std::vector<std::thread> threads;
-    int n_tasks = std::max(1u, std::thread::hardware_concurrency() - 2);
-    threads.reserve(n_tasks);
-    unsigned char c_step[33] = {0};
-    set_int(c_step, n_tasks);
-    secp256k1_pubkey pk_step = {0};
-    secp256k1_ec_pubkey_create(ctx, &pk_step, c_step);
-
-    auto pushKey = [&max](std::multimap<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t counter) {
-        static RecursiveMutex _mutex;
-        LOCK(_mutex);
-        uint64_t t = *(uint64_t*)pk.data;
-        m.insert({t, counter});
-        if (counter > max) max = counter;
-    };
-    auto qualified = [](const secp256k1_pubkey& k) {
-        RhoState rs_ret[256];
-        RhoState rs_src;
-        rs_src.x = k;
-        int c = rho_Fi(ctx, &rs_src, rs_ret);
-        return c >= 8;
-    };
-    auto calc = [&](uint64_t _n, uint64_t _b) {
-        secp256k1_pubkey pk_tmp = {0};
-        unsigned char c_base[33] = {0};
-        set_int(c_base, _b);
-        uint64_t counter = _b;
-        secp256k1_ec_pubkey_create(ctx, &pk_tmp, c_base);
-        if (qualified(pk_tmp))
-            pushKey(_map, pk_tmp, counter);
-        for (uint64_t i = 1; i < _n; ) {
-            counter += n_tasks;
-            if (gameover && counter > max)
-                break;
-            secp256k1_pubkey pk_add = pk_tmp;
-            secp256k1_pubkey* ins[2] = {&pk_add, &pk_step};
-            int r = secp256k1_ec_pubkey_combine(ctx, &pk_tmp, ins, 2);
-            if (qualified(pk_tmp)) {
-                pushKey(_map, pk_tmp, counter);
-                i++;
-            }
-        }
-    };
-
-    for (int i = 0; i < n_tasks; ++i) {
-        uint64_t n = num / n_tasks;
-        uint64_t b = base + i;
-        if (i == n_tasks - 1) n += num % n_tasks;
-        threads.emplace_back(calc, n, b);
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-    return max + 1;
-}
-
 int64_t buildBabyMap(std::multimap<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
 {
     if (num <= 0)
@@ -3359,6 +3298,50 @@ int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState*
     return count;
 }
 
+// ---------------------------------------------------------------------------
+// GLV 自同构对应的标量常数。
+//   lambda^3 = 1 (mod N), lambda != 1
+// (与 libsecp256k1 src/scalar_lambda.h 的 lambda / minus_lambda 同一组值;
+//  lambda^2 = N - 1 - lambda 由 1 + lambda + lambda^2 = 0 得到。)
+// 群上 phi(P) = lambda*P, 域上就是 x -> beta*x, 于是 P / lambda*P / lambda^2*P
+// 三个点的 x 全都满足同一个 40 位判据 —— 每扫一个点等于判三次 (记录率 x3)。
+// 注意: host 侧完全不需要 beta —— 轨道代表用"记录 (m,n) 各乘 lambda^j"直接得到。
+// ---------------------------------------------------------------------------
+static const unsigned char kGlvLambda[32] = {
+    0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0,
+    0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64, 0x5a,
+    0x12, 0x2e, 0x22, 0xea, 0x20, 0x81, 0x66, 0x78,
+    0xdf, 0x02, 0x96, 0x7c, 0x1b, 0x23, 0xbd, 0x72};
+static const unsigned char kGlvLambda2[32] = {
+    0xac, 0x9c, 0x52, 0xb3, 0x3f, 0xa3, 0xcf, 0x1f,
+    0x5a, 0xd9, 0xe3, 0xfd, 0x77, 0xed, 0x9b, 0xa4,
+    0xa8, 0x80, 0xb9, 0xfc, 0x8e, 0xc7, 0x39, 0xc2,
+    0xe0, 0xcf, 0xc8, 0x10, 0xb5, 0x12, 0x83, 0xce};
+
+// j = 0 返回 nullptr (表示"不缩放")
+static const unsigned char* glv_lambda_pow(int j)
+{
+    return (j == 0) ? nullptr : (j == 1 ? kGlvLambda : kGlvLambda2);
+}
+
+// 记录 (m, n) 乘上 lambda^j: 它表示的点 (m + n*k)G 变成 lambda^j*(m + n*k)G,
+// 即两个系数各自乘 lambda^j (mod N)。lambda == nullptr 时原样返回。
+//
+// 与下面的 bingo 一样不查返回值: 0 乘任何数还是 0 (无穷远点), 这类记录本来就
+// 进不了碰撞解算。
+static SecPair glv_scale_pair(const secp256k1_context* ctx, const SecPair& sp,
+                              const unsigned char* lambda)
+{
+    SecPair out;
+    memcpy(out.m, sp.m, sizeof(out.m));
+    memcpy(out.n, sp.n, sizeof(out.n));
+    if (lambda != nullptr) {
+        (void)secp256k1_ec_seckey_tweak_mul(ctx, out.m, lambda);
+        (void)secp256k1_ec_seckey_tweak_mul(ctx, out.n, lambda);
+    }
+    return out;
+}
+
 // bingo 的结局。老口径是一个 bool: false 只在 sp1 == sp2 时给, 两个 x 不相等也照样给
 // true (配一个假 k)。可调用方要的信息其实是三分的 —— 真碰撞 / 短回路 (同一份记录) /
 // 只是索引撞了 (两个点根本不是一个), 所以把 bool 拆成这个枚举。
@@ -3369,33 +3352,40 @@ enum class BingoResult {
 };
 
 // ---------------------------------------------------------------------------
-// bingo: 两条 DP 记录 (m1, n1) / (m2, n2) 表示的点落到同一个 x 上时, 解出 k (MVP = k*G)。
+// bingo: 两条 DP 记录 (m1, n1) / (m2, n2) 落到同一个 DP 索引上时, 解出 k (MVP = k*G)。
 //
-// 口径: 点 x 的标量 s 满足 x = m*G + n*MVP = (m + n*k)*G, 即 s = m + n*k。x 相同只有
-// 两种可能, 各自对应一个公式, 差别只在两个符号上:
-//     同点 (P2 ==  P1, y 相同):  s1 =  s2  =>  k =  (m1 - m2) / (n2 - n1)
-//     反号 (P2 == -P1, y 反号):  s1 = -s2  =>  k = -(m1 + m2) / (n1 + n2)
-// 是哪种**本函数自己算点, 再用 check() 比出来** (同点走同点式, 反号走反号式), 调用方不
-// 用管 —— 老口径一律按同点算, 反号那一类要么被静默跳过 (调用方先比全值公钥, y 反号就
-// 当成"同索引不同点"), 要么算出一个假 k 当真碰撞存下去。
+// 口径: 记录表示点 (m + n*k)*G, 且每条记录存的 (m,n) 是**命中那个代表自己的**
+// 系数 (见 cuda.cu 的 glv_scale_point), 所以 "x == m*G + n*MVP" 对每条记录恒成立。
+// 于是两条记录表示同一个点 (或互为反号) ⟺ 它们自己算出来的 x 相等 —— 直接比就行,
+// 不需要再乘 lambda^j 去试轨道分支:
+//     P2 =  P1 (同点):  k =  (m1 - m2) / (n2 - n1)
+//     P2 = -P1 (反号):  k = -(m1 + m2) / (n1 + n2)
+// 是哪种由**本函数自己算点、比 y** 判出来, 调用方不用管。
+//
+// 以前的实现要拿 lambda^j 分支兜一件事: 记录的索引来自代表 j、而 (m,n) 来自 walker
+// 脚下那个点, 两边不是同一个点。改成各自存自己的系数之后这个不对称没了, 而
+// beta^j*x 三个值互不相同 (x = 0 才相等, 不在曲线上), 所以 "同一个索引、两边却是
+// 轨道上不同代表" 的情形不会再被摆到一起比较 —— j != 0 那几支成了死代码, 已删。
+//
 // 返回值 (BingoResult, 三分):
 //     SameRecord   = sp1 == sp2, 同一份记录 (ta2 == 1 靠这个认"短回路")
-//     Solved       = 两个 x 相同且解出了 k, r 里是真解
-//     NotCollision = 不是可用碰撞: 两个 x 不相等 (常态), 或 x 相同但两边都化成 0
-//                    (精确孪生 (m,n)/(-m,-n), 解不出 k) —— 调用方拿到的信息一样:
-//                    别存这个 k, 也别当碰撞。
+//     Solved       = 解出了 k, r 里是真解
+//     NotCollision = 不是可用碰撞: 两个 x 不等 (常态); 或 x 相等但两边都化成 0
+//                    (精确孪生 (m,n)/(-m,-n), 解不出 k)。
 // ---------------------------------------------------------------------------
 
 BingoResult bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, const SecPair& sp2)
 {
     if (sp1 == sp2) return BingoResult::SameRecord;
+
     secp256k1_pubkey x1;
+    secp256k1_pubkey x2;
     create(ctx, &x1, sp1.m, sp1.n);
-    // 同点/反号/不同点交给 check(): 它就是这套约定的原版 (只比 x 那 32 字节, 命中再用
-    // ec_pubkey_cmp 分符号) —— 同点给 1, 反号给 -1, x 不同给 0, find_baby 吃的也是它。
-    const int form = check(ctx, &x1, sp2.m, sp2.n);
-    if (form == 0) return BingoResult::NotCollision;   // 两个 x 不等, 本来就不是同一个点
-    const bool neg_point = form < 0;
+    create(ctx, &x2, sp2.m, sp2.n);
+    // 只比 x (pk.data 前 32 字节 = ge_storage 的 x, check() 也是这么比的)。
+    // 差别是这里不再调 check() —— 两个 pubkey 都现成, 没必要让它内部再 create 一次。
+    if (memcmp(x1.data, x2.data, 32) != 0) return BingoResult::NotCollision;
+    const bool neg_point = (memcmp(x1.data + 32, x2.data + 32, 32) != 0);
 
     unsigned char cm1[33] = {0};
     unsigned char cn1[33] = {0};
@@ -3411,8 +3401,8 @@ BingoResult bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, con
     } else {
         secp256k1_ec_seckey_negate(ctx, cm2);   // 同点: 分母 n2 - n1, 分子 m1 - m2
     }
-    // 分母为 0 就没得解。精确孪生 (m, n) / (-m, -n) 正落在这一支: 两边都化成 0, 对 k 不
-    // 含任何信息 (同一个点的两种写法而已), 报 NotCollision, 不编造 k。
+    // 分母为 0 就没得解。精确孪生 (m, n) / (-m, -n) 正落在这一支: 两边都化成 0,
+    // 对 k 不含任何信息 (同一个点的两种写法而已), 报 NotCollision, 不编造 k。
     // (negate 入参为 0 时它返回 0 并把结果留成 0 —— 正是"0 的相反数还是 0", 不查返回值。)
     if (!secp256k1_ec_seckey_tweak_add(ctx, cn1, cn2)) return BingoResult::NotCollision;
     if (!secp256k1_ec_seckey_tweak_add(ctx, cm1, cm2)) return BingoResult::NotCollision;
@@ -3477,17 +3467,63 @@ std::vector<T> loadVectorFromFile(const std::string& filename, uint64_t count = 
 }
 
 
-// DP 判定: x 的低 40 位全 0 时, 取其后连续 64 位 (x 的 bit 40..103) 作索引。
-// x.data 是按字节存放的坐标, 所以 bit 40 即字节偏移 5。
-// 注意: 索引 0 与"非 DP"同值, 属约定取舍。
-auto distinguishable = [](const secp256k1_pubkey& x) {
-    uint64_t r = 0;
-    uint64_t t = *(uint64_t*)x.data;
-    if ((t & 0xFFFFFFFFFFULL) == 0) {
-        r = *(uint64_t*)(x.data + 5);
+// ---------------------------------------------------------------------------
+// GLV 三个轨道代表的 host 侧口径 (与设备端 cuda.cu 的 glv_orbit_x 严格一致)
+//
+// 设备端: 对 p 自己、beta*p、beta^2*p 分别判 DP, 各自记一条 (见 rho_w)。
+// 主机端: 不碰 beta —— 记录 (m, n) 表示点 (m + n*k)G, 它的三个轨道代表就是
+//         (lambda^j * m, lambda^j * n), j = 0/1/2, 各自算一次点即可。
+//         第 j 个代表的 x 必须与设备端第 j 个逐字节相同; validate_glv 对拍这一条。
+//
+// 字节口径: secp256k1_pubkey::data 的前 32 字节是 ge_storage 的 x (4 个 uint64
+// 小端), 与设备端 uint256_t 的 8 个 uint32 小端逐字节相同。
+// ---------------------------------------------------------------------------
+void glv_orbit_x_host(const secp256k1_context* ctx, const SecPair& sp, unsigned char out[3][32])
+{
+    for (int j = 0; j < 3; ++j) {
+        const SecPair sj = glv_scale_pair(ctx, sp, glv_lambda_pow(j));
+        secp256k1_pubkey pk;
+        create(ctx, &pk, sj.m, sj.n);
+        memcpy(out[j], pk.data, 32);
     }
-    return r;
-};
+}
+
+// 40 位判据的单点版 (设备端对应 glv_dp_indices 里那一步): x 的低 40 位全 0 时,
+// 取其后连续 64 位 (x 的 bit 40..103) 作索引。坐标是按字节存放的, 所以 bit 40 即
+// 字节偏移 5。注意: 索引 0 与"非 DP"同值, 属约定取舍。
+// 从 32 字节 x (ge_storage 小端) 取 40 位 DP 索引; 不是 DP 返回 false。
+static bool dp40_index_from_x(const unsigned char* xb, uint64_t& out)
+{
+    uint64_t t = 0;
+    memcpy(&t, xb, sizeof(t));
+    if ((t & 0xFFFFFFFFFFULL) != 0) return false;
+    memcpy(&out, xb + 5, sizeof(out));
+    return true;
+}
+
+// 40 位 DP 索引三元组: idx[j] = 第 j 个轨道代表的索引 (0 = 不是 DP)。
+// 这就是设备端 glv_dp_indices 的 host 版本。
+static void dp40_index_orbit(const secp256k1_context* ctx, const SecPair& sp, uint64_t idx[3])
+{
+    unsigned char xb[3][32];
+    glv_orbit_x_host(ctx, sp, xb);
+    for (int j = 0; j < 3; ++j) {
+        if (!dp40_index_from_x(xb[j], idx[j])) idx[j] = 0;
+    }
+}
+
+// 归档校验: 记录存的是**命中那个代表自己的** (m,n) (设备端 glv_scale_point 与主机
+// glv_scale_pair 同口径), 所以拿它自己现算出来的点必然就是命中的那个点 —— 索引只可能
+// 等于 idx[0]。存盘数据全是 GLV 改动之后的新口径 (旧口径的文件不存在), 所以 "索引对上
+// 三个代表之一" 那种宽松比较没有兼容对象, 只会在记录损坏时放行, 已收紧成只认 idx[0]。
+static bool dp40_index_matches(const secp256k1_context* ctx, const SecPair& sp, uint64_t stored)
+{
+    if (stored == 0) return false;   // 0 与"非 DP"同值, 永远不会被设备端记下来
+    secp256k1_pubkey pk;
+    create(ctx, &pk, sp.m, sp.n);
+    uint64_t idx = 0;
+    return dp40_index_from_x(pk.data, idx) && stored == idx;
+}
 
 auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
     std::string line;
@@ -3503,7 +3539,7 @@ auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
 
             secp256k1_pubkey x_tmp;
             create(ctx, &x_tmp, sp.m, sp.n);
-            assert(dp_index == distinguishable(x_tmp));
+            assert(dp40_index_matches(ctx, sp, dp_index));
             assert(dpMap.find(dp_index) == dpMap.end());
             dpMap[dp_index] = sp;
         }
@@ -3518,8 +3554,6 @@ unsigned char randChar() {
 
 static const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
 static const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
-static const std::string _XvecL_name = "D:\\lambda_map\\Xvec.bin";
-static const std::string _MvecL_name = "D:\\lambda_map\\Mvec.bin";
 static const std::string _DPFile_name = "D:\\DistinguishablePoints.txt";
 
 auto saveDP = [](std::ofstream& fs, uint64_t index, const SecPair& sp) {
@@ -4570,11 +4604,22 @@ public:
             }
             return false;
         }
-        if (auto d = distinguishable(rs[0].x)) {
-            ++count_dstg;
-            saveDP(_dplog.ofs, d, rs[0]);
-            rs[0].rand();
-            fun_mul(rs[0], 2);
+        // GLV: 与 Rho::shoot / 设备端 rho_w 同一口径 —— p / beta*p / beta^2*p 各判一次,
+        // 命中的各记一条, 且存的是**命中那个代表自己的** (m, n) (glv_scale_pair)。
+        // 换起点只看 p 自己是否命中, 与设备端 reset 只有 dp[0] 为真一致。
+        uint64_t orbit[3];
+        dp40_index_orbit(ctx, rs[0], orbit);
+        if (orbit[0] != 0 || orbit[1] != 0 || orbit[2] != 0) {
+            ++count_dstg;   // 与 Rho::shoot 同口径: 一条 walker 命中一次数一次
+            for (int j = 0; j < 3; ++j) {
+                if (orbit[j] == 0) continue;
+                const SecPair sj = glv_scale_pair(ctx, rs[0], glv_lambda_pow(j));
+                saveDP(_dplog.ofs, orbit[j], sj);
+            }
+            if (orbit[0] != 0) {
+                rs[0].rand();
+                fun_mul(rs[0], 2);
+            }
         }
         return true;
     }
@@ -4583,8 +4628,6 @@ public:
 class Rho
 {
 private:
-    std::vector<uint64_t> _Xvec;
-    std::vector<uint64_t> _Mvec;
     iLog _dplog;
 
 public:
@@ -4611,10 +4654,6 @@ public:
     }
     void prepare()
     {
-        /* _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
-        _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
-        assert(_Xvec.size() == _Mvec.size());*/
-
         // 仿射点加: 预展开 adds_pub[0][*] 到内部 fe 表示。
         // 必须在这里 (worker 线程启动前) 做一次。
         rho_affine_prepare();
@@ -4638,7 +4677,37 @@ public:
         for (uint32_t m = dp_mask; m != 0; m &= m - 1) {
             const int k = std::countr_zero(m);
             ++count_dstg;
-            saveDP(_dplog.ofs, distinguishable(rs[k].x), rs[k]);
+            // GLV: 与设备端同一规则 —— p / beta*p / beta^2*p 各自判过, 命中的各记
+            // 一条。dp40_index_orbit 的顺序与 rho_affine_dp 内的判定顺序一致;
+            // 掩码为真 ⇒ 至少有一个非 0。
+            //
+            // ⚠ 存的是**命中那个代表自己的** (m, n): j > 0 时把 rs[k] 的 (m, n) 各乘
+            //   lambda^j (mod N)。设备端 rho_w 做的是同一件事 (glv_scale_point), 所以
+            //   两边落盘的数据同构 —— 一条记录的 x 恒等于 m*G + n*MVP, 求解端不必再猜 j。
+            uint64_t orbit[3];
+            dp40_index_orbit(ctx, rs[k], orbit);
+            for (int j = 0; j < 3; ++j) {
+                if (orbit[j] == 0) continue;
+                const SecPair sj = glv_scale_pair(ctx, rs[k], glv_lambda_pow(j));
+                saveDP(_dplog.ofs, orbit[j], sj);
+            }
+            // 换起点: 只有 p 自己命中 (orbit[0] != 0) 才换, 与设备端 reset_start_point
+            // 的条件一致。CPU 侧没有预备队池, 直接换一个随机点。
+            //
+            // ⚠ 只有**非 0 线程**换:** 线程 0 命中后不换, 继续从当前点往前走。
+            //   线程 0 是"单链速度优先"那一档 (RHO_WALKERS0 = 2, 见 common.h), 它的
+            //   轨迹本来就是要尽量长的一条链 —— 换起点等于把它截断。其余线程是吞吐档
+            //   (RHO_WALKERS = 32), 换起点正是它们该干的事。模式 1 (仅 CPU 单线程)
+            //   只有线程 0, 于是那个模式下完全不换起点。
+            //
+            // rs[k] 此刻是 rho_affine_FW 刚写回的新值 (命中者才会写回), 这里整个覆盖掉
+            // 成新起点。⚠ times 必须一并清零: 线程局部 cache 靠
+            // "cache.synced_times[i] != rs[i].times" 判断外部重置, 只改点不改 times
+            // 的话下次 rho_affine_FW 会继续用缓存里的旧状态, 这次重置静默失效。
+            if (i != 0 && orbit[0] != 0) {
+                rs[k].rand();
+                rs[k].times = 0;
+            }
         }
         return true;
     }
@@ -5429,36 +5498,6 @@ static RPCHelpMan testmvp()
                     }
                 }
             }
-            // 生成lambdamap
-            if (ta == 128) {
-                std::multimap<uint64_t, uint64_t> theMap;
-                uint64_t base = 1;
-                std::string base_filename = "D:\\lambda_map\\lambda_base.txt";
-                std::string filename  = "D:\\lambda_map\\lambda_map1.txt";
-                base = read_num(base_filename);
-                read_map(theMap, filename);
-                gameover = false;
-                std::thread t(judge);
-                base = buildLambdaMap(theMap, 1024*1024*1024, base);
-                save_map(theMap, filename);
-                write_num(base_filename, base);
-                gameover = true;
-                if (t.joinable())
-                    t.join();
-            };
-            // 加载lambdamap 并简单测试
-            if (ta == 129) {
-                std::vector<uint64_t> _Xvec;
-                std::vector<uint64_t> _Mvec;
-                if (ta2 == 888) {
-                    read_map(_Xvec, _Mvec, 0, "lambda");
-                    saveVectorToFile<uint64_t>(_Xvec, _XvecL_name);
-                    saveVectorToFile<uint64_t>(_Mvec, _MvecL_name);
-                } else {
-                    _Mvec = loadVectorFromFile<uint64_t>(_MvecL_name);
-                    _Xvec = loadVectorFromFile<uint64_t>(_XvecL_name);
-                }
-            }
             if (ta == 8) {
                 // ta2 == 1: 40 位 DP 文本归档 D:\DistinguishablePoints.txt (三行一条)
                 // ta2 == 2: 32 位 DP 起点漫游的边表 D:\Dp32Edge.txt (一行一条)
@@ -5516,7 +5555,9 @@ static RPCHelpMan testmvp()
 
                             secp256k1_pubkey x_tmp;
                             create(ctx, &x_tmp, sp.m, sp.n);
-                            if (dp_index != distinguishable(x_tmp)) {
+                            // 记录里的 (m, n) 是**命中那个代表自己的**, 所以它自己算出来的
+                            // 点必然就是命中的那个, 索引必须正好是 idx[0]。
+                            if (!dp40_index_matches(ctx, sp, dp_index)) {
                                 unspent.pushKV("str", "!!!!Error!!!! dp_index: " + std::to_string(dp_index));
                                 unspent.pushKV("str2", HexStr(x_tmp.data) + " : " + HexStr(sp.m) + " : " + HexStr(sp.n));
                                 return 1;
@@ -5536,17 +5577,41 @@ static RPCHelpMan testmvp()
                     // 还原之后这些记录就能进同一张 dpMap: 两条链 (或链与 40 位语料) 落到同一个
                     // x 上就是一次真实的碰撞候选, 与 ta2 == 1 原本的口径完全一致 —— bingo 自己
                     // 会判同点/反号, 解出 k 就落盘。
+                    //
+                    // ⚠ GLV 之后一行的 k 是**命中那个点自己的**链系数, 不再是扫描位置:
+                    //   p        = k·Q            -> (k,        索引0)
+                    //   beta·p   = (lambda·k)·Q   -> (lambda·k, 索引1)     都是 mod N 的 256 位数
+                    //   beta²·p  = (lambda²·k)·Q  -> (lambda²·k, 索引2)
+                    // 所以这里按 256 位十进制解析, 且**不要求 k 递增** (lambda 一乘就乱了序)。
+                    // 记录本身自洽: x 永远等于 m·G + n·MVP, 求解端不用再乘 lambda^j 去猜。
                     uint64_t n_k40_files = 0, n_k40_lines = 0, n_k40_bad = 0, n_k40_kdup = 0;
                     std::string first_k40_bad;
+                    // 十进制字符串 -> 32 字节大端 (超 256 位 / 非数字 -> false)
+                    auto dec_to_scalar = [](const std::string& s, unsigned char out[32]) -> bool {
+                        if (s.empty() || s.size() > 78) return false;
+                        unsigned char t[32];
+                        memset(t, 0, 32);
+                        for (const char c : s) {
+                            if (c < '0' || c > '9') return false;
+                            unsigned int carry = (unsigned int)(c - '0');
+                            for (int i = 31; i >= 0; --i) {
+                                const unsigned int v = (unsigned int)t[i] * 10u + carry;
+                                t[i] = (unsigned char)(v & 0xFFu);
+                                carry = v >> 8;
+                            }
+                            if (carry != 0) return false;
+                        }
+                        memcpy(out, t, 32);
+                        return true;
+                    };
                     auto processK40File = [&](const std::string& path) -> int {
                         std::ifstream ifs(path);
                         if (!ifs.is_open()) return 0;   // 没有这条链的存档: 不算错
                         uint64_t a_mvp = 0, b_g = 0;    // 头注释里读回来; 缺省 "0" = P0 无穷远
                         bool use_mvp = false;           // 缺省 Q = G (改名前的老文件没有 Q 一项)
                         std::string line;
-                        uint64_t n_line = 0, n_bad = 0, n_dup = 0, kprev = 0, kmax = 0;
-                        bool have_prev = false;
-                        std::set<uint64_t> seen_k;
+                        uint64_t n_line = 0, n_bad = 0, n_dup = 0, kmax = 0;
+                        std::set<std::pair<std::string, uint64_t>> seen_ki;
                         auto bad = [&](const std::string& why) {
                             if (first_k40_bad.empty()) first_k40_bad = path + ": " + why;
                             n_bad++;
@@ -5579,39 +5644,68 @@ static RPCHelpMan testmvp()
                                 }
                                 continue;
                             }
-                            unsigned long long k = 0, idx = 0;
-                            if (sscanf(line.c_str(), "%llu %llu", &k, &idx) != 2) {
+                            // 第一列是十进制 k (可能是 256 位), 第二列是索引
+                            char kbuf[96] = {0};
+                            unsigned long long idx = 0;
+                            if (sscanf(line.c_str(), "%95s %llu", kbuf, &idx) != 2) {
                                 bad("列数不对: " + line.substr(0, 60));
                                 continue;
                             }
-                            n_line++;
-                            if (!have_prev) {
-                                kprev = kmax = (uint64_t)k;
-                                have_prev = true;
-                            } else {
-                                if ((uint64_t)k <= kprev) bad("k 不是严格递增: " + std::to_string(k));
-                                kprev = (uint64_t)k;
-                                if ((uint64_t)k > kmax) kmax = (uint64_t)k;
-                            }
-                            if (!seen_k.insert((uint64_t)k).second) n_dup++;
-
-                            // 还原成 (m, n) 并现算 x = m*G + n*MVP
-                            const uint64_t mv = b_g + (use_mvp ? 0 : (uint64_t)k);
-                            const uint64_t nv = a_mvp + (use_mvp ? (uint64_t)k : 0);
-                            if (mv == 0 && nv == 0) {
-                                bad("k=" + std::to_string(k) + " 落到无穷远点");
+                            const std::string kstr(kbuf);
+                            unsigned char ck[32];
+                            if (!dec_to_scalar(kstr, ck)) {
+                                bad("k 不是十进制 256 位内的数: " + kstr.substr(0, 40));
                                 continue;
                             }
+                            n_line++;
+                            // k 不保证递增 (GLV 轨道代表的系数是 lambda^j·k mod N)。
+                            // 重复行按 (k 字符串, 索引) 这一对判。
+                            if (!seen_ki.insert({kstr, (uint64_t)idx}).second) n_dup++;
+                            // k 上界的统计只看 j = 0 的记录 —— 那些才是扫描位置 (小整数);
+                            // 轨道代表的 k' 是 256 位的均匀数, 掉进 64 位区间的概率 2^-192, 忽略。
+                            // ⚠ ck 是**大端** (ck[31] 最低字节), 所以"装得进 64 位"
+                            //   <=> 高 24 字节 ck[0..23] 全 0, 低 64 位是 ck[24..31]。
+                            bool fits64 = true;
+                            for (int i = 0; i < 24; ++i) {
+                                if (ck[i] != 0) { fits64 = false; break; }
+                            }
+                            if (fits64) {
+                                unsigned long long k64 = 0;
+                                for (int i = 24; i < 32; ++i) {
+                                    k64 = (k64 << 8) | (unsigned long long)ck[i];
+                                }
+                                if (k64 > kmax) kmax = k64;
+                            }
+
+                            // 还原成 (m, n) 并现算 x = m*G + n*MVP
+                            //   Q = G   : m = b_g + k (mod N), n = a_mvp
+                            //   Q = MVP : m = b_g,           n = a_mvp + k (mod N)
                             SecPair sp;
                             memset(&sp, 0, sizeof(sp));
-                            set_int(sp.m, (int64_t)mv);
-                            set_int(sp.n, (int64_t)nv);
-                            secp256k1_pubkey x_tmp;
-                            create(ctx, &x_tmp, sp.m, sp.n);
-                            const uint64_t got = distinguishable(x_tmp);
-                            if (got != (uint64_t)idx) {
-                                bad("k=" + std::to_string(k) + " 不是 40 位 DP (记录索引 " +
-                                    std::to_string(idx) + ", 实算 " + std::to_string(got) + ")");
+                            set_int(sp.m, (int64_t)b_g);
+                            set_int(sp.n, (int64_t)a_mvp);
+                            unsigned char* dst = use_mvp ? sp.n : sp.m;
+                            bool k_is_zero = true;
+                            for (int i = 0; i < 32; ++i) {
+                                if (ck[i] != 0) { k_is_zero = false; break; }
+                            }
+                            // tweak_add 返回 0 有两种原因: k >= N (记录本身坏了), 或者
+                            // 加完变成 0 (k = 0 且 P0 = 无穷远 -> 点根本不存在)。
+                            if (!secp256k1_ec_seckey_tweak_add(ctx, dst, ck)) {
+                                bad(k_is_zero ? ("k=" + kstr + " 落到无穷远点")
+                                              : ("k=" + kstr.substr(0, 32) + " 超出 N (mod N 加法溢出)"));
+                                continue;
+                            }
+                            // k40 表是现算复核对账。记录的 (m,n) 就是命中那个代表自己的,
+                            // 所以它自己算出来的点必须正好是 40 位 DP, 索引也必须是 idx[0]。
+                            secp256k1_pubkey pk_k40;
+                            create(ctx, &pk_k40, sp.m, sp.n);
+                            uint64_t idx_k40 = 0;
+                            const bool k40_is_dp = dp40_index_from_x(pk_k40.data, idx_k40);
+                            if (!k40_is_dp || (uint64_t)idx != idx_k40) {
+                                bad("k=" + kstr.substr(0, 32) + " 不是 40 位 DP (记录索引 " +
+                                    std::to_string(idx) + ", 实算 " +
+                                    (k40_is_dp ? std::to_string(idx_k40) : std::string("非 DP")) + ")");
                                 continue;
                             }
                             if (const int r = noteDp((uint64_t)idx, sp); r != 0) return r;
@@ -5816,18 +5910,26 @@ static RPCHelpMan testmvp()
 
                         secp256k1_pubkey x_tmp;
                         create(ctx, &x_tmp, sp.m, sp.n);
-                        uint64_t dp_index = 0;
-                        if (!dp32_test(x_tmp, dp_index) || dp_index != dst) {
+                        // 终点记录存的是**命中那个代表自己的** (m,n), 所以它自己算出来的
+                        // 点必然就是命中的那个, 32 位索引必须正好等于记录的终点索引。
+                        uint64_t idx_dst = 0;
+                        const bool dst_is_dp = dp32_test(x_tmp, idx_dst);
+                        const bool dst_ok = (dst != 0) && dst_is_dp && dst == idx_dst;
+                        if (!dst_ok) {
                             n_bad++;
                             if (first_bad.empty()) {
                                 first_bad = "第 " + std::to_string(n_lines) + " 行不是 32 位 DP: 记录终点索引 "
-                                            + std::to_string(dst) + ", x " + HexStr(x_tmp.data);
+                                            + std::to_string(dst) + ", 实算 " +
+                                            (dst_is_dp ? std::to_string(idx_dst) : std::string("非 DP")) +
+                                            ", x " + HexStr(x_tmp.data);
                             }
                             continue;
                         }
 
                         // 起点索引: 两种情形分开计数 ——
-                        //   src == 2^64-1 : 空槽 (随机起点), 设计如此, 只数不改;
+                        //   src == 2^64-1 : 哨兵。两类来源: (a) 空槽 (库见底后主机补的
+                        //     随机起点), (b) GLV 的 βp / β²p 代表 —— 那两个点不在从
+                        //     起点出发的那条链上。两者都是设计如此, 只数不改;
                         //   其他但库里查不到 : 库被重建过 / 状态对不上, 这是真异常。
                         uint32_t slot = 0;
                         if (src == kEdgeSrcNone) {
@@ -5865,7 +5967,8 @@ static RPCHelpMan testmvp()
                         }
                     }
 
-                    cprintf("Dp32Edge 校验: %llu 行, 非 32 位 DP %llu 条, 空槽起点(随机, 2^64-1) %llu 条, "
+                    cprintf("Dp32Edge 校验: %llu 行, 非 32 位 DP %llu 条, src 哨兵(空槽随机起点 "
+                            "+ GLV 轨道代表) %llu 条, "
                             "起点不在库里 %llu 条, 同终点碰撞 %llu 条 (其中 x 相同 %llu 条, "
                             "x 相同但解不出 %llu 条), 终点去重 %llu\n",
                             (unsigned long long)n_lines, (unsigned long long)n_bad,

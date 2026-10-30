@@ -543,22 +543,44 @@ void rho_affine_store(const RhoAffineState& s, RhoPoint& rp)
     limbs_to_be32(rp.n, s.n);
 }
 
-// 对应 distinguishable(): x 的 bit 0..39 全 0 时, 返回 x 的 bit 40..103 (连续 64 位)。
+// 对应 cuda.cu 的 glv_dp_indices(): 对 p / beta*p / beta^2*p 三个代表**分别**判定,
+// 返回"第一个命中的代表的索引" (顺序固定为 p, beta*p, beta^2*p); 都不命中返回 0。
 //
-// distinguishable 是按字节读的: *(uint64_t*)(x.data + 5), 也就是 x 的 bit 40..103
-// 这一段连续 64 位。这里要在 5x52 肢体上取出同一段, 分两段拼接:
-//   bit 40..51  = X.n[0] 的 bit 40..51   (n[0] 只覆盖到 bit 51)
-//   bit 52..103 = X.n[1] 的 bit 0..51    (n[1] 的 bit 0 即 x 的 bit 52)
-// 合并即 (X.n[0] >> 40) | (X.n[1] << 12): n[0] >> 40 只有 12 位有效,
-// n[1] 的 52 位整体左移 12 位后正好对接其上端, 合计 64 位。
+// 与设备端 glv_dp_indices 同一口径: 三个代表各自判定, 任一命中就把这个 walker 的
+// DP 掩码置位 (一步只占一个 bit, 不因命中三个而变三份); 具体记哪几条、每条存谁的
+// (m, n) 由调用方 (blockchain.cpp 的 Rho::shoot) 再算一遍 glv_orbit 决定。
 //
-// 注意: 这里假定 X 已全规约 (rho_affine_step_batch 每步结尾保证), 否则 limb 与
-//       x 的二进制位对不上。
+// 返回第一个命中的索引而不只是 p 自己的, 是为了让"掩码为真 ⟺ 有代表命中" 与
+// 设备端 dp[0]/dp[1]/dp[2] 三格完全对应; 索引值本身在这里只当布尔用。
+//
+// 只要 1 次域乘: beta^2 + beta + 1 = 0 (mod p)  =>  beta^2*x = -(beta*x + x)。
+// bx / b2x 必须 normalize 之后才能读肢体 (bit 0..39)。
+//
+// 取索引时在 5x52 肢体上分两段拼接 (该代表已全规约):
+//   bit 40..51  = c.n[0] 的 bit 40..51   (n[0] 只覆盖到 bit 51)
+//   bit 52..103 = c.n[1] 的 bit 0..51    (n[1] 的 bit 0 即 x 的 bit 52)
+// 合并即 (c.n[0] >> 40) | (c.n[1] << 12): 合计 64 位。
 inline uint64_t rho_affine_dp(const RhoAffineState& s)
 {
-    // x bit 0..39 != 0 -> 不构成 DP (n[0] 的 bit 40..51 不参与判定)
-    if ((s.X.n[0] & 0xFFFFFFFFFFULL) != 0) return 0;
-    return (s.X.n[0] >> 40) | (s.X.n[1] << 12);
+    // 单点判据: 该代表自己的 bit 0..39 全 0 时返回 bit 40..103。
+    auto one = [](const secp256k1_fe& c) -> uint64_t {
+        if ((c.n[0] & 0xFFFFFFFFFFULL) != 0) return 0;
+        return (c.n[0] >> 40) | (c.n[1] << 12);
+    };
+
+    // s.X 已全规约 (rho_affine_step_batch 每步结尾保证) —— 它自己不用再 normalize,
+    // 省掉这份热路径上的开销。bx / b2x 必须 normalize 之后才能读肢体。
+    secp256k1_fe bx, b2x, t;
+    secp256k1_fe_mul(&bx, &s.X, &secp256k1_const_beta);   // mag 1
+    t = bx;
+    secp256k1_fe_add(&t, &s.X);                           // 原地加: t = bx + x, mag 2
+    secp256k1_fe_negate(&b2x, &t, 2);                     // b2x = -(bx + x)
+    secp256k1_fe_normalize_var(&bx);
+    secp256k1_fe_normalize_var(&b2x);
+
+    if (const uint64_t d = one(s.X)) return d;   // dp[0]: p 自己
+    if (const uint64_t d = one(bx)) return d;    // dp[1]: beta*p
+    return one(b2x);                             // dp[2]: beta^2*p
 }
 
 // ===========================================================================
@@ -898,6 +920,11 @@ void validate_rho_affine()
     // 分支, 所以这里用构造值专门覆盖它。参考值走生产回写路径
     // (rho_affine_store -> rs.x.data), 再按 distinguishable 的读法取
     // x.data[5..13), 即 x 的 bit 40..103。
+    //
+    // 注: rho_affine_dp 现在会对 p / beta*p / beta^2*p 三个代表分别判定, 返回第一个
+    // 命中的索引。下面这 6 个构造值都远小于 p (最大的约 2^104), 而 beta*x / beta^2*x
+    // 是满宽的, 所以只有 x 自己可能命中 —— 与这里"按 x 原样"写的参考值必然一致。
+    // 三个代表与 beta/lambda 的正确性由 cuda.cu 的 validate_glv 覆盖。
     bool dp_ok = true;
     {
         // 32 字节大端, 低 5 字节 (40 位) 均为 0 时构成 DP; 值均 < p
@@ -1110,11 +1137,12 @@ void rho_affine_prepare()
 // 槽位通过只增不减的流水号间接指向履历; 流水号 0 是哨兵, 表示"这个槽位没有队员"
 // (也就是随机点占位 —— 1 类不进账本)。
 //
-// 池子大小是 dp_buffer_size, 而 add_dp_to_buffer 取用的下标不止到 max_size - 1
+// 池子大小是 dp_buffer_size, 而 reset_start_point 取用的池位下标不止到 max_size - 1
 // (max_size = dp_buffer_size - 20, 见 cuda.cu 的 edge_pool_size 那段):
-// 它先写入再判 break, 所以下标还会往上走一点 —— 同一批里每线程 W 个 walker 最多各
-// 命中一次, 而 break_flag 要等各线程轮询到才生效 (轮询间隔 2^18 批), 超出的量都是
-// 个位数 (期望 ~3 条), 数组比 max_size 多留的 20 项就是给这段的。
+// 池位消费量 (dp_reset_count) 的上界是记录条数, 而记录是**先写入再判 break** 的,
+// 所以下标还会往上走一点 —— 同一批里每线程 W 个 walker 最多各命中一次, 而
+// break_flag 要等各线程轮询到才生效 (轮询间隔 2^18 批), 超出的量都是个位数
+// (期望 ~3 条), 数组比 max_size 多留的 20 项就是给这段的。
 //
 // 库存要够首轮一次性填满 dp_buffer_size 个槽位 (之后每轮只补被征调的): 2 类的 256 条
 // + 无上限阶梯绰绰有余, 3 类看存档有多少。真取不到时走 begin_round 的耗尽处理 ——
@@ -1792,15 +1820,17 @@ void init_RhoStates_reserve()
     upload_RhoStates_reserve(staging.data(), staging.size());
 }
 
-// 账本记账: 这一轮设备写出去 dp_count 条 DP 记录。记录下标 j 就是被征调的槽位 ——
-// add_dp_to_buffer 里 r = RhoStates_reserve[index], 而 index 同时就是 buffer 下标,
-// 所以设备端不需要额外回传任何东西, 只要记录条数。
+// 账本记账: 这一轮设备实际**换了 dp_count 次起点** (= 被征调的槽位数)。
+// 不能传记录条数: GLV 之后每步判 p / beta*p / beta^2*p 三个代表, 每个命中各记一条,
+// 但只有 p 自己命中才换起点 (reset_start_point), 所以记录条数 >= 征调数。
+// 调用方传 DpManager::last_reset_count()。
 void note_reserve_dps(unsigned int dp_count)
 {
     if (g_reserve_pool == nullptr) return;
     for (unsigned int j = 0; j < dp_count; ++j) {
-        // index 可以超出槽位数 (add_dp_to_buffer 先写入再判 break, 最多超 W-1 项),
-        // 那些超界的记录只是写进了备用项, 没有槽位对应, 自然不记账。
+        // 池位下标可以超出槽位数: 它的上界是记录条数, 而记录是"先写入再判 break"的
+        // (最多超 W-1 项), 那些超界的池位只是从备用项里取了点, 没有账本条目对应,
+        // 自然不记账。
         if (j >= g_reserve_pool->size()) break;
         g_reserve_pool->note_drafted(j);
     }

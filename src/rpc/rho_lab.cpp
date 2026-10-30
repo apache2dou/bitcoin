@@ -345,7 +345,7 @@ bool k40_save_cursor(const std::string& file, uint64_t cursor, bool use_mvp)
 }
 
 bool k40_append_dps(const std::string& file, bool use_mvp, uint64_t a_mvp, uint64_t b_g,
-                    const std::vector<uint64_t>& ks, const std::vector<uint64_t>& idxs)
+                    const std::vector<std::string>& ks, const std::vector<uint64_t>& idxs)
 {
     if (ks.empty()) return true;
     if (ks.size() != idxs.size()) return false;
@@ -360,7 +360,9 @@ bool k40_append_dps(const std::string& file, bool use_mvp, uint64_t a_mvp, uint6
     if (need_header) {
         ofs << "# k40 起点 P0 = " << k40_spec_tag(a_mvp, b_g)
             << " (0 = 无穷远), 基准点 Q = " << k40_chain_tag(use_mvp) << "\n"
-            << "# 每行: <k> <索引>  => x(P0 + k*Q) 低 40 位为 0, 索引 = 第 40..103 位\n";
+            << "# 每行: <k> <索引>  => x(P0 + k*Q) 低 40 位为 0, 索引 = 第 40..103 位\n"
+            << "# k 是命中那个点自己的系数 (GLV: 轨道代表 j 记 lambda^j*k mod N, 可为 256 位),\n"
+            << "# 所以 k 不保证递增; P0 = 0 时 x = k*Q, 否则 x = P0 + k*Q (仅 j = 0 会记)。\n";
     }
     for (size_t i = 0; i < ks.size(); ++i) {
         ofs << ks[i] << ' ' << idxs[i] << '\n';
