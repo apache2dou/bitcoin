@@ -309,6 +309,13 @@ if(BUILD_BITCOIN_CUDA)
   target_compile_options(bitcoin_node PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--forward-unknown-to-host-compiler>
     $<$<COMPILE_LANGUAGE:CUDA>:--forward-slash-prefix-opts>
+    # ⚠ 不要删这一行。不加它 ptxas 会把 rho_w<W> 吃到 255 regs, 于是每 SM 只能驻留
+    # 2 个 128 线程 block = 8 warps/SM —— 正好卡死在生产档位 RHO_PROD_WARPS_PER_SM
+    # 上, 连 12 warps/SM 都发不出来 (见 cuda.cu 里 GLV 代价那节的推导)。
+    # 168 regs = 3 block/SM = 12 warps; 76 regs 是历史上报的工作点。
+    # 历史教训: 这条设置一度只写在**生成的** build/src/bitcoin_node.vcxproj 里,
+    # 重跑一次 cmake 配置就静默丢了, 整套 [prod] 数字跟着失效 —— 所以钉在这里。
+    $<$<COMPILE_LANGUAGE:CUDA>:-maxrregcount=168>
   )
   set_target_properties(bitcoin_node PROPERTIES
     CUDA_STANDARD 20

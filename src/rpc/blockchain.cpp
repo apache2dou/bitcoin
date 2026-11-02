@@ -4909,7 +4909,13 @@ void play() {
     if (g_run_mode != 1) {
         // 模式1不启动CUDA线程
         // threads.emplace_back(rho_play); 
-        // 32 位 DP 起点漫游
+        // 32 位 DP 起点漫游。
+        // ⚠ 这两条路**不能同时启动**: 它们各自在入口处构造一个 DpManager, 而 DpManager
+        //   的构造函数会往**同一个** __device__ 符号 dp_device_buffer 写设备指针 ——
+        //   后构造的覆盖前一个, 先构造那条路的 DP 命中就会静默落进别人的缓冲区。
+        //   同理 break_flag_dev 也是共享的。当前只开边路 (上面那行是注释的),
+        //   要长期同时跑, 必须先把 dp_device_buffer / break_flag_dev 这两套设备符号
+        //   按路拆开 (EdgeManager 那侧已经是独立的, 只有 dp_device_buffer 是共用的)。
         threads.emplace_back(dp32_edge_play); 
 
         // 实验田 k40 (沿固定加数链路扫 40 位可分点).
@@ -5689,9 +5695,22 @@ static RPCHelpMan testmvp()
                             for (int i = 0; i < 32; ++i) {
                                 if (ck[i] != 0) { k_is_zero = false; break; }
                             }
-                            // tweak_add 返回 0 有两种原因: k >= N (记录本身坏了), 或者
-                            // 加完变成 0 (k = 0 且 P0 = 无穷远 -> 点根本不存在)。
-                            if (!secp256k1_ec_seckey_tweak_add(ctx, dst, ck)) {
+                            // ⚠ 基准部分为 0 时**不能**用 tweak_add: 它要求被加的私钥
+                            //   本身是合法私钥 (`0 + k` 也被拒绝, 直接返回 0), 跟 k 无
+                            //   关。而 P0 = 无穷远 恰恰是最常见的跑法 (Q=G 时 b_g = 0,
+                            //   Q=MVP 时 a_mvp = 0), 那时 dst 全零 ⇒ 每一行都会冤枉地
+                            //   报 "超出 N"。0 + k 本来就等于 k, 所以这一支直接抄过去,
+                            //   只把 k 自己按私钥口径 (0 < k < N) 验一遍。
+                            const bool base_zero = use_mvp ? (a_mvp == 0) : (b_g == 0);
+                            if (base_zero) {
+                                if (!secp256k1_ec_seckey_verify(ctx, ck)) {
+                                    bad(k_is_zero ? ("k=" + kstr + " 落到无穷远点")
+                                                  : ("k=" + kstr.substr(0, 32) + " 超出 N"));
+                                    continue;
+                                }
+                                memcpy(dst, ck, 32);
+                            } else if (!secp256k1_ec_seckey_tweak_add(ctx, dst, ck)) {
+                                // 被加私钥合法, 返回 0 只可能是 k >= N, 或结果恰好为 0
                                 bad(k_is_zero ? ("k=" + kstr + " 落到无穷远点")
                                               : ("k=" + kstr.substr(0, 32) + " 超出 N (mod N 加法溢出)"));
                                 continue;
@@ -5859,11 +5878,14 @@ static RPCHelpMan testmvp()
 
                     std::map<uint64_t, SecPair> dstMap;   // 终点索引 -> 该终点的 (m, n)
                     uint64_t n_lines = 0, n_bad = 0, n_src_unknown = 0, n_dst_dup = 0;
-                    // 起点那一列是 EDGE_SRC_NONE (= 2^64-1) 的边数。这类边来自**空槽**:
-                    // 库已见底时主机用 RhoPoint::rand() 补随机起点, 走的是一条真实轨迹,
-                    // 命中照记, 但追溯不到它是从库里哪个 32 位 DP 出发的 —— 所以起点列
-                    // 只能写哨兵。它与"起点索引在库里查不到"(n_src_unknown) 是两回事:
-                    // 后者说明库被重建/状态对不上, 前者是设计如此。
+                    // 起点那一列是 EDGE_SRC_NONE (= 2^64-1) 的边数, 两类来源, **都只出现在
+                    // 旧文件里** (新代码不再产生这类行):
+                    //   (a) 空槽: 库已见底时主机用 RhoPoint::rand() 补随机起点;
+                    //   (b) GLV 的 βp / β²p 代表: 不在从起点出发的那条链上。
+                    // 两者走的都是真实轨迹, 命中照记, 但追溯不到它是从库里哪个 32 位 DP
+                    // 出发的 —— 所以起点列只能写哨兵。它与"起点索引在库里查不到"
+                    // (n_src_unknown) 是两回事: 后者说明库被重建/状态对不上, 前者是设计如此。
+                    // ⚠ 兼容: 盘上现有文件里约 7 万行是这一类 (GLV 时代留下的), 校验时只数不改。
                     // 注: 这里的 2^64-1 与 cuda.cu 的 EDGE_SRC_NONE 是同一个值 (两个翻译
                     // 单元, 各自定义; 改一边必须改另一边)。
                     constexpr uint64_t kEdgeSrcNone = (uint64_t)-1;
@@ -5927,9 +5949,10 @@ static RPCHelpMan testmvp()
                         }
 
                         // 起点索引: 两种情形分开计数 ——
-                        //   src == 2^64-1 : 哨兵。两类来源: (a) 空槽 (库见底后主机补的
-                        //     随机起点), (b) GLV 的 βp / β²p 代表 —— 那两个点不在从
-                        //     起点出发的那条链上。两者都是设计如此, 只数不改;
+                        //   src == 2^64-1 : 哨兵。两类来源 (都只存在于旧文件里):
+                        //     (a) 空槽 (库见底后主机补的随机起点), (b) GLV 的 βp / β²p
+                        //     代表 —— 那两个点不在从起点出发的那条链上。两者都是设计
+                        //     如此, 只数不改;
                         //   其他但库里查不到 : 库被重建过 / 状态对不上, 这是真异常。
                         uint32_t slot = 0;
                         if (src == kEdgeSrcNone) {
@@ -5967,7 +5990,7 @@ static RPCHelpMan testmvp()
                         }
                     }
 
-                    cprintf("Dp32Edge 校验: %llu 行, 非 32 位 DP %llu 条, src 哨兵(空槽随机起点 "
+                    cprintf("Dp32Edge 校验: %llu 行, 非 32 位 DP %llu 条, src 哨兵(旧文件: 空槽随机起点 "
                             "+ GLV 轨道代表) %llu 条, "
                             "起点不在库里 %llu 条, 同终点碰撞 %llu 条 (其中 x 相同 %llu 条, "
                             "x 相同但解不出 %llu 条), 终点去重 %llu\n",
