@@ -922,6 +922,40 @@ static_assert(sizeof(RhoPoint_dev) % 16 == 0, "array stride must be 16B or only 
 __device__ RhoPoint_dev adds_pub_dev[256];
 
 constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
+
+// ---------------------------------------------------------------------------
+// 内核的两级"返回点" (单位: 批; 一批 = 每条 walker 走一步, 见 fun_add_w)
+//
+//   RHO_POLL_BATCHES : 每这么多批读一次 break_flag (host-mapped, 走 PCIe)。
+//                      这是**暂停/停机的响应延迟**, 也是"断流窗口"的长度 ——
+//                      旗子置起后各线程还要走到下一个检查点才散场, 这段里还会
+//                      再冒出一批 DP 命中, 缓冲余量必须接住它。
+//   RHO_ROUND_BATCHES: 无条件返回点, 决定落盘节奏 (与 W 无关)。
+//
+// 轮询掩码原来是 2^18 (= 每 walker 262,144 步), 在 W=24 下单批量 2.6 分钟
+// —— "有人在用机器就停算"这个需求等不起, 所以降到 2^12。
+//
+// 降下来在**正确性**上是单向变好 (断流窗口短了 64 倍, 越界概率只降不升):
+//   edge 路 32 位边  λ = states x P / 2^32
+//        P=2^18: 376,832 x 262,144 / 2^32 = 23.0 条  (这就是 edge_window_slack 的由来)
+//        P=2^12: 376,832 x   4,096 / 2^32 =  0.36 条
+//   生产路 40 位     λ = states x 3 x P / 2^40
+//        P=2^18: 282,624 x 3 x 262,144 / 2^40 = 0.20 条   (余量 20 档)
+//        P=2^12: 282,624 x 3 x   4,096 / 2^40 = 0.003 条
+// 代价是 host-mapped 读的频率: W=24 下 P=2^12 是每 walker 每 2.4 s 一次, 一次
+// PCIe 读 ~1-2 us, 摊到 11,776 个线程也还是 1e-5 量级的开销 —— 实测看不出来。
+// 外层 `(count_rho & (P-1)) == 0` 这个 AND+分支**原本每一批就有**, 所以改小 P
+// 不增加热路径指令条数, 只是让内层那次 volatile 读更频繁。
+//
+// ⚠ 必须是 2 的幂, 且必须整除 RHO_ROUND_BATCHES (否则那个无条件返回点被短路,
+//   内核永远不自己收工)。两个 static_assert 在下面。
+// ---------------------------------------------------------------------------
+constexpr uint64_t RHO_POLL_BATCHES = 1ULL << 12;
+constexpr uint64_t RHO_ROUND_BATCHES = 1ULL << 24;
+static_assert((RHO_POLL_BATCHES & (RHO_POLL_BATCHES - 1)) == 0, "RHO_POLL_BATCHES must be a power of two");
+static_assert(RHO_ROUND_BATCHES % RHO_POLL_BATCHES == 0,
+              "RHO_ROUND_BATCHES must be a multiple of RHO_POLL_BATCHES (inner break would be short-circuited)");
+
 // DP 命中后的**预备队** (按"换起点次数"一取出, 一人一个; GLV 之后一条记录
 // 不一定换起点 —— 只有 p 自己命中的那条才换, 见 reset_start_point)。
 // 它和 RhoStates_dev 不是一回事: 这个数组不参与迭代, 只在某个 walker 命中可区分点
@@ -1007,13 +1041,18 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 //   16   565,248     81 MB    143 MiB     2.22 s
 //   32 1,130,496    163 MB    286 MiB     4.44 s
 //   (设备态 = states x 144 B, 文本态 = states x 256 B, 落盘按
-//    save_RhoStates_dev_fast 实测 3.93 us/条。) 这一列随 states 线性, 可外推。
-// 启动补点另行记账: 只在 states 超过 D:\RhoState2.txt 现有条数时发生, 耗时是
-// (states - 现有条数) x 单点耗时, 单点由 RhoPoint::rand() 在多线程 CPU 上算,
-// 实测 ~0.045 ms/点 (16 线程)。**这一列的绝对值随文件大小和 CPU 负载变, 不要
-// 记成常数**; 只记两件不变的事: 它随 W 线性增长, 且完全发生在 kernel 之外
-// (补点期间 GPU 全程空转)。例: 文件 188,416 条时 W<=5 一个缺口都不用补, W=32
-// 要补 942,080 个 (实测 ~42 s)。
+//    save_RhoStates_dev 实测 3.93 us/条。) 这一列随 states 线性, 可外推。
+// 启动补点另行记账: 只在 states 超过 RhoState2.txt 现有条数时发生, 耗时是
+// (states - 现有条数) x 单点耗时。单点由 RhoPoint::rand() 算, 而那条路径是
+// **串行单线程**的 —— 调用点 (init_RhoStates_dev 的缺口循环) 是个普通 for 循环,
+// RhoPoint::rand() 内部也没有并行 (2 次 MakeNewKey + create() 的 2 次标量乘
+// + 1 次点加)。实测 ~0.045 ms/点 (= 44.6 us)。
+//   ⚠ 别按线程数去除: 这条链路的耗时与 CPU 核数无关, 只与缺口条数成正比。
+//   **绝对值还随 CPU 负载变, 不要记成常数**; 只记两件不变的事: 它随 W 线性
+//   增长, 且完全发生在 kernel 之外 (补点期间 GPU 全程空转)。
+// 例: 文件 188,416 条时 W<=5 一个缺口都不用补, W=32 要补 942,080 个 (~42 s);
+//     W=24 (282,624 states) 从 0 开始要补 282,624 个 (~12.6 s), 从上面那个文件
+//     起步则补 94,208 个 (~4.2 s)。
 //
 // ==== OPT-7: 寄存器上限 (nvcc -maxrregcount), 已设 168 ====
 // ⚠ 这条设置**没有**写进受版本控制的 src/CMakeLists.txt —— 它只存在于构建目录的
@@ -1036,7 +1075,8 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 //
 // ==== 生产核 rho_w<W> 的真实吞吐 (W=4, block=128, RHO_CONC_CURVE=1) ====
 // 之前从没测过生产核的吞吐 —— 这里用"预置 break_flag=true, 让内核跑完第一个
-// poll 段 (2^18 批 = 每线程 2^20 点) 就返回"的办法量出纯生产循环的稳态吞吐:
+// poll 段 (当时是 2^18 批 = 每线程 2^20 点; 现在常量已改成 2^12, 见
+// RHO_POLL_BATCHES, 本表是当时的口径) 就返回"的办法量出纯生产循环的稳态吞吐:
 //   k   grid  threads  warps/SM    总吞吐 pts/s     每线程 pts/s    s/一轮
 //   1     46    5,888      4        263,566,679       44,763       23.4
 //   2     92   11,776      8        414,780,612       35,222       29.8
@@ -1153,7 +1193,7 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 //   自己走够远)。产出率 = 整卡吞吐 / 2^40, 于是只看总吞吐这一列:
 //     W=4 399.7M  ->  W=8 539.1M  ->  W=16 665.7M  ->  W=32 745.7M pts/s
 //   代价是 states = threads x W 线性涨 (47,104 -> 376,832): 启动补点 ~8 s (只这一次),
-//   每轮落盘 100 MB / ~1.5 s (save_RhoStates_dev_fast), 单 walker 速度掉到 1,979 pts/s
+//   每轮落盘 100 MB / ~1.5 s (save_RhoStates_dev), 单 walker 速度掉到 1,979 pts/s
 //   ⇒ 内核 2^24 批的返回点从 ~30 分钟拉长到 ~2.35 小时 (一轮的墙钟时间)。
 //   要换回来只改这一行; 上面 W=4 的实测表与开销表保留作历史对照, 不必重算。
 //
@@ -1173,16 +1213,23 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 //         单轮耗时   153.8 s -> 200.6 s (+30%)
 //         每轮落盘    ~72 MB -> ~96 MB
 // 所以 2026-11-02 的复核意见是"改 W=24 更划算" (拿 2.4% 吞吐换 25~33% 的
-// state/落盘/启动开销), 但**用户裁决暂时不动, 维持 32**。要改只改下面这一行;
+// state/落盘/启动开销), 当时保留 32; **2026-11-09 用户裁决: 改为 24**。
 // 这次的仪器 (perf_rho_w_prod_kpol / perf_rho_w_w_sweep) 已删 —— 要复核就按上面
-// 的口径重加一次 (每档 2^18 批, A B A B 交错, 分母别拿每线程当每 walker)。
+// 的口径重加一次 (每档 2^18 批 —— 注意现在的 RHO_POLL_BATCHES 已降到 2^12,
+// 要复现这张表得临时改回去; 分母别拿每线程当每 walker)。
 //
 // ⚠ 两组数字别混: 上表的 pts/s 是**整卡总吞吐**; 换算成 "steps/s/walker" 要除以
 //   states (= threads x W) —— 本轮 sweep 是 492.4M / 376,832 = 1,306 (W=32) 与
 //   481.0M / 282,624 = 1,702 (W=24)。生产日志里那个 1,446 (GLV 后) / 1,931 (GLV 前)
 //   是 flush_round_rate 按**整轮** (2^24 批) 算的, 比 sweep 的 2^18 批高 ~10%:
 //   sweep 的样本太短, 内核启动 + 54 MB 状态载入没有摊开。**只有同一口径内的比值可比**。
-constexpr int RHO_GPU_WALKERS = 32;
+//
+// ⚠ 2026-11-09 改为 24 (用户裁决)。连带变化:
+//     states                    376,832 -> 282,624
+//     kRhoState2FrontRecords    376,832 -> 282,624 (自动跟随, 见下面的定义)
+//     每轮落盘                  ~96 MB -> ~72 MB, 单轮 200.6 s -> 153.8 s
+//     RhoState2.txt 现有 188,416 条 < 282,624 => 首轮要补 94,208 个点 (一次性)
+constexpr int RHO_GPU_WALKERS = 24;
 
 // 起点漫游 (32 位判据, dp32_edge_play) 的每线程 walker 数 —— 与生产路**分开定档**。
 // 它的产出率是"整卡吞吐 / 2^32", 只看总吞吐这一列, 所以和生产路一样往大取:
@@ -1190,15 +1237,17 @@ constexpr int RHO_GPU_WALKERS = 32;
 // 即 W=32 比 W=4 快 1.87 倍, 边产出率同比例 (0.093 -> 0.174 边/秒)。
 //
 // ⚠ 但它被**断流窗口**卡住, 不能只改这一个数: 每轮上限是 edge_max_edges = 90 条边,
-//   而 break_flag 置起后各线程要走到下一个 2^18 批的检查点才散场, 这段窗口里还会再
-//   冒出一批命中, 且期望值随 states (= 线程数 x W) 线性涨:
-//     W=4   47,104 states   期望  2.9 条   -> 20 档余量下越界概率 3e-13/轮 (旧配置)
-//     W=32 376,832 states   期望 23.0 条   -> 20 档余量下 0.13/轮 (必崩)
-//   所以加 W 必须同时加 edge_pool_size (缓冲容量), 见那边的推导。
+//   而 break_flag 置起后各线程要走到下一个 RHO_POLL_BATCHES 的检查点才散场, 这段
+//   窗口里还会再冒出一批命中, 且期望值随 states (= 线程数 x W) 线性涨 (口径: 每
+//   walker 每个 poll 间隔走 RHO_POLL_BATCHES 步):
+//     W=4   47,104 states   P=2^18 期望  2.9 条 /  P=2^12 期望 0.045 条
+//     W=32 376,832 states   P=2^18 期望 23.0 条 /  P=2^12 期望 0.36 条
+//   P=2^18 时 20 档余量已经不够 (0.13/轮必崩), 所以当时把 edge_pool_size 加到 234;
+//   现在 P=2^12, 20 档早就够了 —— 但余量留着不吃亏 (只占 11 KB), 见 edge_window_slack。
 //
 // 其余联动项 (都已核对过, 不需要跟着改):
 //   · dp_buffer_size (110) 是**生产路**的槽位数, 同时决定 RhoStates_reserve 常量内存、
-//     rho.cpp 的预备队账本条数、D:\RhoReserve.txt 的 "slots" 校验 —— 两边已解耦,
+//     rho.cpp 的预备队账本条数、RhoReserve.txt 的 "slots" 校验 —— 两边已解耦,
 //     edge 用自己的一套设备内存 (edge_states_dev / edge_src_dev), 不碰 dp_buffer_size。
 //   · total_points = threads x W 由 rho_play_impl 按 EDGE 分档算出并传进来,
 //     dp32_edge_session 用同一个常量, 两处一致。
@@ -1257,11 +1306,12 @@ constexpr int RHO_PROD_WARPS_PER_SM = 8;
 //
 // 记录密度 (两套判据分开数, 别加成"3 x"):
 //   40 位档案: 3 x 2^-40 每步 —— 生产路三个代表全进; edge 路只有 βp / β²p 与
-//              空槽上的 p 进 (活槽的 p 走 32 位那条, 见下)。生产路 (W=32, 每 walker
-//              2^24 步) 每轮期望 ~17 条; edge 路断流窗口期望 3 x states x 2^18 / 2^40
-//              ~= 0.27 条 (edge 路的上限与余量按 32 位那条算, 见 edge_window_slack)。
+//              空槽上的 p 进 (活槽的 p 走 32 位那条, 见下)。生产路 (W=24, 每 walker
+//              2^24 步) 每轮期望 ~12 条; edge 路断流窗口 (RHO_POLL_BATCHES) 期望
+//              3 x states x 2^12 / 2^40 ~= 0.003 条 (上限与余量按 32 位那条算,
+//              见 edge_window_slack)。
 //   32 位边表: 1 x 2^-32 每步, **只由活槽的 p 自己产生** (βp / β²p 不写边),
-//              edge 路每轮上限 90 条、断流窗口期望 ~23 条 (见 edge_window_slack)。
+//              edge 路每轮上限 90 条、断流窗口期望 ~0.36 条 (见 edge_window_slack)。
 //
 // ⚠ 32 位判据 (distinguishable32) 在 edge 路上**只判 p 自己** (要的是"从库起点
 //   走出来的下一条边", βp / β²p 不在那条链上); 生产路仍按同一规则判三个代表。
@@ -1624,14 +1674,16 @@ static constexpr uint64_t EDGE_SRC_NONE = (uint64_t)-1;
 // "一轮落一批"的量级选择)。断流窗口的余量不在这里, 在 edge_window_slack。
 constexpr unsigned int edge_max_edges = dp_buffer_size - 20;   // = 90
 
-// 断流窗口余量 (档数)。窗口 = break_flag 置起到各线程走到下一个 2^18 批检查点,
-// 这段里还会再冒出一批命中。边现在只由"活槽上的 p 自己命中 32 位"产生, 每步一份:
-//   期望 λ = states x 2^18 / 2^32,  states = 92 x 128 x RHO_EDGE_WALKERS
-//          = 376,832 x 2^18 / 2^32 = 23.0 条 (W=32)
-// 越界 = 这 23 条里冒到第 slack+1 条以上 (第 90 条之后又写满 slack+1 格):
-//   slack  20 -> 6e-12/轮      (早已够用)
-//   slack 144 -> 远小于 1e-30/轮   (留这一档: 余量只花 11 KB 内存)
-// 保留 144 是因为它还同时当着"起点池容量 - 写限"—— 改小收益为零, 改大要重算。
+// 断流窗口余量 (档数)。窗口 = break_flag 置起到各线程走到下一个检查点, 这段里还会
+// 再冒出一批命中。边现在只由"活槽上的 p 自己命中 32 位"产生, 每步一份:
+//   期望 λ = states x RHO_POLL_BATCHES / 2^32,  states = 92 x 128 x RHO_EDGE_WALKERS
+//   P=2^18 (旧): 376,832 x 262,144 / 2^32 = 23.0 条  ← 这个 144 就是按它定的
+//   P=2^12 (今): 376,832 x   4,096 / 2^32 =  0.36 条
+// 越界 = 这 0.36 条里冒到第 slack+1 条以上 (第 90 条之后又写满 slack+1 格):
+//   slack  20 -> 已经远远够用 (P=2^18 时是 6e-12/轮, 现在更小)
+//   slack 144 -> 远小于 1e-30/轮
+// ⚠ 轮询改成 2^12 之后这个余量已经**过剩**, 但它同时当着"起点池容量 - 写限",
+//   改小收益为零 (省 11 KB), 改大要重算, 所以保留原值不动。
 // 代价只有内存: 234 x 80 B 的边缓冲 + 234 x 144 B 的起点池 ≈ 52 KB, 可忽略。
 constexpr unsigned int edge_window_slack = 144;
 
@@ -1705,8 +1757,9 @@ __device__ void add_dp_to_buffer(uint64_t d, const RhoPoint_dev& r,
     //   漫游 (EDGE=true) : 容量 edge_pool_size (234), 上限 edge_max_edges (90),
     //                      余量 edge_window_slack (144 档); 32 位边只剩
     //                      "活槽的 p 自己命中"这一种, 期望 23 条 -> 144 档绰绰有余。
-    //   index 由 atomicAdd 取, 可以越过 max_size (break_flag 要等内核走到下一个检查点
-    //   才被看到), 越出的那些就是靠上面的余量接住的; 越出余量 = 越界写。
+    //   index 由 atomicAdd 取, 可以越过 max_size (break_flag 要等内核走到下一个
+    //   RHO_POLL_BATCHES 检查点才被看到), 越出的那些就是靠上面的余量接住的;
+    //   越出余量 = 越界写。
     buffer[index].d = d;
     transfer(buffer[index].sp.m , (const unsigned char*)&r.m);
     transfer(buffer[index].sp.n, (const unsigned char*)&r.n);
@@ -1783,7 +1836,7 @@ void break_rho(bool value)
 
 void _saveDP(uint64_t index, const SecPair& sp);
 // 定义在 blockchain.cpp (与 _saveDP 同处, 那边的 HexStr / iLog 才是文件出口):
-// 一条起点漫游的边 -> 追加一行到 D:\Dp32Edge.txt, 列序 "起点 终点 m n"。
+// 一条起点漫游的边 -> 追加一行到 Dp32Edge.txt, 列序 "起点 终点 m n"。
 void _saveEdge(uint64_t src, uint64_t dst, const SecPair& sp);
 // DP 管理器类
 class DpManager
@@ -1864,7 +1917,7 @@ private:
     unsigned int m_last_resets = 0;
 };
 
-// 起点漫游的边缓冲管理器 —— 与 DpManager 同构, 只是落到 D:\Dp32Edge.txt,
+// 起点漫游的边缓冲管理器 —— 与 DpManager 同构, 只是落到 Dp32Edge.txt,
 // 且多一列"起点索引"。
 class EdgeManager
 {
@@ -1991,7 +2044,7 @@ static EdgeFileLines count_edge_lines(const std::string& name)
 
 // 每轮性能对账的累加器 —— 只在内存里记账, 收工时打一行汇总 (见 flush_round_rate)。
 //
-// 原实现是每轮往生产日志 D:\iLog.txt 写一行 ("dp32edge round N: ...")。一轮动辄上千秒,
+// 原实现是每轮往生产日志 iLog.txt 写一行 ("dp32edge round N: ...")。一轮动辄上千秒,
 // 逐轮写只让日志文件随轮数线性膨胀, 信息量与"收工看一次总账"没多大差别; 所以改成累加。
 // 汇总行的口径与历史逐轮行**逐项一致** (同一套 per_walker / total_steps 公式),
 // 换档重编后仍可与老日志并排比 —— ⚠ 但历史行 (以及改动前的汇总行) 把 per_walker
@@ -2004,25 +2057,23 @@ static EdgeFileLines count_edge_lines(const std::string& name)
 //   总步数 = 每 walker 步数 * walker 状态数; 总步/秒 = 整卡吞吐。
 // 行里还带齐了编译期几何 (grid x block / warps per SM / W / walker 状态数), 所以
 // 单独标定几何也只靠这一行。
-// 注意: batches 是 idx==0 的采样。break_flag 是在 2^18 的整数倍上被看到的, 各线程
-// 快慢不同会落在相邻两档, 所以它是 ±2^18 批的采样值, 不是全体精确值。
+// 注意: batches 是 idx==0 的采样。break_flag 是在 RHO_POLL_BATCHES 的整数倍上
+// 被看到的, 各线程快慢不同会落在相邻两档, 所以它是 ±RHO_POLL_BATCHES 批的采样值,
+// 不是全体精确值。
 struct RoundRateAcc {
     const char* tag = "";
     uint64_t rounds = 0;             // 已累加的轮数
     double secs = 0.0;               // 各轮核函数耗时之和 (不含落盘/落边)
     unsigned long long steps = 0;    // 各轮 "每 walker 步数 (batches)" 之和
     unsigned long long hits = 0;     // 各轮命中数之和 (EDGE 档 = 落边条数)
-    double best = 0.0, worst = 0.0;  // 单轮最快/最慢的整卡吞吐 (steps/s)
-    uint64_t best_round = 0, worst_round = 0;
     int total_points = 0, W = 0, grid = 0, block = 0;
 };
 
 static RoundRateAcc g_round_rate;
 
-static void accum_round_rate(const char* tag, uint64_t round_index, double secs,
+static void accum_round_rate(const char* tag, double secs,
                              unsigned long long batches, int total_points, int W,
-                             int grid, int block, unsigned int hits)
-{
+                             int grid, int block, unsigned int hits){
     RoundRateAcc& a = g_round_rate;
     // 一批 = W 条 walker 各走一步 ⇒ 每 walker 的步数**就是批数本身** (batches = count_rho)。
     // 曾经写成 batches * W —— 那是"这个线程一共产出多少点", 单位是点不是步: 于是
@@ -2030,7 +2081,6 @@ static void accum_round_rate(const char* tag, uint64_t round_index, double secs,
     // 注意 total_points = 线程数 * W 本来已含 W, 所以整卡吞吐跟着一起虚 W 倍 —— 两栏
     // 内部是一致的, 光看日志自洽性发现不了这个错 (要靠与基准的每线程点数对账)。
     const uint64_t per_walker = batches;
-    const double rate_total = (secs > 0.0) ? (double)per_walker * total_points / secs : 0.0;
 
     a.tag = tag;
     a.rounds++;
@@ -2041,8 +2091,6 @@ static void accum_round_rate(const char* tag, uint64_t round_index, double secs,
     a.W = W;
     a.grid = grid;
     a.block = block;
-    if (a.rounds == 1 || rate_total > a.best) { a.best = rate_total; a.best_round = round_index; }
-    if (a.rounds == 1 || rate_total < a.worst) { a.worst = rate_total; a.worst_round = round_index; }
 }
 
 // 收工时的总账: 一行打完并复位累加器 (重复调用只出一次)。控制台与生产日志各一份。
@@ -2061,75 +2109,13 @@ static void flush_round_rate()
     char buf[512];
     snprintf(buf, sizeof(buf),
              "%s 汇总: %llu 轮, %.1f s, %llu steps/walker (%.0f steps/s/walker), "
-             "%.1f M steps/s, %llu hits, 单轮 %.1f~%.1f M steps/s (最快第 %llu 轮, 最慢第 %llu 轮), "
+             "%.1f M steps/s, %llu hits, "
              "geometry %dx%d (%d warps/SM, W=%d, %d states)",
              a.tag, (unsigned long long)a.rounds, a.secs,
              a.steps, rate_walker, rate_total / 1e6, a.hits,
-             a.best / 1e6, a.worst / 1e6,
-             (unsigned long long)a.best_round, (unsigned long long)a.worst_round,
              a.grid, a.block, RHO_PROD_WARPS_PER_SM, a.W, a.total_points);
     cprintf("%s\n", buf);
     ilog_line(buf);
-}
-
-// 设备端辅助函数：将32位整数转换为大端序十六进制字符串
-__host__ __device__ void uint32_to_hex_be(char* output, uint32_t value)
-{
-    const char hex_chars[] = "0123456789abcdef";
-    for (int i = 0; i < 8; i++) {
-        // 从最高位字节开始处理 (大端序)
-        uint8_t byte = (value >> ((7 - i) * 4)) & 0xF;
-        output[i] = hex_chars[byte];
-    }
-}
-
-// 设备端辅助函数：将uint256_t转换为大端序十六进制字符串
-__host__ __device__ void uint256_to_hex_be(char* output, const uint256_t& value)
-{
-    // 大端序：从最高位limb开始 (limb[7])
-    for (int limb_idx = 7; limb_idx >= 0; limb_idx--) {
-        uint32_to_hex_be(output + (7 - limb_idx) * 8, value.limb[limb_idx]);
-    }
-    output[64] = '\0'; // 终止字符串
-}
-
-// 设备端函数：打印RhoPoint_dev的大端序十六进制表示
-__host__ __device__ void print_rho_point_dev(const RhoPoint_dev& point)
-{
-    // 缓冲区大小：4个256位值 * 64字符 + 分隔符 + 终结符
-    constexpr int buf_size = 4 * 64 + 10;
-    char buf[buf_size];
-    char* ptr = buf;
-
-    // 打印 m
-    uint256_to_hex_be(ptr, point.m);
-    ptr += 64;
-    *ptr++ = '\n';
-
-    // 打印 n
-    uint256_to_hex_be(ptr, point.n);
-    ptr += 64;
-    *ptr++ = '\n';
-
-    // 打印 x 坐标
-    uint256_to_hex_be(ptr, point.x.x);
-    ptr += 64;
-    *ptr++ = '\n';
-
-    // 打印 y 坐标
-    uint256_to_hex_be(ptr, point.x.y);
-    ptr += 64;
-
-    // 添加无穷标志
-    if (point.x.infinity) {
-        *ptr++ = '\n';
-        *ptr++ = 'I';
-    }
-
-    *ptr = '\0'; // 终结字符串
-
-    // 打印结果
-    printf("\nRhoPoint_dev:\n%s\n", buf);
 }
 
 // ================== 多 walker 内核 ==================
@@ -2258,24 +2244,24 @@ __global__ void __launch_bounds__(128, 3) rho_w()
                 }
             }
         }
-        // 周期性返回, 让 rho_play 能定期落盘 (意外关机最多丢这一段):
-        //   每 2^18 批 poll 一次外部 break_flag;
-        //   第 2^24 批无条件返回 (= 每条 walker 2^24 步, 与 W 无关)。
+        // 周期性返回, 让 rho_play 能定期落盘 (意外关机最多丢这一段), 同时给
+        // "停算"一个响应点:
+        //   每 RHO_POLL_BATCHES (2^12) 批 poll 一次外部 break_flag  -> 暂停/停机延迟;
+        //   第 RHO_ROUND_BATCHES (2^24) 批无条件返回 (= 每条 walker 2^24 步, 与 W 无关)
+        //   -> 落盘节奏。
         // 时长对齐: 时间目标取 CPU 侧 play() 同一件事的周期 —— 0 号线程 (W0=2)
         //   在 count_try = 2^30 批 (= 2^31 点) 时 pause 落盘 (blockchain.cpp),
         //   按其 ~1.29M pts/s 约 30 分钟。
-        //   ⚠ CPU 侧那 30 分钟与 GPU 侧**不再对齐**: W=4 时单 walker 8,485 步/秒
-        //   => 2^24 步 = 1,977 s = 33 分钟 (当年就是照这个对齐的); 生产改成 W=32
-        //   后单 walker 只有 1,979 步/秒 => 2^24 步 = 8,478 s = 2.35 小时, 比 CPU 侧
-        //   的 pause 慢 4.7 倍。两条线程各有各的落盘节奏 (barrier 只包含 CPU 线程,
-        //   见 play() 的 std::barrier(n_tasks)), 所以只是 GPU 侧落盘变粗, 不互相阻塞。
-        //   起点漫游 (W=4) 仍是 ~30 分钟一档: 2^26 点/线程下每条 walker 平均命中
-        //   2^26/2^32 次 32 位 DP, 一轮的边数远小于缓冲区上限。
-        // 注意: 内层判断被外层 (count_rho & 0x3FFFF) == 0 短路, 所以 2^24 必须
-        //       是 2^18 的整数倍 (2^24 = 64 x 2^18, 成立), 否则这一支永远不会被求值。
+        //   ⚠ CPU 侧那 30 分钟与 GPU 侧**不再对齐**: W=24 时单 walker 1,702 步/秒
+        //   => 2^24 步 = 9,858 s = 2.74 小时, 比 CPU 侧的 pause 慢 5.5 倍。两条线程
+        //   各有各的落盘节奏 (barrier 只包含 CPU 线程, 见 play() 的
+        //   std::barrier(n_tasks)), 所以只是 GPU 侧落盘变粗, 不互相阻塞。
+        // 注意: 内层判断被外层 `(count_rho & (RHO_POLL_BATCHES-1)) == 0` 短路,
+        //       所以 RHO_ROUND_BATCHES 必须是 RHO_POLL_BATCHES 的整数倍
+        //       (2^24 = 4096 x 2^12, 成立; 有 static_assert 兜着)。
         // 注意: count_rho 是批数, 而 printf 打的是点数, 两套单位不要混。
-        if ((count_rho & 0x3FFFF) == 0) {
-            if (*break_flag_dev || (count_rho & 0xFFFFFF) == 0) break;
+        if ((count_rho & (RHO_POLL_BATCHES - 1)) == 0) {
+            if (*break_flag_dev || (count_rho & (RHO_ROUND_BATCHES - 1)) == 0) break;
         }
     }
 #pragma unroll
@@ -2386,7 +2372,7 @@ extern secp256k1_context* ctx;
 // 侧的逻辑, 一行 CUDA 都用不上; 设备侧只剩上面的 upload_RhoStates_reserve 与
 // RhoStates_reserve 那份常量内存。
 
-static const std::string _RSFile2_name = "D:\\RhoState2.txt";
+static const std::string _RSFile2_name = data_file("RhoState2.txt");
 int loadRhoState(RhoState* s, int num, const std::string& name);
 bool saveRhoState(const RhoState* s, int num, const std::string& name);
 
@@ -2442,8 +2428,28 @@ static inline void hex_encode(char* dst, const unsigned char* src, int n)
 // 扫描不存储; 文件以二进制打开并显式写 \r\n, 避开 CRT 文本模式逐字节翻译。
 // 单条记录布局 (times=0 时恰好 265 字节):
 //   x(64B)->128 hex + \r\n, m(32B)->64 hex + \r\n, n(32B)->64 hex + \r\n, times + \r\n
-static void save_RhoStates_dev_fast(const RhoState* s, int num, const std::string& name)
+//
+// 唯一的落盘入口: 收设备指针, 回读 + 转 RhoState + 写文本全在这一处。两条路只是
+// "times 那一列写什么" 不同 (原来是 fast/slow 两层, 只是把回读在两层之间搬来搬去,
+// 现已合并):
+//   times == nullptr -> 该列写 0           (生产路 rho_w: 不记步数)
+//   times != nullptr -> 逐条取 times[i]    (起点漫游路: 该列是起点索引, 不是步数)
+static void save_RhoStates_dev(const RhoPoint_dev* dev, int num, const std::string& name,
+                               const uint64_t* times = nullptr)
 {
+    // 0) 回读 + 转成文本用的 RhoState。缓冲复用以免每轮重新分配几十 MB。
+    static std::vector<RhoPoint_dev> staging;
+    static std::vector<RhoState> rsv;
+    staging.resize(num);
+    rsv.resize(num);
+    CHECK_CUDA(cudaMemcpy(staging.data(), dev, (size_t)num * sizeof(RhoPoint_dev),
+                          cudaMemcpyDeviceToHost));
+    for (int i = 0; i < num; i++) {
+        staging[i].to(rsv[i]);
+        rsv[i].times = times ? times[i] : 0ULL;
+    }
+    const RhoState* s = rsv.data();
+
     // 1) 保留 num*4 行之后的 tail, 语义与 saveRhoState 一致, 但不再把前面的行存下来
     std::string tail;
     {
@@ -2513,25 +2519,6 @@ static void save_RhoStates_dev_fast(const RhoState* s, int num, const std::strin
     file.close();
 }
 
-void save_RhoStates_dev(int total_points, const std::string& name)
-{
-    std::vector<RhoState> rsv;
-    rsv.resize(total_points);
-    static std::vector<RhoPoint_dev> staging;
-    staging.resize(total_points);
-
-    CHECK_CUDA(cudaMemcpy(staging.data(), RhoStates_host, total_points * sizeof(RhoPoint_dev), cudaMemcpyDeviceToHost));
-
-    for (int i = 0; i < total_points; i++) {
-        staging[i].to(rsv[i]);
-        rsv[i].times = 0;
-    }
-
-    save_RhoStates_dev_fast(rsv.data(), total_points, name);
-
-    std::cout << get_time() << " : save_RhoStates_dev. " << std::endl;
-}
-
 // ---------------------------------------------------------------------------
 // 被征召的预备点"重走"探针 (入口: testmvp 120 892)
 //
@@ -2551,7 +2538,7 @@ void save_RhoStates_dev(int total_points, const std::string& name)
 // 有 N 组等价的 (m,n) (模 N 的解有 N 组), 轨迹不同则 (m,n) 不同 —— 512 位撞上一条不是
 // 巧合。命中之后拿 x 复核一次 (x 也要逐字节相同)。
 //
-// 起点从哪来: D:\DpDrafted32.bin 尾部那几条非墓碑记录 = 最近被征召的几个预备点的原始
+// 起点从哪来: DpDrafted32.bin 尾部那几条非墓碑记录 = 最近被征召的几个预备点的原始
 // (m, n)。源库里同一批槽位已经打成墓碑 (m/n 清零) 拿不到; 已征召库是 append 的, 尾部
 // 就是最近被征召的。index / m / n 都打出来, 便于人工核对是哪几个槽位。
 //
@@ -2569,7 +2556,7 @@ constexpr size_t kDraftedRecordBytes = 72;
 // 当前生产几何下"最近一轮写下的前段"有多少条: 92 x 128 x RHO_GPU_WALKERS
 // (W=4 时 47104, W=32 时 376832 —— 与 total_points 同一个数)。
 // RhoState2.txt 里 0..前段-1 是最近一轮 (写盘的那个进程) 的落盘状态, 之后是更早的
-// 一轮写的、之后每次写盘都原样保留的冻结段 (见 save_RhoStates_dev_fast 保留尾部的说明)。
+// 一轮写的、之后每次写盘都原样保留的冻结段 (见 save_RhoStates_dev 保留尾部的说明)。
 // ⚠ rho_rewalk_probe 的 ref.load 上限写在下面 (400000), 改 W 大到 3 以上时注意别被截。
 constexpr int kRhoState2FrontRecords = 92 * 128 * RHO_GPU_WALKERS;
 
@@ -2726,14 +2713,14 @@ void rho_rewalk_probe()
 {
     std::vector<RhoPoint> starts;
     std::vector<uint64_t> starts_index;
-    if (!rewalk_load_starts("D:\\DpDrafted32.bin", RHO_GPU_WALKERS, starts, starts_index)) {
-        cprintf("rewalk: 读不到 D:\\DpDrafted32.bin 尾部的非墓碑记录, 中止\n");
+    if (!rewalk_load_starts(data_file(DP32_DRAFTED_NAME), RHO_GPU_WALKERS, starts, starts_index)) {
+        cprintf("rewalk: 读不到 %s 尾部的非墓碑记录, 中止\n", data_file(DP32_DRAFTED_NAME).c_str());
         return;
     }
 
     RewalkRefSet ref;
-    if (!ref.load("D:\\RhoState2.txt", 400000)) {
-        cprintf("rewalk: 读不到 D:\\RhoState2.txt, 中止\n");
+    if (!ref.load(_RSFile2_name, 400000)) {
+        cprintf("rewalk: 读不到 %s, 中止\n", _RSFile2_name.c_str());
         return;
     }
 
@@ -2768,9 +2755,10 @@ void rho_rewalk_probe()
     const uint64_t max_steps = 1ULL << 27;
     std::vector<RewalkWalk> out((size_t)N);
 
-    cprintf("\nrewalk 探针: 起点 %d 个 (D:\\DpDrafted32.bin 尾部非墓碑记录), 参照 %llu 条 "
-            "(D:\\RhoState2.txt, 前段 %d 条)\n",
-            N, (unsigned long long)ref.records(), kRhoState2FrontRecords);
+    cprintf("\nrewalk 探针: 起点 %d 个 (%s 尾部非墓碑记录), 参照 %llu 条 "
+            "(%s, 前段 %d 条)\n",
+            N, data_file(DP32_DRAFTED_NAME).c_str(), (unsigned long long)ref.records(),
+            _RSFile2_name.c_str(), kRhoState2FrontRecords);
     for (int k = 0; k < N; k++) {
         char mh[65];
         hex_encode(mh, starts[k].m, 32);
@@ -2859,7 +2847,7 @@ void rho_rewalk_probe()
     }
 }
 
-// DP 测试样点 (供 init_RhoStates_test 的尾槽使用): 取自 D:\DistinguishablePoints.txt
+// DP 测试样点 (供 init_RhoStates_test 的尾槽使用): 取自 DistinguishablePoints.txt
 // 第 1 条记录, 即 40 位判据下的一次真实运行写出的可区分点。已离线核验:
 //   x = m*G + n*MVP
 //     = d0670ffb7d97f164bcb5e73ec8da8f5575ace1a94bf211911028d30000000000
@@ -2887,7 +2875,7 @@ void init_RhoStates_test(int total_points)
         rho_F(ctx, r);
     }
     // 尾槽 (total_points-1) 是独立填充点, 不接在链上, 专门作 DP 判据的被测样点。
-    // m/n 取自 D:\DistinguishablePoints.txt 的记录 (见 RHO_DP_TEST_*): 它自己的 x
+    // m/n 取自 DistinguishablePoints.txt 的记录 (见 RHO_DP_TEST_*): 它自己的 x
     // 低 40 位为 0, 索引 = RHO_DP_TEST_IDX; 它的 beta*x / beta^2*x 不满足判据。
     // validate_point_add 末尾会同时核对单点判据与 GLV 三元组。
     set_int256(r.m, RHO_DP_TEST_M);
@@ -2912,8 +2900,8 @@ void init_RhoStates_test(int total_points)
 //   edge_device_buffer[edge_pool_size]   本轮的边 (容量 234, 每轮上限 90 = edge_max_edges,
 //                                   差的 144 档是断流窗口余量, 推导见 edge_window_slack)
 //
-// 状态文件规模随 W 线性涨 (W=32 时 376,832 条 = 1,507,328 行 / ~105 MB), 每轮整份重写,
-// 所以这里必须走 save_RhoStates_dev_fast (并行格式化 + 大块 write, 实测 ~1.5 s);
+// 状态文件规模随 W 线性涨 (W=24 时 282,624 条 = 1,130,496 行 / ~75 MB), 每轮整份重写,
+// 所以这里必须走 save_RhoStates_dev (并行格式化 + 大块 write, 实测 ~1.2 s);
 // 老的 saveRhoState 每行一次 std::endl 刷新 + 先把旧文件整个读进 vector<string>,
 // 同一份数据要 ~8-10 s, 还额外吃 150 MB 堆。
 //
@@ -2921,7 +2909,7 @@ void init_RhoStates_test(int total_points)
 //   cursor          库游标 = 下一个要发出去的库**位置** (从状态文件的起点索引列恢复:
 //                   把 max(活槽起点索引) 换算成它在库里的位置再 + 1;
 //                   索引值不能直接当位置用, 见 dp32_edge_session 里的换算)
-//   每槽起点索引     落 D:\Dp32EdgeState.txt 的第 4 行 (借 RhoState.times 这一格)
+//   每槽起点索引     落 Dp32EdgeState.txt 的第 4 行 (借 RhoState.times 这一格)
 //
 // 停机: 库走完 (不再有起点可发) 且所有槽都退役 (alive == 0)。库走完之后的尾巴是最后
 // 那批 walker 各自走完自己的 2^32 期望距离, 还要几天, 期间只出不进。
@@ -2932,15 +2920,18 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     constexpr int W = RHO_EDGE_WALKERS;
 
     // ---- 全量库 (只读, 起点都从这儿取) ----
-    // drf_path 传 nullptr = 只载这一个库: 全量库是语料的只读快照, 没有墓碑/销账那套账。
+    // 只传 src_path (drf_path 留空) = 只载这一个库: 全量库是语料的只读快照,
+    // 没有墓碑/销账那套账。
     Dp32Store lib;
-    if (!lib.load(DP32_ALL_FILE, nullptr) || !lib.loaded()) {
-        cprintf("%s : %s 载入失败, 起点漫游不启动\n", get_time().c_str(), DP32_ALL_FILE);
+    if (!lib.load(data_file(DP32_ALL_NAME)) || !lib.loaded()) {
+        cprintf("%s : %s 载入失败, 起点漫游不启动\n", get_time().c_str(),
+                data_file(DP32_ALL_NAME).c_str());
         return;
     }
     const uint64_t lib_total = lib.src_count();
     if (lib_total == 0) {
-        cprintf("%s : %s 是空库, 起点漫游不启动\n", get_time().c_str(), DP32_ALL_FILE);
+        cprintf("%s : %s 是空库, 起点漫游不启动\n", get_time().c_str(),
+                data_file(DP32_ALL_NAME).c_str());
         return;
     }
 
@@ -2993,9 +2984,10 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     //            上限 dp_buffer_size - 20 (90), 容量 dp_buffer_size (110)
     // 两个 atomicAdd 计数器、两份设备内存、两个输出文件 (Dp32Edge.txt /
     // DistinguishablePoints.txt) 都不相交; 唯一的共享是 **break_flag** —— 任一侧
-    // 写满自己的上限就把本轮标记为收工, 内核在下一个 2^18 批检查点返回。这是想要的
+    // 写满自己的上限就把本轮标记为收工, 内核在下一个 poll 检查点返回。这是想要的
     // 语义 (哪一类缓冲先满都该落盘), 且两侧余量都远大于断流窗口的命中量:
-    //   边 23.0 条/窗口 (W=32), 档案 3 x states x 2^18 / 2^40 ≈ 0.27 条/窗口。
+    //   边 states x P / 2^32 (W=32, P=2^12: 0.36 条/窗口),
+    //   档案 3 x states x P / 2^40 (W=24, P=2^12: 0.003 条/窗口)。
     // 起点漫游路判 40 位的只有"追不到来源"的那几个点 (beta*p / beta^2*p / 空槽上的 p),
     // 所以档案池基本恒空; 但它必须**真实存在** —— 内核里 dp_device_buffer 为 nullptr
     // 时一命中就是空指针写。
@@ -3008,7 +3000,7 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     int got = 0;
     {
         std::vector<RhoState> rsv(total_points);
-        got = loadRhoState(rsv.data(), total_points, DP32_EDGE_STATE_FILE);
+        got = loadRhoState(rsv.data(), total_points, data_file(DP32_EDGE_STATE_NAME));
         for (int i = 0; i < got; i++) {
             states_host[i].from(rsv[i]);
             src_host[i] = rsv[i].times;   // 第 4 行的 times 位在这里存的是起点索引
@@ -3073,12 +3065,13 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
     }
     // 边表对账只拿**可追溯起点**的边比游标: 哨兵 src 的边不消耗库位置 —— 旧文件里那批
     // (空槽随机起点 + GLV 轨道代表) 混进来就会误报"状态被回滚"。新写出的行不会再有哨兵。
-    const EdgeFileLines elines = count_edge_lines(DP32_EDGE_FILE);
+    const EdgeFileLines elines = count_edge_lines(data_file(DP32_EDGE_NAME));
     if (got == 0 && elines.total != 0) {
         // 状态没了而边还在: 只能从头重发 (会重复走掉已经走过的号, 但绝不会漏号)。
         cprintf("%s : %s 无记录但 %s 已有 %llu 行 (可追溯起点 %llu / 哨兵 %llu), "
                 "游标从 0 重发 (会重复走)\n",
-                get_time().c_str(), DP32_EDGE_STATE_FILE, DP32_EDGE_FILE,
+                get_time().c_str(), data_file(DP32_EDGE_STATE_NAME).c_str(),
+                data_file(DP32_EDGE_NAME).c_str(),
                 (unsigned long long)elines.total, (unsigned long long)elines.real,
                 (unsigned long long)elines.random_);
     } else if (elines.real > cursor) {
@@ -3101,7 +3094,7 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         // 照常走, 命中改判 40 位进 40 位档案, 并换成下一份随机起点)。随机点单点
         // 约 0.045 ms, 且只在库见底时才出现。
         cprintf("%s : %s 恢复 %d/%d 槽, 其余从库游标 %llu 处补起点\n", get_time().c_str(),
-                DP32_EDGE_STATE_FILE, got, total_points, (unsigned long long)cursor);
+                data_file(DP32_EDGE_STATE_NAME).c_str(), got, total_points, (unsigned long long)cursor);
         int n_rand = 0;
         for (int i = got; i < total_points; i++) {
             RhoPoint p;
@@ -3146,6 +3139,11 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         ilog_line("dp32_edge_play: done already, exit.");
     }
     while (!gameover && alive != 0) {
+        // 停算期间停在这里 (有人在用本机, 见 common.h 的 set_compute_pause)。
+        // 上一轮末尾已经 save_edges / save_dps / save_RhoStates_dev 过, 所以停在这里
+        // 等于"数据落在盘上再停"。必须在 break_rho(false) **之前**: 暂停时旗子是立着
+        // 的, 提前清掉内核就会再跑满一整轮; 顺序反过来才是"放行之后才重新发射"。
+        wait_while_paused();
         break_rho(false);
 
         // 铺起点池 (与 init_RhoStates_reserve 同一时序位: 每轮开始重铺一次池子)。
@@ -3181,7 +3179,7 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         const unsigned int edges = edge_manager.save_edges();
         total_edges += edges;
         // 本轮从"追不到来源"的那几个点上判出来的 40 位 DP (beta*p / beta^2*p /
-        // 空槽上的 p), 追加进 D:\DistinguishablePoints.txt。大多数轮次是 0 条。
+        // 空槽上的 p), 追加进 DistinguishablePoints.txt。大多数轮次是 0 条。
         const unsigned int dp40_hits = dp_manager.save_dps();
         total_dp40 += (uint64_t)dp40_hits;
         // 游标按"被用掉的库池位"推进。两种换起点来源 (见 rho_w):
@@ -3203,15 +3201,14 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
 
         unsigned long long batches = 0;
         CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
-        accum_round_rate("dp32edge", round_no, secs, batches, total_points, W, gridSize, blockSize, edges);
+        accum_round_rate("dp32edge", secs, batches, total_points, W, gridSize, blockSize, edges);
 
         // 状态落盘: 文本 4 行/条, "x / m / n / 起点索引" (与 RhoState 格式逐字一致)。
-        // 走 fast 版: W=32 时是 376,832 条 / 1,507,328 行 / ~105 MB, 每轮都要整份重写,
-        // saveRhoState 那套 (每行 endl 刷新 + 先读旧文件进 vector<string>) 要 8-10 s
-        // 并额外吃 150 MB 堆; fast 版并行格式化 + 大块 write, ~1.5 s。
-        // 语义逐字一致 (times 那一列同样写 src_host[i], 同样保留 num*4 行之后的尾部)。
-        CHECK_CUDA(cudaMemcpy(states_host.data(), states_dev,
-                              total_points * sizeof(RhoPoint_dev), cudaMemcpyDeviceToHost));
+        // 走 save_RhoStates_dev (并行格式化 + 大块 write): W=24 时是 282,624 条 /
+        // 1,130,496 行 / ~75 MB, 每轮都要整份重写; saveRhoState 那套 (每行 endl 刷新 +
+        // 先读旧文件进 vector<string>) 要 8-10 s 并额外吃 150 MB 堆, 这里 ~1.2 s。
+        // 语义逐字一致 (times 那一列写 src_host[i] —— 起点索引, 不是步数)。
+        // 状态点本身由 save_RhoStates_dev 自己回读 states_dev, 这里不用先下载。
         CHECK_CUDA(cudaMemcpy(src_host.data(), src_dev,
                               total_points * sizeof(uint64_t), cudaMemcpyDeviceToHost));
         // 活槽数直接数回读的 src_host。回读是权威值, 而且是 O(n), 比"用边数做减法"
@@ -3222,14 +3219,8 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         for (int i = 0; i < total_points; i++) {
             if (src_host[i] != EDGE_SRC_NONE) alive++;
         }
-        {
-            std::vector<RhoState> rsv(total_points);
-            for (int i = 0; i < total_points; i++) {
-                states_host[i].to(rsv[i]);
-                rsv[i].times = src_host[i];   // 这一格存的是起点索引, 不是步数
-            }
-            save_RhoStates_dev_fast(rsv.data(), total_points, DP32_EDGE_STATE_FILE);
-        }
+        save_RhoStates_dev(states_dev, total_points, data_file(DP32_EDGE_STATE_NAME),
+                           src_host.data());
         round_no++;
 
         if (alive == 0) {
@@ -3288,7 +3279,7 @@ static void rho_play_impl()
         // 初始化break_flag
         init_break_flag();
         // 预备队账本: 槽位数 = DP 缓冲区槽位数。来源与账本本身都在 rho.cpp。
-        // persistent = true: 启动时回读 D:\RhoReserve.txt (货源游标 + 留用队员)。
+        // persistent = true: 启动时回读 RhoReserve.txt (货源游标 + 留用队员)。
         // 不落盘的话游标重启归零, 头几批点跟上一次 run 逐字节重复 —— 重复的那批 DP
         // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
         // ⚠ 来源配成 Random (当前配置) 时 rho.cpp 会把这条通道整个关掉: 既不回读也不
@@ -3307,7 +3298,12 @@ static void rho_play_impl()
             reserve_retire_consumed();
         }
         uint64_t round_no = 0;
+        (void)round_no;   // 轮号已不再进汇总行 (见 flush_round_rate), 留着只为可选调试
         while (!gameover) {
+            // 停算期间停在这里 (有人在用本机, 见 common.h 的 set_compute_pause)。
+            // 上一轮末尾已经 save_reserve_state / save_RhoStates_dev 过, 所以停在这里
+            // 等于"数据落在盘上再停"。顺序与起点漫游路一致: 先等放行, 再清 break_flag。
+            wait_while_paused();
             break_rho(false);
             // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由账本决定
             init_RhoStates_reserve();
@@ -3323,9 +3319,9 @@ static void rho_play_impl()
             note_reserve_dps(dp_manager.last_reset_count());
             unsigned long long batches = 0;
             CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
-            accum_round_rate("rho", round_no++, secs, batches, total_points, W, gridSize, blockSize, hits);
+            accum_round_rate("rho", secs, batches, total_points, W, gridSize, blockSize, hits);
             save_reserve_state();
-            save_RhoStates_dev(total_points, _RSFile2_name);
+            save_RhoStates_dev(RhoStates_host, total_points, _RSFile2_name);
         }
         CHECK_CUDA(cudaFree(RhoStates_host));
         RhoStates_host = nullptr;
@@ -3379,7 +3375,6 @@ __global__ void validate_multi_w()
                 unsigned long long n = atomicAdd(&g_validate_fail, 1ULL);
                 if (n < 4) {
                     printf("validate_multi_w<W=%d> MISMATCH at base=%d k=%d\n", W, base, k);
-                    print_rho_point_dev(s[k]);
                 }
             }
         }
@@ -3498,7 +3493,7 @@ __global__ void validate_point_add()
     }
 
     // 尾槽 (RHOSTATES_TEST_NUM) 是 init_RhoStates_test 从
-    // D:\DistinguishablePoints.txt 填入的历史样点: 它自己的 x 低 40 位为 0, 所以
+    // DistinguishablePoints.txt 填入的历史样点: 它自己的 x 低 40 位为 0, 所以
     // 按 distinguishable (单点口径) 仍是 40 位 DP, 索引与文件记录逐位相符。
     DEV_ASSERT(distinguishable(RhoStates_dev[RHOSTATES_TEST_NUM].x.x) == RHO_DP_TEST_IDX);
 
@@ -3668,9 +3663,14 @@ void perf_test_gpu()
 // warp/SM 到底换来了什么? 如果什么都没换来, 那就是白烧电 —— 在 -pl 受限的笔记本上
 // 还可能触到功耗墙把频率压下去, 总吞吐反而更低。这个账从来没有测过, 现在测。
 //
-// 测法: 生产核是 while(true) 长跑, 但它在 (count_rho & 0x3FFFF) == 0 时轮询
-// break_flag。所以预先置 break_flag = true, 内核跑满 2^18 批 (= 每线程 2^18 * W 点)
-// 就返回。这一段就是纯生产循环的稳态时间 (不含补点, 不含落盘)。
+// 测法: 生产核是 while(true) 长跑, 但它在 (count_rho & (RHO_POLL_BATCHES-1)) == 0
+// 时轮询 break_flag。所以预先置 break_flag = true, 内核跑满 RHO_POLL_BATCHES 批
+// (= 每线程 RHO_POLL_BATCHES * W 点) 就返回。这一段就是纯生产循环的稳态时间
+// (不含补点, 不含落盘)。
+// ⚠ RHO_POLL_BATCHES 从 2^18 降到 2^12 之后, 窗口短了 64 倍, 短程偏乐观会变明显
+//   —— 下面 run_one 的 points 口径已经跟着改成 RHO_POLL_BATCHES (否则会虚高 64 倍),
+//   但**读绝对吞吐时要知道这是 2.4 s 的样本**, 启动/升频没摊开。要长窗口就临时把
+//   RHO_POLL_BATCHES 改回 2^18 再跑, 改完记得改回来 (暂停延迟也一起变回去)。
 //
 // 口径 (只测两档, 单遍):
 //   k=0        1 block x 1 thread —— 同一个内核、同一段 poll 掩码, 就是本进程内的
@@ -3685,7 +3685,10 @@ void perf_test_gpu()
 static void perf_prod_rho_w_throughput(int block)
 {
     constexpr int W = RHO_GPU_WALKERS;
-    const int prod_batches = 1 << 18;   // rho_w 的 poll 掩码, 内核最少要跑这么多批
+    // 测量窗口**必须**等于内核的 poll 掩码: 这里靠"预置 break_flag=true"让内核在
+    // 第一个检查点返回, 所以它实际只跑了 RHO_POLL_BATCHES 批。口径若还按旧的
+    // 2^18 记, 算出来的 pts/s 会虚高 64 倍。
+    constexpr uint64_t prod_batches = RHO_POLL_BATCHES;
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     const int sm = prop.multiProcessorCount;
@@ -3706,8 +3709,9 @@ static void perf_prod_rho_w_throughput(int block)
     if (own_flag) init_break_flag();
     break_rho(true);    // 内核跑完第一个 poll 段就返回
 
-    printf("  [prod] W=%d block=%d SM=%d points/thread=%d\n",
-           W, block, sm, prod_batches * W);
+    printf("  [prod] W=%d block=%d SM=%d points/thread=%llu (window = %llu batches)\n",
+           W, block, sm, (unsigned long long)(prod_batches * (uint64_t)W),
+           (unsigned long long)prod_batches);
 
     // 跑一档并返回每线程吞吐。k=0 = 1 block x 1 thread (进程内单线程参照);
     // k>=1 = 每 SM 发 k 个 block, 即 k*block/32 个 warp/SM。
@@ -4211,10 +4215,10 @@ void validate_test()
 
     // 测试 init_RhoStates_dev / save_RhoStates_dev / loadRhoState 的往返
     int points = 100 * 960;
-    const std::string fn_ = "D:\\test_rs.txt";
-    const std::string fn2_ = "D:\\test_rs2.txt";
+    const std::string fn_ = data_file("test_rs.txt");
+    const std::string fn2_ = data_file("test_rs2.txt");
     init_RhoStates_dev(points, fn_);
-    save_RhoStates_dev(points, fn_);
+    save_RhoStates_dev(RhoStates_host, points, fn_);
     std::vector<RhoState> rsv, rsv2;
     rsv.resize(points);
     rsv2.resize(points);
@@ -4223,7 +4227,7 @@ void validate_test()
     CHECK_CUDA(cudaFree(RhoStates_host));
     RhoStates_host = nullptr;
     init_RhoStates_dev(points, fn_);
-    save_RhoStates_dev(points, fn2_);
+    save_RhoStates_dev(RhoStates_host, points, fn2_);
     int n2 = loadRhoState(rsv2.data(), points, fn2_);
     HOST_ASSERT(n2 == points);
     for (int i = 0; i < points; i++) {
@@ -4306,7 +4310,7 @@ void validate_test()
 // 只有这里把"全局供应器 + 全局账本 + 真库存"串成生产那一串 —— 库不在盘上、游标落进
 // 墓碑堆、上传偏移写错, 都只有这里看得见。
 //
-// persistent = false: 只读不写, 绝不碰生产存档 D:\RhoReserve.txt。
+// persistent = false: 只读不写, 绝不碰生产存档 RhoReserve.txt。
 void validate_reserve_prod_config()
 {
     const ReserveSource rsrc = reserve_configured_source();

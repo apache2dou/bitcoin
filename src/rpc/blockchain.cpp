@@ -64,10 +64,11 @@
 #include <cstdarg>
 #include <cstdio>
 
-#include <condition_variable>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <barrier>
 
 // ---------------------------------------------------------------------------
@@ -2783,12 +2784,91 @@ public:
 
 
 #include <key_io.h>
+
+// ---------------------------------------------------------------------------
+// 数据目录: 一律 = exe 所在目录 (声明与理由见 common.h)
+//
+// 结果缓存在 data_dir() 的函数内静态里。这里刻意不用 std::cout 也不碰 g_log: 这些
+// 函数会被**静态初始化**调用 (下面的 _RSFile1_name / cuda.cu 的 _RSFile2_name 都是
+// namespace 作用域的 std::string), 那时候 cout 的静态初始化可能还没跑完, g_log 更是
+// nullptr。
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+// windows.h 已在本文件顶部引入 (compat/compat.h 之后)
+#else
+#include <sys/types.h>
+#include <unistd.h>   // readlink("/proc/self/exe")
+#endif
+
+namespace {
+
+// exe 所在目录 (不带尾部分隔符)。取不到返回空串。
+std::string data_exe_dir()
+{
+#ifdef _WIN32
+    // 必须用 W 版: 路径里可能有中文, A 版会按 ANSI(GBK) 处理并截断
+    std::vector<wchar_t> wbuf(4096, 0);
+    const DWORD n = ::GetModuleFileNameW(nullptr, wbuf.data(), (DWORD)wbuf.size());
+    if (n == 0 || (size_t)n >= wbuf.size()) return std::string();
+    const fs::path exe(std::wstring(wbuf.data(), (size_t)n));
+    return fs::PathToString(exe.parent_path());
+#else
+    std::vector<char> buf(4096, 0);
+    const ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);
+    if (n <= 0) return std::string();
+    return fs::PathToString(fs::path(std::string(buf.data(), (size_t)n)).parent_path());
+#endif
+}
+
+// 路径分隔符: Windows 用反斜杠, 其余用斜杠。data_dir 的返回值以它结尾,
+// 拼叶子时直接 data_dir() + leaf 就对了, 不必让调用方关心平台。
+#ifdef _WIN32
+constexpr char kDataSep = '\\';
+#else
+constexpr char kDataSep = '/';
+#endif
+
+} // namespace
+
+const std::string& data_dir()
+{
+    static const std::string dir = []() -> std::string {
+        // 唯一规则: exe 所在目录。不再探测 D:\ —— 数据跟 exe 绑在一起,
+        // 整个目录拷走就把状态带走了。
+        const std::string exe_dir = data_exe_dir();
+        if (!exe_dir.empty()) {
+            std::string d = exe_dir;
+            if (d.back() != '\\' && d.back() != '/') d += kDataSep;
+            return d;
+        }
+
+        // 连 exe 路径都取不到 (理论上不会): 退回当前工作目录
+        return std::string(".") + kDataSep;
+    }();
+    return dir;
+}
+
+std::string data_file(const char* leaf)
+{
+    std::string p = data_dir();
+    if (leaf != nullptr) p += leaf;
+
+    // 顺手把叶子前面那段子目录建出来 (baby_map / lambda_map 这种)。建不出来不在这里
+    // 报 —— 后面打开文件会失败, 那才是真正的失败点; 这里抛异常连静态初始化都会挂。
+    const size_t cut = p.find_last_of("\\/");
+    if (cut != std::string::npos && cut + 1 > data_dir().size()) {
+        std::error_code ec;
+        std::filesystem::create_directories(fs::PathFromString(p.substr(0, cut)), ec);
+    }
+    return p;
+}
+
 static RecursiveMutex find_mutex;
 bool save_key(CKey& secret)
 {
     LOCK(find_mutex);
     std::string s = EncodeSecret(secret) + "\r\n";
-    const fs::path path = fsbridge::AbsPathJoin(fs::u8path("D:\\"), fs::u8path("find.txt"));
+    const fs::path path = fs::PathFromString(data_file("find.txt"));
 
     FILE* file{fsbridge::fopen(path, "a+")};
     if (file==NULL) {
@@ -2803,7 +2883,7 @@ bool save_key(CKey& secret)
 #include <iostream>
 #include <fstream>
 std::string read_key() {
-    std::ifstream file("D:\\find.txt"); // 打开文件
+    std::ifstream file(data_file("find.txt")); // 打开文件
     std::string line;
 
     if (file.is_open()) {
@@ -2862,7 +2942,7 @@ void save_map(Map& _map, const std::string& filename)
 void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, const std::string& name)
 {
     std::string baseFileName = name + "_map";
-    std::string directory = "D:\\" + name + "_map\\";
+    std::string directory = data_file((name + "_map\\").c_str());
     std::vector<std::ifstream> fileStreams;
     typedef struct {
         uint64_t value;
@@ -2933,7 +3013,7 @@ void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, 
 secp256k1_context* ctx = nullptr;
 static iLog* g_log = nullptr;
 
-// 生产日志 (D:\iLog.txt) 追加一行, 给 rho.cpp 用 (那边拿不到 g_log)。
+// 生产日志 (iLog.txt) 追加一行, 给 rho.cpp 用 (那边拿不到 g_log)。
 // 日志文件里的文本一直是 UTF-8, 所以不走 cprint/cprintf 那一层 (那是控制台出口)。
 // 日志没开 (g_log == nullptr, 比如 validate 入口) 时静默 —— 自测不该污染生产日志。
 void ilog_line(const std::string& utf8)
@@ -2964,7 +3044,7 @@ bool RhoPoint::rand()
 }
 
 
-static const std::string _RSFile1_name = "D:\\RhoState.txt";
+static const std::string _RSFile1_name = data_file("RhoState.txt");
 
 int loadRhoState(RhoState* s, int num, const std::string& name)
 {
@@ -3042,7 +3122,7 @@ bool saveRhoState(const RhoState* s, int num, const std::string& name)
 }
 
 bool gameover = false;
-int g_run_mode = 3; // 默认模式3：multiple=2，CPU半核
+int g_run_mode = 2; // 默认模式2：multiple=1，CPU 1/4 核
 void break_rho(bool f);
 
 static int64_t BabyNUM = 0x3fffffff;
@@ -3054,8 +3134,46 @@ RhoPoint adds_pub[2][256] = {0};
 
 int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs);
 
+// ---------------------------------------------------------------------------
+// 计算暂停 (有人在用机器就停算)。语义见 common.h 的同名声明。
+//
+// 一个原子布尔 + sleep 轮询就够了: 暂停的粒度是"一轮", 200 ms 的唤醒延迟无所谓,
+// 换来的是没有锁、没有丢唤醒、停机时也不需要"先放行再 join"那一套。
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_compute_paused{false};
+
+bool compute_pause_active()
+{
+    return g_compute_paused.load(std::memory_order_relaxed);
+}
+
+void set_compute_pause(bool pause)
+{
+    if (pause == compute_pause_active()) return;   // 幂等: 状态没变就什么都不做
+    g_compute_paused.store(pause, std::memory_order_relaxed);
+    // GPU: 内核只在 RHO_POLL_BATCHES (2^12 批) 的 poll 检查点上看 break_flag
+    // (见 cuda.cu 的 rho_w)。立旗子让**当前这一轮**尽早收尾并落盘 —— W=24 下
+    // 最坏 2^12 批 ≈ 2.4 s; 不立旗子就要等它自己走完 2^24 批 (约 2.7 小时)。
+    // 撤旗子时清回去, 下一轮才发射得出去。
+    // gameover 时不要清: 那是停机指令, 清掉内核会再跑满一整轮。
+    if (pause || !gameover) break_rho(pause);
+    // 只印控制台: 这两个事件跟生产数据无关, 写进 iLog 只会把日志刷得看不清。
+    cprintf("%s : %s\n", get_time().c_str(), pause ? "有人在用, 计算暂停" : "计算恢复");
+}
+
+void wait_while_paused()
+{
+    // 调用点都在"本轮已经落盘"之后 (见 common.h), 所以停在这里 = 数据已落盘再停。
+    // 200 ms 一次轮询: GPU 一轮是分钟级, CPU 一秒也就查 5 次, 开销可忽略。
+    // gameover 时立刻返回, 所以停机永远不会被暂停卡住。
+    while (compute_pause_active() && !gameover) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+}
+
 void stop_game() {
     gameover = true;
+    // 停机不需要管暂停: wait_while_paused 的循环条件里带 !gameover, 会自己退出。
     break_rho(true);
 }
 
@@ -3065,7 +3183,7 @@ private:
     iLog _log;
 
 public:
-    INIT() : _log("D:\\iLog.txt")
+    INIT() : _log(data_file("iLog.txt"))
     {
         g_log = &_log;
         ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
@@ -3552,9 +3670,9 @@ unsigned char randChar() {
     return rnd[7];
 }
 
-static const std::string _Xvec_name = "D:\\baby_map\\Xvec.bin";
-static const std::string _Mvec_name = "D:\\baby_map\\Mvec.bin";
-static const std::string _DPFile_name = "D:\\DistinguishablePoints.txt";
+static const std::string _Xvec_name = data_file("baby_map\\Xvec.bin");
+static const std::string _Mvec_name = data_file("baby_map\\Mvec.bin");
+static const std::string _DPFile_name = data_file("DistinguishablePoints.txt");
 
 auto saveDP = [](std::ofstream& fs, uint64_t index, const SecPair& sp) {
     static RecursiveMutex dplog_mutex;
@@ -3582,7 +3700,7 @@ auto saveEdge = [](std::ofstream& fs, uint64_t src, uint64_t dst, const SecPair&
 
 void _saveEdge(uint64_t src, uint64_t dst, const SecPair& sp)
 {
-    iLog _edgelog(DP32_EDGE_FILE);
+    iLog _edgelog(data_file(DP32_EDGE_NAME));
     saveEdge(_edgelog.ofs, src, dst, sp);
 }
 
@@ -3758,13 +3876,13 @@ void Dp32Store::unload()
     m_loaded = false;
 }
 
-bool Dp32Store::load(const char* src_path, const char* drf_path)
+bool Dp32Store::load(const std::string& src_path, const std::string& drf_path)
 {
     unload();
-    // 空指针与空串等价 (见头文件): 全量库就是"只有一个库", 不给已征召库路径。
-    // 注意不能直接把 nullptr 赋给 std::string —— 那是 UB, MSVC 下 strlen(nullptr) 当场崩。
-    m_src_path = src_path ? src_path : "";
-    m_drf_path = drf_path ? drf_path : "";
+    // 空串有意义: src_path 空 = 用默认源库; drf_path 空 = "只有一个库", 全量库
+    // DpSource32all.bin 就是这么载的。(老接口用 nullptr 表示后者, 现在统一成空串。)
+    m_src_path = src_path.empty() ? data_file(DP32_SOURCE_NAME) : src_path;
+    m_drf_path = drf_path;
     if (load_impl()) {
         m_loaded = true;
         return true;
@@ -3953,11 +4071,11 @@ bool dp32_store_init()
     if (!s.load()) {
         // 载入失败是异常 (库缺失/损坏 -> 3 类货源回退随机点): 既印在控制台上让人当场
         // 看见, 也留在生产日志里。
-        cprint() << "====Dp32 瘦索引载入失败 (库缺失或损坏): " << DP32_SOURCE_FILE << " / "
-                 << DP32_DRAFTED_FILE << std::endl;
+        cprint() << "====Dp32 瘦索引载入失败 (库缺失或损坏): " << data_file(DP32_SOURCE_NAME) << " / "
+                 << data_file(DP32_DRAFTED_NAME) << std::endl;
         if (g_log != nullptr) {
-            g_log->ofs << "====Dp32 瘦索引载入失败 (库缺失或损坏): " << DP32_SOURCE_FILE
-                       << " / " << DP32_DRAFTED_FILE << std::endl;
+            g_log->ofs << "====Dp32 瘦索引载入失败 (库缺失或损坏): " << data_file(DP32_SOURCE_NAME)
+                       << " / " << data_file(DP32_DRAFTED_NAME) << std::endl;
         }
         return false;
     }
@@ -3982,8 +4100,8 @@ bool dp32_store_init()
 // 自测: 全部走合成文件 (不碰生产库); 最后若真库在, 再做一轮抽样复算。
 void validate_dp32_store()
 {
-    const std::string psrc = std::string(DP32_SOURCE_FILE) + ".selftest";
-    const std::string pdrf = std::string(DP32_DRAFTED_FILE) + ".selftest";
+    const std::string psrc = data_file((std::string(DP32_SOURCE_NAME) + ".selftest").c_str());
+    const std::string pdrf = data_file((std::string(DP32_DRAFTED_NAME) + ".selftest").c_str());
     const std::string pbad = psrc + ".bad";
 
     auto mk = [](uint64_t index, unsigned char tag) {
@@ -4420,12 +4538,13 @@ void validate_dp32_corpus(Dp32CorpusTarget target)
     const char* const label = all_mode ? DP32_CORPUS_NAME_ALL : DP32_CORPUS_NAME_TWO;
     Dp32Store store;
     if (all_mode) {
-        // 全量库是一个只读快照: 一个升序库, 没有已征召库 (drf 传 nullptr), 也没有墓碑
-        if (!store.load(DP32_ALL_FILE, nullptr)) {
-            cprintf("dp32 corpus(%s): 库不可用 (还没生成) %s, 跳过对账\n", label, DP32_ALL_FILE);
+        // 全量库是一个只读快照: 一个升序库, 没有已征召库 (drf 不传), 也没有墓碑
+        if (!store.load(data_file(DP32_ALL_NAME))) {
+            cprintf("dp32 corpus(%s): 库不可用 (还没生成) %s, 跳过对账\n", label,
+                    data_file(DP32_ALL_NAME).c_str());
             return;
         }
-    } else if (!store.load(DP32_SOURCE_FILE, DP32_DRAFTED_FILE)) {
+    } else if (!store.load(data_file(DP32_SOURCE_NAME), data_file(DP32_DRAFTED_NAME))) {
         cprintf("dp32 corpus(%s): 库不可用 (还没生成), 跳过对账\n", label);
         return;
     }
@@ -4727,81 +4846,6 @@ std::string get_time()
 
 void rho_play();
 
-// 将当前线程绑定到第 index 个物理核（每核只绑首个 SMT 线程，避免超线程争抢）。
-// 成功返回 true。仅模式2/3 调用。
-static bool pin_to_physical_core(unsigned index)
-{
-#ifdef WIN32
-    // 两阶段查询：第一次调用只取所需长度（返回值忽略），第二次才取数据
-    DWORD len = 0;
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len) &&
-        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        return false;
-    }
-    std::vector<BYTE> buf(len);
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
-        return false;
-    }
-    // 收集每个物理核的首个 SMT 线程亲和性
-    std::vector<GROUP_AFFINITY> cores;
-    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX it =
-        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
-    DWORD used = 0;
-    while (used < len) {
-        if (it->Relationship == RelationProcessorCore) {
-            const PROCESSOR_RELATIONSHIP* pr = &it->Processor;
-            for (WORD g = 0; g < pr->GroupCount; ++g) {
-                KAFFINITY mask = pr->GroupMask[g].Mask;
-                if (mask == 0) continue;
-                // 只取掩码中最低位的 SMT 线程（一个物理核）
-                GROUP_AFFINITY ga = pr->GroupMask[g];
-                unsigned long b;
-                _BitScanForward64(&b, mask);
-                ga.Mask = ((KAFFINITY)1) << b;
-                cores.push_back(ga);
-            }
-        }
-        used += it->Size;
-        it = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
-            reinterpret_cast<BYTE*>(it) + it->Size);
-    }
-    if (index >= cores.size()) return false;
-    GROUP_AFFINITY old;
-    return SetThreadGroupAffinity(GetCurrentThread(), &cores[index], &old) != FALSE;
-#else
-    // Linux：读取每个 cpu 的 thread_siblings_list，取每个物理核首个线程
-    std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(index) + "/topology/thread_siblings_list";
-    std::ifstream f(path);
-    if (!f) return false;
-    std::string line;
-    std::getline(f, line);
-    // 解析 "0" / "0,2" / "0-3" 形式，取第一个 CPU 号
-    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
-    int first = -1;
-    size_t p = 0;
-    while (p < line.size()) {
-        if (is_digit(line[p])) {
-            size_t start = p;
-            while (p < line.size() && is_digit(line[p])) ++p;
-            int v = std::stoi(line.substr(start, p - start));
-            if (first < 0) first = v;
-            // 处理范围 "a-b"：只需首核，遇到 '-' 后的数字跳过
-            if (p < line.size() && line[p] == '-') {
-                ++p;
-                while (p < line.size() && is_digit(line[p])) ++p;
-            }
-        } else {
-            ++p;
-        }
-    }
-    if (first < 0) return false;
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(first, &set);
-    return sched_setaffinity(0, sizeof(set), &set) == 0;
-#endif
-}
-
 template <typename PLAYER>
 void play() {
     // 槽位数就是存档文件的条数上限 (RHO_STATE_SLOTS, 见 common.h)
@@ -4855,9 +4899,6 @@ void play() {
     };
     std::barrier barrier(n_tasks, on_barrier);
     auto T = [&](int i) {
-        if ((g_run_mode == 2 || g_run_mode == 3) && !pin_to_physical_core(i)) {
-            std::cout << "thread " << i << " pin core failed." << std::endl;
-        }
         const int w_i = (i == 0) ? W0 : W;
         // 本线程独占的 walker 段: 线程0 在头部, 其余线程紧随其后连续排列
         RhoState* rs_i = &rs[(i == 0) ? 0 : W0 + (i - 1) * W];
@@ -4875,11 +4916,26 @@ void play() {
                 pause = true;
                 std::cout << get_time() << " : game pause!" << std::endl;
             }
+            // 外部要求停算 (有人在用本机, 见 test/main.cpp 的 ConsoleToggleHotkey):
+            // 借既有的 pause/barrier 通道先落一次盘, 再停在这个等待点上。
+            // 只有线程 0 置 pause; 其余线程靠**每轮重新看一次** pause 来"到达"。
+            // on_barrier 会把 pause 清回 false, 所以暂停不会重复触发。
+            if (i == 0 && compute_pause_active()) {
+                pause = true;
+            }
             if (pause) {
                 // 暂停存档前把缓存写回 rs: on_barrier -> saveStates 读的是 rs,
                 // 而 rho_affine_FW 平时不写 rs (只在 DP 命中时写)
                 _player.flush(i, rs_i);
                 barrier.arrive_and_wait();
+                // ⚠ 等待必须放在 barrier **之内**: barrier 要等 n_tasks 个线程全部
+                //   到齐。如果某线程在 pause 被置起之前就通过了上面的判断, 它会跳过
+                //   barrier 直接落到等待点上睡住 (pause 期间 compute_pause_active()
+                //   一直是 true) —— 于是线程 0 永远等不到它, barrier 不齐, 连 Ctrl+C
+                //   都退不出去。放在这里则"漏掉的线程"只是再跑一轮 shoot() 然后补上
+                //   这次 barrier, 不会阻塞任何人。
+                // 落盘发生在 on_barrier (saveStates) 里, 所以这里 = "状态已在盘上再停"。
+                wait_while_paused();
             }
         }
         // 线程退出前同样要写回: 线程局部缓存随线程销毁, 主线程 join 之后的
@@ -5019,76 +5075,6 @@ static RPCHelpMan testmvp()
                 assert(secret.VerifyPubKey(pbkey2));
                 std::string s = HexStr(secret) + " : " + HexStr(pbkey2);
                 */
-
-                //测试 secp256k1_ec_pubkey_tweak_mul========================================
-                //65f584d3699d0575173d704cd91b2532a3a658d2ca82c0b73dac602a43a2817a
-                //04a9bd2361197fef1b5e8e915055aff9899aa554a8ee5ff738775f1051a63f1c056b9eed5714e4e541bd624c772ca3ef63d53f7d74fc7ea6c4904fa1057c6483ae
-                secp256k1_pubkey G;
-                unsigned char ctmp_one[33] = {0};
-                ctmp_one[31] = 0x01;
-                secp256k1_ec_pubkey_create(ctx, &G, ctmp_one);
-
-                //secp256k1_pubkey 貌似是小顶端， 而CPubKey 是大顶端。 两者打印出来，字节序是相反的。
-                secp256k1_pubkey pk_mul = G;
-                //私钥的数组是 大顶端。打印出来和CKey 是一致的。
-                unsigned char ctmp2[33] = {0x65, 0xf5, 0x84, 0xd3, 0x69, 0x9d, 0x05, 0x75, 0x17, 0x3d, 0x70, 0x4c, 0xd9, 0x1b, 0x25, 0x32, 0xa3, 0xa6, 0x58, 0xd2, 0xca, 0x82, 0xc0, 0xb7, 0x3d, 0xac, 0x60, 0x2a, 0x43, 0xa2, 0x81, 0x7a};
-                secp256k1_ec_pubkey_tweak_mul(ctx, &pk_mul, ctmp2);
-                CPubKey cpk3;
-                size_t clen = CPubKey::SIZE;
-                secp256k1_ec_pubkey_serialize(ctx, (unsigned char*)cpk3.begin(), &clen, &pk_mul, SECP256K1_EC_UNCOMPRESSED);
-                assert(cpk3.size() == clen);
-                assert(cpk3.IsValid());
-                CKey sec3;
-                sec3.Set(ctmp2, &ctmp2[32], false);
-                CPubKey cpk4 = sec3.GetPubKey();
-                assert(cpk4 == cpk3);
-                //unspent.pushKV("str", HexStr(pk_mul.data) + " _ " + HexStr(cpk3));
-                //unspent.pushKV("str2", HexStr(ctmp2) + " _ " + HexStr(sec3));
-
-                //测试 secp256k1_ec_pubkey_tweak_add=======================================================
-                unsigned char ctmp3[33] = {0};
-                memcpy(ctmp3, ctmp2, 31);
-                unsigned char ctmp4[33] = {0};
-                ctmp4[31] = 0x7a;
-                secp256k1_pubkey pk4;
-                secp256k1_ec_pubkey_create(ctx, &pk4, ctmp3);
-                secp256k1_pubkey pk_add = pk4;
-                secp256k1_ec_pubkey_tweak_add(ctx, &pk_add, ctmp4);
-                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_add, &pk_mul) == 0);
-
-                // 测试 secp256k1_ec_pubkey_combine=======================================================
-                ctmp3[31] = 0x79;
-                secp256k1_pubkey* ins[2] = {&pk4, &G};
-                secp256k1_pubkey pk_combine;
-                secp256k1_ec_pubkey_create(ctx, &pk4, ctmp3);
-                secp256k1_ec_pubkey_combine(ctx, &pk_combine, ins, 2);
-                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_combine, &pk_mul) == 0);
-
-                // 测试 secp256k1_ec_pubkey_parse=======================================================
-                CPubKey cpbkey(ParseHex("04a9bd2361197fef1b5e8e915055aff9899aa554a8ee5ff738775f1051a63f1c056b9eed5714e4e541bd624c772ca3ef63d53f7d74fc7ea6c4904fa1057c6483ae"));
-                secp256k1_pubkey pk_parsed;
-                secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey.data(), cpbkey.size());
-                assert(secp256k1_ec_pubkey_cmp(ctx, &pk_parsed, &pk_mul) == 0);
-
-                //测试 secp256k1_ec_seckey_tweak_mul 和 secp256k1_ec_seckey_inverse=======================================================
-                auto sec4 = ParseHex("bbbace0c56e3ebd03072b0cb2370f1a060b6f29e988ec77e92a190c92448c6e6");
-                auto sec4_tmp = sec4;
-                auto sec4_inv = ParseHex("82b6f65ef08f2312c9655cc497ee200f3e71a6e4a3b53c29793e572fdfa8e8f1");
-                secp256k1_ec_seckey_tweak_mul(ctx, sec4_tmp.data(), sec4_inv.data());
-                assert(memcmp(sec4_tmp.data(), ctmp_one, sec4_tmp.size()) == 0);
-                unsigned char cinverse[33] = {0};
-                secp256k1_ec_seckey_inverse(ctx, cinverse, sec4_inv.data());
-                assert(memcmp(sec4.data(), cinverse, sec4.size()) == 0);
-
-                CKey sec_rand;
-                sec_rand.MakeNewKey(false);
-                CPubKey pbkey_rand = sec_rand.GetPubKey();
-                secp256k1_pubkey pbkey_rand_parse_mul;
-                secp256k1_ec_pubkey_parse(ctx, &pbkey_rand_parse_mul, pbkey_rand.data(), pbkey_rand.size());
-                unsigned char sec_rand_inv[33] = {0};
-                secp256k1_ec_seckey_inverse(ctx, sec_rand_inv, (unsigned char*)sec_rand.data());
-                secp256k1_ec_pubkey_tweak_mul(ctx, &pbkey_rand_parse_mul, sec_rand_inv);
-                assert(secp256k1_ec_pubkey_cmp(ctx, &pbkey_rand_parse_mul, &G) == 0);
 
                 //测试bingo=======================================================
                 //5294873c75604180f16f2dec603b8e786da8feefc71baa101e6138205f8d5ba1  sec
@@ -5268,7 +5254,7 @@ static RPCHelpMan testmvp()
 
                 //测试 saveDP 和 loadDP                
                 /* {
-                    iLog _testlog("D:\\test.txt");
+                    iLog _testlog(data_file("test.txt"));
                     std::map<uint64_t, SecPair> _testMap;
                     RhoState rss[1024];
                     for (RhoState& r : rss) {
@@ -5283,7 +5269,7 @@ static RPCHelpMan testmvp()
                         assert(it != _testMap.end() && it->second == r);
                     }
                 }
-                std::remove("D:\\test.txt");*/
+                std::remove(data_file("test.txt").c_str());*/
 
                 //测试CUDA
                 //validate_test();
@@ -5328,7 +5314,7 @@ static RPCHelpMan testmvp()
                 return num;
             };
 
-            const std::string babynum_file = "D:\\baby_map\\babynum.txt";
+            const std::string babynum_file = data_file("baby_map\\babynum.txt");
             //生成babystep
             if (ta == 118) {
                 assert(ta2 > 0);
@@ -5344,7 +5330,8 @@ static RPCHelpMan testmvp()
                     }
                     std::multimap<uint64_t, uint64_t> theMap;
                     char filename[256] = {0};
-                    sprintf(filename, "D:\\baby_map\\baby_map%llu.txt", base);
+                    snprintf(filename, sizeof(filename), "%s",
+                             data_file(("baby_map\\baby_map" + std::to_string(base) + ".txt").c_str()).c_str());
                     base = buildBabyMap(theMap, batch, base);
                     //检测key冲突,这里需要进一步的解决方案
                     assert(theMap.size() == batch);
@@ -5454,7 +5441,7 @@ static RPCHelpMan testmvp()
             //                   语料里的点能在库里找到同一条, 含被征召销账立了墓碑的)
             //三个库都是离线脚本一次生成的快照, 应用内只有校验入口, 要重建就离线跑脚本。
             //重建会移动源库的槽位号, 而 rho 的 3 类货源 (ReserveSource::Dp) 在
-            //D:\RhoReserve.txt 里存的就是槽位游标 —— 重建之后那个游标至多指偏, 不会崩,
+            //RhoReserve.txt 里存的就是槽位游标 —— 重建之后那个游标至多指偏, 不会崩,
             //只是可能重复发出几条已经用过的点。所以重建完最好把存档里的 supply Dp 清零。
             if (ta == 120 && ta2 == 888) {
                 validate_dp32_corpus(Dp32CorpusTarget::AllLib);
@@ -5470,7 +5457,7 @@ static RPCHelpMan testmvp()
             if (ta == 120 && ta2 == 891) {
                 validate_reserve_prod_config();
             }
-            //被征召的预备点"重走"探针: 拿已征召库 (D:\DpDrafted32.bin) 尾部几条点的原始
+            //被征召的预备点"重走"探针: 拿已征召库 (DpDrafted32.bin) 尾部几条点的原始
             //(m, n) 当起点, 用生产核同一套步进 (fun_add_w, W=RHO_GPU_WALKERS) 往前走,
             //每步拿 (m, n) 去 RhoState2.txt 的 (m, n) 集合里查 —— 看被征召的那几个预备点
             //之后有没有真的落到落盘的那批 rhostate 上。只读, 不动设备内存/不写文件。
@@ -5505,8 +5492,8 @@ static RPCHelpMan testmvp()
                 }
             }
             if (ta == 8) {
-                // ta2 == 1: 40 位 DP 文本归档 D:\DistinguishablePoints.txt (三行一条)
-                // ta2 == 2: 32 位 DP 起点漫游的边表 D:\Dp32Edge.txt (一行一条)
+                // ta2 == 1: 40 位 DP 文本归档 DistinguishablePoints.txt (三行一条)
+                // ta2 == 2: 32 位 DP 起点漫游的边表 Dp32Edge.txt (一行一条)
                 if (ta2 == 1) {
                     // 检查DP文件中是否存在碰撞，若存在则计算bingo
                     std::map<uint64_t, SecPair> dpMap;
@@ -5574,7 +5561,7 @@ static RPCHelpMan testmvp()
                     };
 
                     // ---- k40 两条链的 DP 表 ----
-                    // D:\Kg40_<起点>.txt / D:\Kmvp40_<起点>.txt 是 kg40 试验田的产物, 每行
+                    // Kg40_<起点>.txt / Kmvp40_<起点>.txt 是 kg40 试验田的产物, 每行
                     // "<k> <索引>", 含义是 x(P0 + k·Q) 的低 40 位全 0、索引 = 第 40..103 位。
                     // 这里逐行现算复核, 同时把记录还原成 (m, n) —— P0 + k·Q 就是
                     //     Q = G   : m = b + k, n = a
@@ -5754,7 +5741,7 @@ static RPCHelpMan testmvp()
 
                     bool stop = false;
 
-                    // 1) 处理主DP文件 D:\DistinguishablePoints.txt
+                    // 1) 处理主DP文件 DistinguishablePoints.txt
                     {
                         iLog _dplog(_DPFile_name);
                         if (_dplog.ifs.is_open()) {
@@ -5764,14 +5751,14 @@ static RPCHelpMan testmvp()
                         }
                     }
 
-                    // 2) k40 两条链的 DP 表: D:\Kg40_<起点>.txt / D:\Kmvp40_<起点>.txt
+                    // 2) k40 两条链的 DP 表: Kg40_<起点>.txt / Kmvp40_<起点>.txt
                     //    文件名里的 <起点> 由生成时决定 (现在跑的是 "0"), 所以枚举而不是写死;
                     //    起点标签与基准点 Q 都从每个文件的头注释里读回来, 与文件名无关。
                     //    与主文件共用 dpMap: 两条链之间、链与语料之间的碰撞都会在这里判。
                     if (!stop) {
                         std::vector<fs::path> k40_files;
                         std::error_code ec;
-                        const fs::path root = fs::u8path("D:\\");
+                        const fs::path root = fs::PathFromString(data_dir());
                         if (std::filesystem::exists(root, ec)) {
                             for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end;
                                  it.increment(ec)) {
@@ -5786,7 +5773,8 @@ static RPCHelpMan testmvp()
                         }
                         std::sort(k40_files.begin(), k40_files.end());
                         if (k40_files.empty()) {
-                            cprintf("testmvp 8 1: D:\\ 下没有 Kg40_*.txt / Kmvp40_*.txt, 跳过\n");
+                            cprintf("testmvp 8 1: %s 下没有 Kg40_*.txt / Kmvp40_*.txt, 跳过\n",
+                                    data_dir().c_str());
                         }
                         for (const auto& f : k40_files) {
                             if (processK40File(fs::PathToString(f)) != 0) {
@@ -5861,7 +5849,7 @@ static RPCHelpMan testmvp()
                             (unsigned long long)n_k40_files, (unsigned long long)n_k40_bad,
                             (unsigned long long)n_k40_kdup);
                 } else if (ta2 == 2) {
-                    // 校验 D:\Dp32Edge.txt 里的每条边确实是 32 位 DP (ta2 == 1 的 32 位兄弟)。
+                    // 校验 Dp32Edge.txt 里的每条边确实是 32 位 DP (ta2 == 1 的 32 位兄弟)。
                     // 一行 "起点索引 终点索引 终点m 终点n": 由 (m, n) 现算 x = m*G + n*MVP,
                     // 再过 32 位判据 (x 低 32 位全 0 时的 x 的 bit 32..95) 与记录的终点索引逐位
                     // 比 —— 对得上才说明这一行是一次货真价实的"起点 DP -> 终点 DP"的漫步。
@@ -5871,8 +5859,8 @@ static RPCHelpMan testmvp()
                     // 对数 => bingo, 同 ta2 == 1 的碰撞口径 (先确认两份真的是同一个点: 同一索引
                     // 不等于同一个点, 靠 secp256k1_ec_pubkey_cmp 对全值)。
                     Dp32Store all_lib;
-                    if (!all_lib.load(DP32_ALL_FILE, nullptr) || !all_lib.loaded()) {
-                        unspent.pushKV("str", std::string("!!!!Error!!!! 载入失败: ") + DP32_ALL_FILE);
+                    if (!all_lib.load(data_file(DP32_ALL_NAME)) || !all_lib.loaded()) {
+                        unspent.pushKV("str", std::string("!!!!Error!!!! 载入失败: ") + data_file(DP32_ALL_NAME));
                         return unspent;
                     }
 
@@ -5897,9 +5885,9 @@ static RPCHelpMan testmvp()
                     uint64_t n_x_same = 0, n_x_nosol = 0;
                     std::string first_bad;
 
-                    iLog _edgelog(DP32_EDGE_FILE);
+                    iLog _edgelog(data_file(DP32_EDGE_NAME));
                     if (!_edgelog.ifs.is_open()) {
-                        unspent.pushKV("str", std::string("!!!!Error!!!! 打不开: ") + DP32_EDGE_FILE);
+                        unspent.pushKV("str", std::string("!!!!Error!!!! 打不开: ") + data_file(DP32_EDGE_NAME));
                         return unspent;
                     }
                     std::string line;

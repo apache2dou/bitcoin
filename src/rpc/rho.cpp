@@ -891,7 +891,9 @@ void bench_rho_walkers(uint64_t steps)
 
 }  // namespace
 
-// 扫描每个线程 1/2/4/8/16/32 个 walker 的吞吐, 用来选 common.h 里的 RHO_WALKERS。
+// 扫描每个线程 1/8/16/32 个 walker 的吞吐, 用来选 common.h 里的 RHO_WALKERS。
+// (早期还扫过 2 和 4 两档; 那两档的数字在选定 8 之后就没再用过, 已从跑批里去掉 ——
+//  要复现直接加回 bench_rho_walkers<2>/<4> 即可, 函数本身是模板。)
 // 总点数固定 (800000), 与 cuda.cu 的 perf_test_cpu (同样 800000 点) 同口径,
 // 可直接对比。
 // 最后一档 W=1 再跑一次作为漂移对照: 同一进程内的首尾两个 W=1 读数应该很接近。
@@ -900,8 +902,6 @@ void perf_test_rho_affine_walkers()
     rho_affine_init_adds();
     constexpr uint64_t kTotal = 800000;
     bench_rho_walkers<1>(kTotal / 1);
-    bench_rho_walkers<2>(kTotal / 2);
-    bench_rho_walkers<4>(kTotal / 4);
     bench_rho_walkers<8>(kTotal / 8);
     bench_rho_walkers<16>(kTotal / 16);
     bench_rho_walkers<32>(kTotal / 32);
@@ -1179,16 +1179,16 @@ static bool reserve_source_by_name(const std::string& s, ReserveSource& out)
 // 这一行 (不提供运行期切换: 换了之后池子里已有的队员怎么算, 是另一回事)。
 //
 // 当前配置 = 1 类 (Random): 每轮整池换新随机点, 不建账本、不碰
-// D:\RhoReserve.txt 的货源游标, 也不载 32 位 DP 库 (cuda.cu 的 rho_play 按这个
+// RhoReserve.txt 的货源游标, 也不载 32 位 DP 库 (cuda.cu 的 rho_play 按这个
 // 来源跳过 dp32_store_init / reserve_retire_consumed, 见那边 EDGE=false 那一支)。
 // 这样生产路与 32 位 DP 库彻底解耦: 库只归起点漫游 (dp32_edge_play) 用。
 //
 // 换回 3 类 (Dp) 时的前提 (改下面那一行即可, 其余代码不用动): 队员从
-// D:\DpSource32.bin 的源库按槽位游标现取, 库取完 (或库不在盘上) 就整池逐槽回退
+// DpSource32.bin 的源库按槽位游标现取, 库取完 (或库不在盘上) 就整池逐槽回退
 // 随机点。换之前先确认两件事:
 //   1. 源库/已征召库在盘上 (不在就静默回退随机, 见 reserve_load_dp —— 池子照跑,
 //      只是又变回"全随机起点");
-//   2. D:\RhoReserve.txt 里的 "supply Dp <游标>" 还指得准。游标存的是源库**槽位号**,
+//   2. RhoReserve.txt 里的 "supply Dp <游标>" 还指得准。游标存的是源库**槽位号**,
 //      而源库是离线脚本一次生成的快照 (应用内没有重建入口), 所以重新离线建库之后槽位
 //      会整体挪位, 那时要把这个游标清零。
 static ReserveSource g_reserve_source = ReserveSource::Random;
@@ -1205,7 +1205,7 @@ constexpr size_t RHO_RESERVE_STEPS = sizeof(adds_pub[0]) / sizeof(adds_pub[0][0]
 
 // 预备队的**进程级状态**落盘路径 (货源游标 + 账本, 格式见下面的存档一节)。
 // 只有生产路径 (rho_play) 读写它, validate 一律不碰。
-static const std::string RHO_RESERVE_STATE_FILE = "D:\\RhoReserve.txt";
+static const std::string RHO_RESERVE_STATE_FILE = data_file("RhoReserve.txt");
 
 // 一位预备队员的履历。只有 source != Random 才建 (1 类不需要账本)。
 struct ReserveMember {
@@ -1323,7 +1323,7 @@ static void reserve_load_dp(ReserveSupply& sup)
     // 载入是幂等的: 第一个来取货的地方载入, 载入结果印在控制台上 (见 dp32_store_init)。
     if (!dp32_store_init()) {
         cprint() << get_time() << " : reserve supply Dp: 32 位源库不可用 ("
-                 << DP32_SOURCE_FILE << "), 该类回退随机点" << std::endl;
+                 << data_file(DP32_SOURCE_NAME) << "), 该类回退随机点" << std::endl;
         return;
     }
     const Dp32Store& lib = dp32_store();
@@ -1605,7 +1605,7 @@ static ReservePool* g_reserve_pool = nullptr;
 // 配不同的 (m, n)", 这种记录一条都排不上用场, 纯属白烧算力。留用队员同理: 不落盘就
 // 等于每次重启都把整池还没用上的点丢掉重抽。
 //
-// 存档 (纯文本, D:\RhoReserve.txt, 每轮 rho_play 落一次):
+// 存档 (纯文本, RhoReserve.txt, 每轮 rho_play 落一次):
 //     RhoReserve 1                                     版本号, 不认就整份丢掉
 //     round <n>                                        当前轮号 (日志轮号跨进程连续)
 //     supply <来源名> <游标>                            货源游标 = 已经发出去的条数
@@ -1800,7 +1800,7 @@ void init_reserve_pool(size_t slots, bool persistent)
 
 // 落一次盘 (每轮 loop 末了一次, 紧跟 note_reserve_dps)。
 // Random 来源下 g_reserve_persistent 恒为 false (见 init_reserve_pool), 这里直接返回 ——
-// 不打开 D:\RhoReserve.txt, 也不写它的 .tmp。
+// 不打开 RhoReserve.txt, 也不写它的 .tmp。
 void save_reserve_state()
 {
     if (g_reserve_pool == nullptr || !g_reserve_persistent) return;
@@ -2086,7 +2086,7 @@ void validate_reserve_supplies()
 
 // 状态存档自测: 建池 -> 灌满 -> 征调一位 -> 落盘 -> 新池回读 -> 逐项对拍 -> 续跑一轮。
 // 用合成供应器 (每槽一个真随机点, 不吃真库存), 写路径 + ".selftest", 绝不碰生产存档
-// (D:\RhoReserve.txt)。
+// (RhoReserve.txt)。
 void validate_reserve_state_file()
 {
     const std::string path = RHO_RESERVE_STATE_FILE + ".selftest";

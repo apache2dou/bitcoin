@@ -8,7 +8,7 @@
 //     往生产路径 (rho.cpp / cuda.cu / blockchain.cpp) 搬。
 //
 // 约定:
-//   - 一律只读现有状态, 不改生产存档 (D:\Rho*.bin / RhoReserve.txt 等), 不启动
+//   - 一律只读现有状态, 不改生产存档 (Rho*.bin / RhoReserve.txt 等), 不启动
 //     play、不动设备内存, 除非某个试验确实需要并单独说明。
 //   - 对外入口在 rpc/common.h 里声明, 由 perf_test() / validate_test() 或命令行
 //     分支调用。
@@ -43,8 +43,8 @@
 // 是一条等差子链 (固定加数 = 步长点), 合起来不重不漏地覆盖一段连续的 k。
 //
 // ==== 基准点 Q: k40_play 的形参 use_mvp (见 rpc/common.h) ====
-//   use_mvp = false -> Q = G   (扫 k·G, 原来的 kg40; 落盘 D:\Kg40_<起点>.*)
-//   use_mvp = true  -> Q = MVP (扫 k·MVP;                落盘 D:\Kmvp40_<起点>.*)
+//   use_mvp = false -> Q = G   (扫 k·G, 原来的 kg40; 落盘 Kg40_<起点>.*)
+//   use_mvp = true  -> Q = MVP (扫 k·MVP;                落盘 Kmvp40_<起点>.*)
 // 两档的几何/存盘/断点逻辑完全一样, 唯一差别就是本文件挑哪个点当 Q, 以及文件名
 // 前缀 (所以 k·MVP 那条链绝不会覆盖 Kg40_* 的存档)。
 //
@@ -232,12 +232,12 @@ std::string k40_spec_tag(uint64_t a_mvp, uint64_t b_g)
 
 std::string k40_dp_file(bool use_mvp, uint64_t a_mvp, uint64_t b_g)
 {
-    return "D:\\" + k40_file_prefix(use_mvp) + file_tag(a_mvp, b_g) + ".txt";
+    return data_dir() + k40_file_prefix(use_mvp) + file_tag(a_mvp, b_g) + ".txt";
 }
 
 std::string k40_state_file(bool use_mvp, uint64_t a_mvp, uint64_t b_g)
 {
-    return "D:\\" + k40_file_prefix(use_mvp) + file_tag(a_mvp, b_g) + ".state";
+    return data_dir() + k40_file_prefix(use_mvp) + file_tag(a_mvp, b_g) + ".state";
 }
 
 bool k40_make_start(uint64_t a_mvp, uint64_t b_g, K40Start& out)

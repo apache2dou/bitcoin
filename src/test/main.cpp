@@ -108,1483 +108,17 @@ void work() {
     //play<BabyGiant>();
 }
 
-#if 0
-//=======>>>>>>>>>>>>>
-#pragma comment(lib, "..\\..\\..\\build\\vcpkg_installed\\x64-windows\\lib\\libcrypto.lib")
-#pragma comment(lib, "..\\..\\..\\build\\vcpkg_installed\\x64-windows\\lib\\libssl.lib")
-
-#include <openssl/ec.h>
-#include <openssl/obj_mac.h>
-#include <openssl/bn.h>
-#include <vector>
-
-// 算法参数配置
-#define FILE_DIR ""
-constexpr int r = 32;
-constexpr char STEP_FILE[] = FILE_DIR "precomputed_steps.bin";
-constexpr char SAVE_FILE[] = FILE_DIR "rho_distinguishpoints_%04d.bin";
-constexpr char KEY_FILE[] = FILE_DIR "ec_keypair.txt";
-constexpr char LOG_FILE[] = FILE_DIR "pollard_rho.log";
-constexpr char ID_FILE[] = FILE_DIR "rho.id";
-
-// ID管理类
-enum class IDState { RUNNING,
-                     PAUSED,
-                     COMPLETED };
-
-class IDManager
-{
-private:
-    std::map<int, IDState> id_states;
-    int max_id = 0;
-    const std::string filename = ID_FILE;
-    mutable std::mutex mtx;
-
-    void update_max_id()
-    {
-        if (!id_states.empty()) {
-            max_id = std::max_element(id_states.begin(), id_states.end(),
-                                      [](const auto& a, const auto& b) { return a.first < b.first; })
-                         ->first;
-        }
-    }
-
-public:
-    IDManager()
-    {
-        load_from_file();
-    }
-
-    ~IDManager()
-    {
-        save_to_file();
-    }
-
-    // 请求可用ID（优先返回暂停状态的ID）
-    virtual int request_id()
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-
-        // 优先查找暂停状态的ID
-        auto paused_it = std::find_if(id_states.begin(), id_states.end(),
-                                      [](const auto& p) { return p.second == IDState::PAUSED; });
-
-        if (paused_it != id_states.end()) {
-            paused_it->second = IDState::RUNNING;
-            return paused_it->first;
-        }
-
-        // 生成新ID
-        int new_id = ++max_id;
-        id_states[new_id] = IDState::RUNNING;
-        return new_id;
-    }
-
-    // 暂停指定ID的工作
-    bool pause_id(int id)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = id_states.find(id);
-        if (it != id_states.end() && it->second == IDState::RUNNING) {
-            it->second = IDState::PAUSED;
-            return true;
-        }
-        return false;
-    }
-
-    // 标记ID为完成状态
-    bool complete_id(int id)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = id_states.find(id);
-        if (it != id_states.end()) {
-            id_states.erase(it);
-            return true;
-        }
-        return false;
-    }
-
-    // 获取ID状态
-    IDState get_state(int id) const
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = id_states.find(id);
-        return (it != id_states.end()) ? it->second : IDState::COMPLETED;
-    }
-
-private:
-    // 持久化到文件
-    void save_to_file() const
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::ofstream file(filename);
-        if (!file.is_open()) return;
-
-        for (const auto& [id, state] : id_states) {
-            file << id << "," << static_cast<int>(state) << "\n";
-        }
-    }
-
-    // 从文件加载状态
-    void load_from_file()
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::ifstream file(filename);
-        if (!file.is_open()) return;
-
-        id_states.clear();
-        std::string line;
-        while (std::getline(file, line)) {
-            std::istringstream iss(line);
-            std::string id_str, state_str;
-
-            if (std::getline(iss, id_str, ',') &&
-                std::getline(iss, state_str)) {
-                try {
-                    int id = std::stoi(id_str);
-                    IDState state = static_cast<IDState>(std::stoi(state_str));
-
-                    if (state != IDState::COMPLETED) {
-                        id_states[id] = state;
-                        max_id = std::max(max_id, id);
-                    }
-                } catch (...) {
-                    // 忽略格式错误行
-                }
-            }
-        }
-    }
-
-    // 获取所有未完成ID列表
-    std::vector<int> get_active_ids() const
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::vector<int> ids;
-        for (const auto& [id, state] : id_states) {
-            ids.push_back(id);
-        }
-        return ids;
-    }
-};
-
-class DummyIDManager : public IDManager
-{
-public:
-    int request_id() { return 66; }
-    bool pause_id(int id)
-    {
-        return true;
-    }
-    bool complete_id(int id) { return true; }
-
-};
-
-class Logger
-{
-public:
-    static void init()
-    {
-        log_file.open(LOG_FILE, std::ios::app);
-        if (!log_file.is_open()) {
-            std::cerr << "Failed to open log file\n";
-        }
-        enable(true);
-    }
-
-    static void log(const std::string& message, bool flush = false)
-    {
-        const auto now = std::time(nullptr);
-        char timestamp[64];
-        std::strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S] ", std::localtime(&now));
-
-        const std::string log_entry = timestamp + message + "\n";
-
-        // 输出到控制台
-        std::cout << log_entry;
-
-        // 写入日志文件
-        if (log_file.is_open() && enable_) {
-            log_file << log_entry;
-            if (flush)
-                log_file.flush();
-        }
-    }
-
-    static void cleanup()
-    {
-        if (log_file.is_open()) {
-            log_file.close();
-        }
-    }
-    static void enable(bool e) {
-        enable_ = e;
-    }
-
-private:
-    static bool enable_;
-    static std::ofstream log_file;
-};
-bool Logger::enable_;
-std::ofstream Logger::log_file;
-
-// 椭圆曲线上下文管理
-struct CurveContext {
-    EC_GROUP* group;
-    BIGNUM* order;
-    BN_CTX* bn_ctx;
-    const EC_POINT* Q; // 目标公钥
-
-    CurveContext(int nid = NID_secp112r1) : order(BN_new()),
-                                            bn_ctx(BN_CTX_new()),
-                                            Q(nullptr)
-    {
-        if (nid != 0) {
-            group = EC_GROUP_new_by_curve_name(nid);
-            EC_GROUP_get_order(group, order, bn_ctx);                                            
-        } else {
-            const char* p_hex = "800000000000001d";
-            const char* a_hex = "1";
-            const char* b_hex = "23";
-            const char* n_hex = "80000000b60d4577";
-            const char* gx_hex = "30d739f3e0467dd";
-            const char* gy_hex = "6993cc78c1d6fa3";
-            const char* h_hex = "1";
-
-            EC_POINT* G = NULL;
-            BIGNUM *p = BN_new(), *a = BN_new(), *b = BN_new();
-            BIGNUM *n = BN_new(), *h = BN_new(), *gx = BN_new(), *gy = BN_new();
-
-            // 设置示例参数（16 进制）
-            BN_hex2bn(&p, p_hex);
-            BN_hex2bn(&a, a_hex);
-            BN_hex2bn(&b, b_hex);
-            BN_hex2bn(&n, n_hex);
-            BN_hex2bn(&h, h_hex);
-            BN_hex2bn(&gx, gx_hex);
-            BN_hex2bn(&gy, gy_hex);
-            // 创建椭圆曲线群
-            group = EC_GROUP_new_curve_GFp(p, a, b, NULL);
-            if (!group) goto err;
-            // 创建生成点 G
-            G = EC_POINT_new(group);
-            EC_POINT_set_affine_coordinates(group, G, gx, gy, NULL);
-            // 设置群的生成点、阶数和余因子
-            EC_GROUP_set_generator(group, G, n, h);
-
-            EC_GROUP_get_order(group, order, bn_ctx);    
-        err:
-            BN_free(p);
-            BN_free(a);
-            BN_free(b);
-            BN_free(n);
-            BN_free(h);
-            BN_free(gx);
-            BN_free(gy);
-            if (G != NULL) EC_POINT_free(G);
-        }
-    }
-
-    ~CurveContext()
-    {
-        EC_GROUP_free(group);
-        BN_free(order);
-        BN_CTX_free(bn_ctx);
-        if (Q) EC_POINT_free(const_cast<EC_POINT*>(Q));
-    }
-
-    void set_target(const EC_POINT* target)
-    {
-        Q = EC_POINT_dup(target, group);
-    }
-    // 新增密钥管理方法
-    bool load_keypair(BIGNUM** priv_key, EC_POINT** pub_key)
-    {
-        std::ifstream file(KEY_FILE);
-        if (!file.is_open()) return false;
-
-        std::string line;
-
-        try {
-            // 解析私钥
-            std::getline(file, line);
-            BN_hex2bn(priv_key, line.c_str());
-
-            // 解析公钥坐标
-            BIGNUM* x = BN_new();
-            BIGNUM* y = BN_new();
-            std::getline(file, line);
-            BN_hex2bn(&x, line.c_str());
-            std::getline(file, line);
-            BN_hex2bn(&y, line.c_str());
-
-            // 创建公钥点
-            *pub_key = EC_POINT_new(group);
-            EC_POINT_set_affine_coordinates(group, *pub_key, x, y, bn_ctx);
-
-            // 验证点是否在曲线上
-            if (!EC_POINT_is_on_curve(group, *pub_key, bn_ctx)) {
-                EC_POINT_free(*pub_key);
-                BN_free(x);
-                BN_free(y);
-                return false;
-            }
-
-            BN_free(x);
-            BN_free(y);
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    void generate_and_save_keypair(BIGNUM** priv_key, EC_POINT** pub_key)
-    {
-        // 生成新密钥对
-        *priv_key = BN_new();
-        BN_rand_range(*priv_key, order);
-
-        *pub_key = EC_POINT_new(group);
-        EC_POINT_mul(group, *pub_key, *priv_key, nullptr, nullptr, bn_ctx);
-
-        // 保存到文件
-        std::ofstream file(KEY_FILE);
-        if (file.is_open()) {
-            // 写入私钥
-            char* priv_hex = BN_bn2hex(*priv_key);
-            file << priv_hex << "\n";
-            OPENSSL_free(priv_hex);
-
-            // 写入公钥坐标
-            BIGNUM *x = BN_new(), *y = BN_new();
-            EC_POINT_get_affine_coordinates(group, *pub_key, x, y, bn_ctx);
-
-            char* x_hex = BN_bn2hex(x);
-            char* y_hex = BN_bn2hex(y);
-            file << x_hex << "\n";
-            file << y_hex << "\n";
-
-            OPENSSL_free(x_hex);
-            OPENSSL_free(y_hex);
-            BN_free(x);
-            BN_free(y);
-
-            std::cout << "New keypair generated and saved to " << KEY_FILE << "\n";
-        } else {
-            std::cerr << "Warning: Failed to save keypair to file\n";
-        }
-    }
-};
-
-// 预计算步长结构
-struct PrecomputedStep {
-    EC_POINT* point;
-    BIGNUM* s;
-    BIGNUM* t;
-    EC_POINT* inverse_point; // 逆步长点
-
-    PrecomputedStep(const CurveContext& ctx) : point(EC_POINT_new(ctx.group)),
-                                               inverse_point(EC_POINT_new(ctx.group)),
-                                               s(BN_new()),
-                                               t(BN_new())
-    {
-        BN_rand_range(s, ctx.order);
-        BN_rand_range(t, ctx.order);
-        EC_POINT_mul(ctx.group, point, s, ctx.Q, t, ctx.bn_ctx);
-        EC_POINT_copy(inverse_point, point);
-        EC_POINT_invert(ctx.group, inverse_point, ctx.bn_ctx);
-    }
-
-    ~PrecomputedStep()
-    {
-        if (point) EC_POINT_free(point);
-        if (inverse_point) EC_POINT_free(inverse_point);
-        if (s) BN_free(s);
-        if (t) BN_free(t);
-    }
-
-    PrecomputedStep(PrecomputedStep&& other) noexcept : point(other.point),
-                                                        inverse_point(other.inverse_point),
-                                                        s(other.s),
-                                                        t(other.t)
-    {
-        other.point = nullptr;
-        other.inverse_point = nullptr;
-        other.s = nullptr;
-        other.t = nullptr;
-    }
-
-    PrecomputedStep& operator=(PrecomputedStep&& other) noexcept
-    {
-        if (this != &other) {
-            // 1. 清理现有资源
-            if (point) EC_POINT_free(point);
-            if (inverse_point) EC_POINT_free(inverse_point);
-            if (s) BN_free(s);
-            if (t) BN_free(t);
-
-            // 2. 转移资源所有权
-            point = other.point;
-            inverse_point = other.inverse_point;
-            s = other.s;
-            t = other.t;
-
-            // 3. 置空源对象指针
-            other.point = nullptr;
-            other.inverse_point = nullptr;
-            other.s = nullptr;
-            other.t = nullptr;
-        }
-        return *this;
-    }
-
-    // 从文件加载构造
-    PrecomputedStep(const CurveContext& ctx, std::istream& is) : point(EC_POINT_new(ctx.group)),
-                                                                 inverse_point(EC_POINT_new(ctx.group)),
-                                                                 s(BN_new()),
-                                                                 t(BN_new())
-    {
-        // 读取s值
-        size_t s_len;
-        is.read(reinterpret_cast<char*>(&s_len), sizeof(s_len));
-        std::vector<unsigned char> s_buf(s_len);
-        is.read(reinterpret_cast<char*>(s_buf.data()), s_len);
-        BN_bin2bn(s_buf.data(), s_len, s);
-
-        // 读取t值
-        size_t t_len;
-        is.read(reinterpret_cast<char*>(&t_len), sizeof(t_len));
-        std::vector<unsigned char> t_buf(t_len);
-        is.read(reinterpret_cast<char*>(t_buf.data()), t_len);
-        BN_bin2bn(t_buf.data(), t_len, t);
-
-        // 读取点数据
-        size_t point_len;
-        is.read(reinterpret_cast<char*>(&point_len), sizeof(point_len));
-        std::vector<unsigned char> point_buf(point_len);
-        is.read(reinterpret_cast<char*>(point_buf.data()), point_len);
-        EC_POINT_oct2point(ctx.group, point, point_buf.data(), point_len, ctx.bn_ctx);
-
-        EC_POINT_copy(inverse_point, point);
-        EC_POINT_invert(ctx.group, inverse_point, ctx.bn_ctx);
-    }
-
-    void save(const CurveContext& ctx, std::ostream& os) const
-    {
-        // 保存s值
-        const size_t s_len = BN_num_bytes(s);
-        std::vector<unsigned char> s_buf(s_len);
-        BN_bn2bin(s, s_buf.data());
-        os.write(reinterpret_cast<const char*>(&s_len), sizeof(s_len));
-        os.write(reinterpret_cast<const char*>(s_buf.data()), s_len);
-
-        // 保存t值
-        const size_t t_len = BN_num_bytes(t);
-        std::vector<unsigned char> t_buf(t_len);
-        BN_bn2bin(t, t_buf.data());
-        os.write(reinterpret_cast<const char*>(&t_len), sizeof(t_len));
-        os.write(reinterpret_cast<const char*>(t_buf.data()), t_len);
-
-        // 保存点数据
-        const size_t point_len = EC_POINT_point2oct(ctx.group, point,
-                                                    POINT_CONVERSION_COMPRESSED, nullptr, 0, ctx.bn_ctx);
-        std::vector<unsigned char> point_buf(point_len);
-        EC_POINT_point2oct(ctx.group, point, POINT_CONVERSION_COMPRESSED,
-                           point_buf.data(), point_len, ctx.bn_ctx);
-        os.write(reinterpret_cast<const char*>(&point_len), sizeof(point_len));
-        os.write(reinterpret_cast<const char*>(point_buf.data()), point_len);
-    }
-};
-// 可区分点管理
-struct DistinguishedPoint {
-    BIGNUM* a;
-    BIGNUM* b;
-    uint64_t step;
-
-    DistinguishedPoint(BIGNUM* a_val, BIGNUM* b_val, uint64_t s) : a(BN_dup(a_val)),
-                                                                   b(BN_dup(b_val)),
-                                                                   step(s) {}
-
-    DistinguishedPoint(DistinguishedPoint&& other) noexcept : a(other.a),
-                                                              b(other.b),
-                                                              step(other.step)
-    {
-        other.a = nullptr;
-        other.b = nullptr;
-    }
-
-    ~DistinguishedPoint()
-    {
-        if (a) BN_free(a);
-        if (b) BN_free(b);
-    }
-};
-
-class PollardSolver
-{
-public:
-    PollardSolver(std::shared_ptr<CurveContext> ctx, IDManager& manager) : ctx_(ctx),
-                                                                           step_count_(0),
-                                                                           id_manager(manager),
-                                                                           run_id_(id_manager.request_id())
-    {
-        static RecursiveMutex steps_mutex;
-        {
-            LOCK(steps_mutex);
-            // 尝试加载预计算步长
-            if (!load_precomputed_steps(STEP_FILE, steps_)) {
-                generate_precomputed_steps();
-                save_precomputed_steps();
-            }
-        }
-        // 初始化随机起点
-        StartPointResult sp;
-        if (run_id_ != 66) {
-            sp = generate_start_point_with_min_predecessors(6, 1000000);
-        }
-        if (!sp.success) {
-            Logger::log("generate_start_point_with_min_predecessors failed");
-            current_ = EC_POINT_new(ctx_->group);
-            a_ = BN_new();
-            b_ = BN_new();
-            BN_rand_range(a_, ctx_->order);
-            BN_rand_range(b_, ctx_->order);
-            EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
-        } else {
-            a_ = sp.a;
-            b_ = sp.b;
-            current_ = sp.point;
-        }
-    }
-
-    BIGNUM* solve()
-    {
-        bool loaded = load_progress(run_id_);
-        if (loaded) {
-            auto last = lastPoint();
-            assert(last != points_.end());
-            set_initial(last->second.a, last->second.b, last->second.step);
-        }
-        if (!loaded)
-            printPoint(a_, b_, current_);
-        BIGNUM* ret = nullptr;
-        while (ret == nullptr) {
-            if (gameover) {
-                id_manager.pause_id(run_id_);
-                break;
-            }
-            ++step_count_;
-            walk_step();
-            ret = process_distinguished_point();
-        }
-        save_progress();
-        return ret;
-    }
-
-    // 设置起始点函数
-    void set_initial(const BIGNUM* a, const BIGNUM* b, uint64_t step_count)
-    {
-        // 复制并规范化输入参数
-        BN_mod(a_, a, ctx_->order, ctx_->bn_ctx);
-        BN_mod(b_, b, ctx_->order, ctx_->bn_ctx);
-
-        // 重新计算当前点
-        EC_POINT_mul(ctx_->group, current_, a_, ctx_->Q, b_, ctx_->bn_ctx);
-
-        // 重置步数计数器
-        step_count_ = step_count;
-
-        // 记录日志
-        std::stringstream ss;
-        char* a_hex = BN_bn2hex(a_);
-        char* b_hex = BN_bn2hex(b_);
-        ss << "Set initial point - a: 0x" << a_hex << ", b: 0x" << b_hex;
-        Logger::log(ss.str());
-
-        // 打印初始点坐标
-        BIGNUM *x = BN_new(), *y = BN_new();
-        EC_POINT_get_affine_coordinates(ctx_->group, current_, x, y, ctx_->bn_ctx);
-        char* x_hex = BN_bn2hex(x);
-        char* y_hex = BN_bn2hex(y);
-        Logger::log("Initial point coordinates (x, y):\n"
-                    "X: 0x" +
-                    std::string(x_hex) + "\n" +
-                    "Y: 0x" + std::string(y_hex));
-
-        OPENSSL_free(a_hex);
-        OPENSSL_free(b_hex);
-        OPENSSL_free(x_hex);
-        OPENSSL_free(y_hex);
-        BN_free(x);
-        BN_free(y);
-    }
-    //private:
-    bool load_precomputed_steps(const char* filename, std::vector<PrecomputedStep>& step_vec)
-    {
-        if (!fs::exists(filename)) return false;
-
-        try {
-            std::ifstream file(filename, std::ios::binary);
-            if (!file) return false;
-
-            // 验证文件头
-            int file_r;
-            file.read(reinterpret_cast<char*>(&file_r), sizeof(file_r));
-            if (file_r != r) {
-                std::cerr << "Invalid step file configuration\n";
-                return false;
-            }
-
-            step_vec.clear();
-            step_vec.reserve(r);
-            for (int i = 0; i < r; ++i) {
-                step_vec.emplace_back(*ctx_, file);
-            }
-
-            std::cout << "Loaded " << r << " precomputed steps from file\n";
-            return true;
-        } catch (...) {
-            std::cerr << "Error loading precomputed steps\n";
-            step_vec.clear();
-            return false;
-        }
-    }
-
-    void generate_precomputed_steps()
-    {
-        steps_.clear();
-        steps_.reserve(r);
-        for (int i = 0; i < r; ++i) {
-            steps_.emplace_back(*ctx_);
-        }
-        std::cout << "Generated new precomputed steps\n";
-    }
-
-    void save_precomputed_steps() const
-    {
-        std::ofstream file(STEP_FILE, std::ios::binary);
-        if (!file) {
-            std::cerr << "Failed to save precomputed steps\n";
-            return;
-        }
-
-        // 写入文件头
-        file.write(reinterpret_cast<const char*>(&r), sizeof(r));
-
-        // 写入每个步长
-        for (const auto& step : steps_) {
-            step.save(*ctx_, file);
-        }
-
-        std::cout << "Saved " << r << " precomputed steps to file\n";
-    }
-
-    // 在加载/生成预计算步长后调用此函数
-    void adjust_last_step()
-    {
-        if (steps_.size() < 2) {
-            Logger::log("Not enough steps to adjust, need at least 2 elements");
-            return;
-        }
-
-        // 初始化累加器
-        EC_POINT* sum_point = EC_POINT_new(ctx_->group);
-        BIGNUM* sum_s = BN_new();
-        BIGNUM* sum_t = BN_new();
-        BN_zero(sum_s);
-        BN_zero(sum_t);
-
-        // 遍历前N-1个元素进行累加
-        const size_t last_index = steps_.size() - 1;
-        for (size_t i = 0; i < last_index; ++i) {
-            const auto& step = steps_[i];
-
-            // 累加点坐标
-            EC_POINT_add(ctx_->group, sum_point, sum_point, step.point, ctx_->bn_ctx);
-
-            // 累加标量值（模运算）
-            BN_mod_add(sum_s, sum_s, step.s, ctx_->order, ctx_->bn_ctx);
-            BN_mod_add(sum_t, sum_t, step.t, ctx_->order, ctx_->bn_ctx);
-        }
-
-        // 创建新的最后一步
-        PrecomputedStep new_last_step(*ctx_);
-        EC_POINT_copy(new_last_step.point, sum_point);
-        BN_copy(new_last_step.s, sum_s);
-        BN_copy(new_last_step.t, sum_t);
-
-        // 验证新步长的有效性
-        if (!validate_step(new_last_step)) {
-            Logger::log("Failed to validate adjusted last step");
-            EC_POINT_free(sum_point);
-            BN_free(sum_s);
-            BN_free(sum_t);
-            return;
-        }
-
-        // 替换最后一步（带资源清理）
-        steps_.back() = std::move(new_last_step);
-
-        // 释放临时资源
-        EC_POINT_free(sum_point);
-        BN_free(sum_s);
-        BN_free(sum_t);
-
-        Logger::log("Successfully adjusted last step to sum of previous steps");
-    }
-
-    // 验证步长有效性
-    bool validate_step(const PrecomputedStep& step) const
-    {
-        EC_POINT* calc_point = EC_POINT_new(ctx_->group);
-        bool valid = false;
-
-        // 验证sG + tQ = point
-        EC_POINT_mul(ctx_->group, calc_point, step.s, ctx_->Q, step.t, ctx_->bn_ctx);
-        valid = (EC_POINT_cmp(ctx_->group, calc_point, step.point, ctx_->bn_ctx) == 0);
-
-        EC_POINT_free(calc_point);
-        return valid;
-    }
-
-        // 斐波那契模式预计算步长生成
-    void generate_fibonacci_steps(int num_steps)
-    {
-        if (num_steps < 2) {
-            Logger::log("Fibonacci steps require at least 2 steps");
-            return;
-        }
-
-        // 清理现有步长
-        steps_.clear();
-        steps_.reserve(num_steps);
-
-        // 初始化前两个步长
-        BIGNUM* s[2] = {BN_new(), BN_new()};
-        BIGNUM* t[2] = {BN_new(), BN_new()};
-
-        // 生成初始随机值（可改为固定种子）
-        BN_rand_range(s[0], ctx_->order);
-        BN_rand_range(t[0], ctx_->order);
-        BN_rand_range(s[1], ctx_->order);
-        BN_rand_range(t[1], ctx_->order);
-
-        // 添加前两步
-        add_fib_step(s[0], t[0]);
-        add_fib_step(s[1], t[1]);
-
-        // 生成后续步长
-        for (int i = 2; i < num_steps; ++i) {
-            BIGNUM* new_s = BN_new();
-            BIGNUM* new_t = BN_new();
-
-            // s_i = (s_{i-1} + s_{i-2}) mod n
-            BN_mod_add(new_s, s[1], s[0], ctx_->order, ctx_->bn_ctx);
-            // t_i = (t_{i-1} + t_{i-2}) mod n
-            BN_mod_add(new_t, t[1], t[0], ctx_->order, ctx_->bn_ctx);
-
-            // 验证并添加新步长
-            if (!add_fib_step(new_s, new_t)) break;
-
-            // 滚动更新缓存
-            BN_free(s[0]);
-            BN_free(t[0]);
-            s[0] = s[1];
-            t[0] = t[1];
-            s[1] = new_s;
-            t[1] = new_t;
-        }
-
-        // 清理剩余资源
-        BN_free(s[0]);
-        BN_free(t[0]);
-        BN_free(s[1]);
-        BN_free(t[1]);
-    }
-
-    bool add_fib_step(BIGNUM* s, BIGNUM* t)
-    {
-        PrecomputedStep new_step(*ctx_);
-
-        // 计算点坐标
-        if (!EC_POINT_mul(ctx_->group, new_step.point, s, ctx_->Q, t, ctx_->bn_ctx)) {
-            Logger::log("Failed to compute step point");
-            return false;
-        }
-
-        // 验证点有效性
-        if (!EC_POINT_is_on_curve(ctx_->group, new_step.point, ctx_->bn_ctx)) {
-            Logger::log("Generated point is not on curve");
-            return false;
-        }
-
-        // 复制标量值
-        BN_copy(new_step.s, s);
-        BN_copy(new_step.t, t);
-
-        steps_.push_back(std::move(new_step));
-        return true;
-    }
-
-
-    BIGNUM* process_distinguished_point()
-    {
-        BIGNUM* ret = nullptr;
-        const auto key = calculate_key(); 
-        if (key != INVALID_KEY) {
-            if (auto it = points_.find(key); it != points_.end()) {
-                ret = handle_collision(it->second);
-                id_manager.complete_id(run_id_);
-                assert(ret);
-            } else {
-                store_point(key);
-                if ((key & 0xfffffff000000000) == 0)
-                    std::cout << step_count_ << " ";
-            }
-        }
-        return ret;
-    }
-
-    uint64_t calculate_key() const
-    {
-        BIGNUM* x = BN_new();
-        EC_POINT_get_affine_coordinates(ctx_->group, current_, x, nullptr, ctx_->bn_ctx);
-
-        unsigned char bin[32];
-        const size_t len = BN_bn2bin(x, bin);
-        BN_free(x);
-
-        // 检查后2个字节是否为0
-        if (len < 4 || *reinterpret_cast<uint16_t*>(bin + 6) != 0) {
-            return INVALID_KEY;
-        }
-
-        // 提取8字节作为键
-        uint64_t key = *reinterpret_cast<uint64_t*>(bin);
-        return key;
-    }
-
-    BIGNUM* handle_collision(const DistinguishedPoint& dp)
-    {
-        // 返回一个非空值，方便退出循环。
-        BIGNUM* result = BN_new();
-        EC_POINT* stored_point = EC_POINT_new(ctx_->group);
-
-        EC_POINT_mul(ctx_->group, stored_point, dp.a, ctx_->Q, dp.b, ctx_->bn_ctx);
-
-        int collision_type = -1;
-        if (EC_POINT_cmp(ctx_->group, current_, stored_point, ctx_->bn_ctx) == 0) {
-            collision_type = 0;
-        } else {
-            BIGNUM* current_x = BN_new();
-            BIGNUM* current_y = BN_new();
-            BIGNUM* stored_x = BN_new();
-            BIGNUM* stored_y = BN_new();
-            EC_POINT_get_affine_coordinates(ctx_->group, current_,
-                                            current_x, current_y,
-                                            ctx_->bn_ctx);
-            EC_POINT_get_affine_coordinates(ctx_->group, stored_point,
-                                            stored_x, stored_y,
-                                            ctx_->bn_ctx);
-            if (BN_cmp(current_x, stored_x) == 0) {
-                BIGNUM* sum_y = BN_new();
-                BN_mod_add(sum_y, current_y, stored_y, ctx_->order, ctx_->bn_ctx);
-                if (BN_is_zero(sum_y)) {
-                    collision_type = 1;
-                }
-                BN_free(sum_y);
-            }
-            BN_free(current_x);
-            BN_free(current_y);
-            BN_free(stored_x);
-            BN_free(stored_y);
-        }
-        if (collision_type != -1) {
-            const uint64_t tail_length = dp.step;
-            const uint64_t cycle_length = step_count_ - dp.step;
-
-            std::stringstream ss;
-            ss << "\n=== Cycle Detected ===\n"
-               << "run_id_: " << run_id_ << "\n"
-               << "collision_type: " << collision_type << "\n"
-               << "Tail length:  " << tail_length << "\n"
-               << "Cycle length: " << cycle_length << "\n"
-               << "Total steps:  " << step_count_ << "\n"
-               << "Storage size: " << points_.size() << "\n"
-               << "========================";
-            Logger::log(ss.str());
-
-            BIGNUM* result_tmp = process_collision_case(dp, collision_type);
-            if (result_tmp != nullptr) {
-                BN_free(result);
-                result = result_tmp;
-            }
-        }
-
-        return result;
-    }
-
-    BIGNUM* process_collision_case(const DistinguishedPoint& dp, int case_type)
-    {
-        BIGNUM* denominator = BN_new();
-        BIGNUM* numerator = BN_new();
-        BIGNUM* inv_denominator = BN_new();
-        BIGNUM* d = BN_new();
-        BIGNUM* result = nullptr;
-
-        do {
-            if (case_type == 0) { // 常规碰撞
-                if (!BN_mod_sub(numerator, dp.a, a_, ctx_->order, ctx_->bn_ctx)) break;
-                if (!BN_mod_sub(denominator, b_, dp.b, ctx_->order, ctx_->bn_ctx)) break;
-            } else { // x相同y相反的情况
-                if (!BN_mod_add(numerator, dp.a, a_, ctx_->order, ctx_->bn_ctx)) break;
-                if (!BN_mod_add(denominator, dp.b, b_, ctx_->order, ctx_->bn_ctx)) break;
-                if (!BN_mod_sub(numerator, ctx_->order, numerator, ctx_->order, ctx_->bn_ctx)) break;
-            }
-
-            if (BN_is_zero(denominator)) {
-                Logger::log("Zero denominator encountered");
-                break;
-            }
-
-            if (!BN_mod_inverse(inv_denominator, denominator, ctx_->order, ctx_->bn_ctx)) {
-                Logger::log("Failed to compute modular inverse");
-                break;
-            }
-
-            if (!BN_mod_mul(d, numerator, inv_denominator, ctx_->order, ctx_->bn_ctx)) {
-                Logger::log("Failed to compute private key candidate");
-                break;
-            }
-
-            // 规范化为非负表示
-            if (BN_is_negative(d)) {
-                BN_add(d, d, ctx_->order);
-            }
-
-            if (validate_key(d)) {
-                result = BN_dup(d); // 转移所有权给调用者
-                Logger::log("Valid private key found");
-            }
-        } while (false);
-
-        BN_free(denominator);
-        BN_free(numerator);
-        BN_free(inv_denominator);
-        BN_free(d);
-        return result;
-    }
-
-    bool validate_key(BIGNUM* d) const
-    {
-        EC_POINT* test = EC_POINT_new(ctx_->group);
-        EC_POINT_mul(ctx_->group, test, d, nullptr, nullptr, ctx_->bn_ctx);
-        const bool valid = (EC_POINT_cmp(ctx_->group, test, ctx_->Q, ctx_->bn_ctx) == 0);
-        EC_POINT_free(test);
-        return valid;
-    }
-
-    void store_point(uint64_t key)
-    {
-        points_.emplace(key, DistinguishedPoint(a_, b_, step_count_));
-    }
-
-    void walk_step()
-    {
-        const size_t idx = get_step_index_for_point(current_);
-        const auto& step = steps_[idx];
-
-        EC_POINT_add(ctx_->group, current_, current_, step.point, ctx_->bn_ctx);
-        BN_mod_add(a_, a_, step.s, ctx_->order, ctx_->bn_ctx);
-        BN_mod_add(b_, b_, step.t, ctx_->order, ctx_->bn_ctx);
-    }
-    /**
-     * 逆向步进函数
-     * @param current_point 当前点
-     * @param a 当前a标量
-     * @param b 当前b标量
-     * @return 包含所有可能前驱点及其参数的列表，格式为：
-     *         vector<tuple<前驱点EC_POINT*, 前驱a BIGNUM*, 前驱b BIGNUM*>>
-     */
-    std::vector<std::tuple<EC_POINT*, BIGNUM*, BIGNUM*>>
-    reverse_walk_step(const EC_POINT* current_point,
-                      const BIGNUM* a,
-                      const BIGNUM* b)
-    {
-        std::vector<std::tuple<EC_POINT*, BIGNUM*, BIGNUM*>> predecessors;
-
-        // 遍历所有预计算步长
-        for (size_t i = 0; i < steps_.size(); ++i) {
-            const auto& step = steps_[i];
-
-            // 计算候选前驱点：candidate = current - step_i
-            EC_POINT* candidate = EC_POINT_new(ctx_->group);
-            EC_POINT_copy(candidate, current_point);
-
-            // 执行点减法：current + (-step_i)
-            EC_POINT_add(ctx_->group, candidate, candidate, step.inverse_point, ctx_->bn_ctx);
-
-            // 验证候选点有效性
-            /* if (!EC_POINT_is_on_curve(ctx_->group, candidate, ctx_->bn_ctx)) {
-                EC_POINT_free(candidate);
-                continue;
-            }*/
-
-            // 验证候选点的下一步是否指向当前点
-            size_t candidate_idx = get_step_index_for_point(candidate);
-            if (candidate_idx != i) {
-                EC_POINT_free(candidate);
-                continue;
-            }
-
-            // 计算对应的前驱标量
-            BIGNUM* prev_a = BN_dup(a);
-            BIGNUM* prev_b = BN_dup(b);
-            BN_mod_sub(prev_a, prev_a, step.s, ctx_->order, ctx_->bn_ctx);
-            BN_mod_sub(prev_b, prev_b, step.t, ctx_->order, ctx_->bn_ctx);
-
-            // 添加到结果列表
-            predecessors.emplace_back(candidate, prev_a, prev_b);
-        }
-
-        return predecessors;
-    }
-    size_t get_step_index_for_point(const EC_POINT* point) const
-    {
-        BIGNUM* x = BN_new();
-        EC_POINT_get_affine_coordinates(ctx_->group, point, x, nullptr, ctx_->bn_ctx);
-
-        unsigned char bin[32];
-        BN_bn2bin(x, bin);
-        const size_t offset = (BN_num_bytes(x) > 2) ? BN_num_bytes(x) - 2 : 0;
-        BN_free(x);
-        static size_t mask = r - 1;
-        return *reinterpret_cast<uint16_t*>(bin + offset) & mask;
-    }
-    // 返回结构封装结果和状态
-    struct StartPointResult {
-        EC_POINT* point = nullptr;
-        BIGNUM* a = nullptr;
-        BIGNUM* b = nullptr;
-        bool success = false;
-    };
-    // 生成起始点函数返回结构
-    StartPointResult generate_start_point_with_min_predecessors(
-        int min_predecessors,
-        int max_attempts = 10000)
-    {
-        StartPointResult result;
-
-        // 创建新资源
-        EC_POINT* current_point = EC_POINT_new(ctx_->group);
-        BIGNUM* current_a = BN_new();
-        BIGNUM* current_b = BN_new();
-        if (!current_point || !current_a || !current_b) {
-            if (current_point) EC_POINT_free(current_point);
-            if (current_a) BN_free(current_a);
-            if (current_b) BN_free(current_b);
-            return result;
-        }
-        for (int attempt = 0; attempt < max_attempts; ++attempt) {
-            // 生成随机参数
-            BN_rand_range(current_a, ctx_->order);
-            BN_rand_range(current_b, ctx_->order);
-            EC_POINT_mul(ctx_->group, current_point, current_a, ctx_->Q, current_b, ctx_->bn_ctx);
-
-            // 检查前置点数量
-            auto predecessors = reverse_walk_step(current_point, current_a, current_b);
-            const bool valid = predecessors.size() >= min_predecessors;
-
-            // 清理前置点资源
-            for (auto& [p, a, b] : predecessors) {
-                EC_POINT_free(p);
-                BN_free(a);
-                BN_free(b);
-            }
-
-            if (valid) {
-                // 转移资源所有权
-                result.point = current_point;
-                result.a = current_a;
-                result.b = current_b;
-                result.success = true;
-                return result;
-            }
-        }
-        // 释放尝试资源
-        EC_POINT_free(current_point);
-        BN_free(current_a);
-        BN_free(current_b);
-
-        return result;
-    }
-
-    void save_progress() const
-    {
-        std::ofstream file(format_filename(SAVE_FILE, run_id_), std::ios::binary);
-        const uint64_t count = points_.size();
-
-        // 写入记录数量
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-        // 写入每个记录
-        for (const auto& [key, dp] : points_) {
-            file.write(reinterpret_cast<const char*>(&key), sizeof(key));
-            write_bignum(file, dp.a);
-            write_bignum(file, dp.b);
-            file.write(reinterpret_cast<const char*>(&dp.step), sizeof(dp.step));
-        }
-
-        std::cout << "Progress saved: " << count << " points\n";
-    }
-
-    std::string format_filename(const std::string& pattern, int id) const
-    {
-        char buf[256];
-        snprintf(buf, sizeof(buf), pattern.c_str(), id);
-        return buf;
-    }
-
-    bool load_progress(int id)
-    {
-        std::ifstream file(format_filename(SAVE_FILE, id), std::ios::binary);
-        if (!file) return false;
-
-        uint64_t count;
-        file.read(reinterpret_cast<char*>(&count), sizeof(count));
-
-        for (uint64_t i = 0; i < count; ++i) {
-            uint64_t key;
-            file.read(reinterpret_cast<char*>(&key), sizeof(key));
-
-            BIGNUM* a = read_bignum(file);
-            BIGNUM* b = read_bignum(file);
-
-            uint64_t step;
-            file.read(reinterpret_cast<char*>(&step), sizeof(step));
-
-            points_.emplace(key, DistinguishedPoint(a, b, step));
-            BN_free(a);
-            BN_free(b);
-        }
-
-        std::cout << "Loaded " << count << " points from disk\n";
-        return true;
-    }
-
-    auto lastPoint() {
-        auto maxIt = points_.begin();
-        auto maxValue = maxIt->second.step;
-        for (auto it = std::next(points_.begin()); it != points_.end(); ++it) {
-            if (it->second.step > maxValue) {
-                maxValue = it->second.step;
-                maxIt = it;
-            }
-        }
-        return maxIt;
-    }
-
-    void printPoint(BIGNUM* a, BIGNUM* b, EC_POINT* _point) const
-    {
-        // 记录详细的初始点信息
-        std::stringstream log_ss;
-        log_ss << "Initial Point Configuration [Run ID: " << run_id_ << "]\n";
-
-        // 记录标量参数
-        char* a_hex = BN_bn2hex(a);
-        char* b_hex = BN_bn2hex(b);
-        log_ss << "  Scalar a: 0x" << a_hex << "\n";
-        log_ss << "  Scalar b: 0x" << b_hex << "\n";
-        OPENSSL_free(a_hex);
-        OPENSSL_free(b_hex);
-
-        // 获取并记录点坐标
-        BIGNUM *x = BN_new(), *y = BN_new();
-        if (EC_POINT_get_affine_coordinates(ctx_->group, _point, x, y, ctx_->bn_ctx)) {
-            char* x_hex = BN_bn2hex(x);
-            char* y_hex = BN_bn2hex(y);
-
-            log_ss << "  Point Coordinates:\n"
-                   << "    X: 0x" << x_hex << "\n"
-                   << "    Y: 0x" << y_hex << "\n";
-
-            OPENSSL_free(x_hex);
-            OPENSSL_free(y_hex);
-            Logger::log(log_ss.str());
-        } else {
-            Logger::log("Error: Failed to get initial point coordinates");
-        }
-
-        BN_free(x);
-        BN_free(y);
-    }
-
-    static void write_bignum(std::ostream& os, const BIGNUM* num)
-    {
-        const size_t len = BN_num_bytes(num);
-        std::vector<unsigned char> buf(len);
-        BN_bn2bin(num, buf.data());
-
-        os.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        os.write(reinterpret_cast<const char*>(buf.data()), len);
-    }
-
-    static BIGNUM* read_bignum(std::istream& is)
-    {
-        size_t len;
-        is.read(reinterpret_cast<char*>(&len), sizeof(len));
-
-        std::vector<unsigned char> buf(len);
-        is.read(reinterpret_cast<char*>(buf.data()), len);
-
-        BIGNUM* num = BN_new();
-        BN_bin2bn(buf.data(), len, num);
-        return num;
-    }
-    /**
-     * 从文件加载私钥
-     * @param filename 私钥文件路径
-     * @return 成功返回BIGNUM指针，失败返回nullptr
-     */
-    BIGNUM* load_private_key(const std::string& filename)
-    {
-        std::ifstream file(filename);
-        if (!file.is_open()) {
-            Logger::log("Failed to open private key file: " + filename);
-            return nullptr;
-        }
-
-        std::string line;
-        std::getline(file, line); // 读取私钥HEX字符串
-
-        BIGNUM* d = BN_new();
-        if (BN_hex2bn(&d, line.c_str()) == 0) {
-            Logger::log("Invalid private key format in file: " + filename);
-            BN_free(d);
-            return nullptr;
-        }
-
-        // 验证私钥范围 [1, order-1]
-        if (BN_cmp(d, BN_value_one()) < 0 || BN_cmp(d, ctx_->order) >= 0) {
-            Logger::log("Private key out of valid range");
-            BN_free(d);
-            return nullptr;
-        }
-
-        return d;
-    }
-
-        /**
-     * 计算并打印步长标量（需要先加载私钥）
-     * @param d 私钥
-     */
-    void calculate_and_print_scalars(BIGNUM* d)
-    {
-        if (!d || !ctx_ || !ctx_->group) {
-            Logger::log("Invalid parameters for scalar calculation");
-            return;
-        }
-
-        BIGNUM* n = ctx_->order;
-        BIGNUM* scalar = BN_new();
-        BIGNUM* temp = BN_new();
-
-        std::stringstream ss;
-        ss << "\n=== Step Scalar Calculation (d: 0x" << BN_bn2hex(d) << ") ===";
-        Logger::log(ss.str());
-
-        for (size_t i = 0; i < steps_.size(); ++i) {
-            const auto& step = steps_[i];
-
-            // 计算标量：s_i + t_i*d mod n
-            BN_mod_mul(temp, step.t, d, n, ctx_->bn_ctx);      // t_i*d
-            BN_mod_add(scalar, step.s, temp, n, ctx_->bn_ctx); // s_i + t_i*d
-
-            // 构建输出信息
-            ss.str("");
-            ss << "  s + t*d: 0x" << BN_bn2hex(scalar) << "\n"
-               << "  Verify: " << (verify_scalar(scalar, step.point) ? "Valid" : "Invalid");
-            Logger::log(ss.str());
-
-        }
-
-        BN_free(scalar);
-        BN_free(temp);
-        Logger::log("=== End of Scalar Calculation ===");
-    }
-
-    /**
-     * 验证标量计算结果是否正确
-     * @param scalar 计算的标量值
-     * @param point 对应的步长点
-     * @return 验证结果
-     */
-    bool verify_scalar(BIGNUM* scalar, EC_POINT* point)
-    {
-        EC_POINT* calc_point = EC_POINT_new(ctx_->group);
-        EC_POINT_mul(ctx_->group, calc_point, scalar, nullptr, nullptr, ctx_->bn_ctx);
-
-        const int cmp = EC_POINT_cmp(ctx_->group, calc_point, point, ctx_->bn_ctx);
-        EC_POINT_free(calc_point);
-
-        return cmp == 0;
-    }
-
-
-    static constexpr uint64_t INVALID_KEY = UINT64_MAX;
-
-    std::shared_ptr<CurveContext> ctx_;
-    std::vector<PrecomputedStep> steps_;
-    std::map<uint64_t, DistinguishedPoint> points_;
-    EC_POINT* current_;
-    BIGNUM* a_;
-    BIGNUM* b_;
-    uint64_t step_count_;
-    IDManager& id_manager;
-    const int run_id_;
-};
-
-// 获取系统核心数
-unsigned get_core_count()
-{
-    unsigned cores = std::thread::hardware_concurrency();
-    return (cores > 2) ? (cores - 2) : 1;
-}
-
-void test_112()
-{
-    const unsigned num_solvers = get_core_count();
-    std::vector<std::thread> threads;
-    IDManager id_mgr;
-    auto _run = [&id_mgr]() {
-        try {
-            PollardSolver* solver = nullptr;
-            // 生成测试密钥对
-            BIGNUM* priv = nullptr;
-            EC_POINT* pub = nullptr;
-            static RecursiveMutex keypair_mutex;
-            auto ctx = std::make_shared<CurveContext>(0);
-
-            {
-                LOCK(keypair_mutex);
-                // 尝试加载现有密钥对
-                if (!ctx->load_keypair(&priv, &pub)) {
-                    // 生成并保存新密钥对
-                    ctx->generate_and_save_keypair(&priv, &pub);
-                }
-            }
-            ctx->set_target(pub);
-
-            solver = new PollardSolver(ctx, id_mgr);
-            BIGNUM* found = solver->solve(); // 验证结果
-            if (found != nullptr) {
-                if (BN_cmp(found, priv) == 0) {
-                    char* hex = BN_bn2hex(found);
-                    Logger::log("Success! Private key: " + std::string(hex), true);
-                    OPENSSL_free(hex);
-                } else {
-                    Logger::log("Failed!!!", true);
-                }
-                BN_free(found);
-            }
-            BN_free(priv);
-            EC_POINT_free(pub);
-            if (solver) delete solver;
-        } catch (...) {
-            std::cout << "\nException handling!!!\n";
-        }
-    };
-    // 创建并启动线程
-    for (unsigned i = 0; i < num_solvers; ++i) {
-        threads.emplace_back(_run);
-    }
-    // 等待所有线程完成
-    for (auto& t : threads) {
-        if (t.joinable()) t.join();
-    }
-}
-
-void test_112_helper() {
-    Logger::enable(false);
-    BIGNUM* priv = nullptr;
-    EC_POINT* pub = nullptr;
-    auto ctx = std::make_shared<CurveContext>(0);
-    ctx->load_keypair(&priv, &pub);
-    ctx->set_target(pub);
-    BN_free(priv);
-    EC_POINT_free(pub);
-    DummyIDManager id_mgr;
-    PollardSolver solver(ctx, id_mgr);
-
-    //研究规律
-    /*
-    auto sec = solver.load_private_key("ec_keypair.txt");
-    solver.calculate_and_print_scalars(sec);
-    BN_free(sec);*/
-
-    /*
-    solver.load_progress(1);
-    auto last = solver.lastPoint();
-    assert(last != solver.points_.end());
-    solver.set_initial(last->second.a, last->second.b, last->second.step);
-    uint32_t stat[64] = {0};
-    do {
-        solver.walk_step();
-        auto predecessors = solver.reverse_walk_step(solver.current_, solver.a_, solver.b_);
-        std::cout << predecessors.size() << " ";
-        stat[predecessors.size()]++;
-
-        // 清理前置点资源
-        for (auto& [p, a, b] : predecessors) {
-            EC_POINT_free(p);
-            BN_free(a);
-            BN_free(b);
-        }
-    } while (solver.a_ != last->second.a && stat[1] < 10000);
-    std::cout << std::endl;
-    for (auto s: stat)
-        std::cout << s << " ";*/
-
-    //测试斐波那契 step
-     solver.generate_fibonacci_steps(r);
-    solver.save_precomputed_steps();
-
-    //将最后一个step 改为之前step之和
-    /*std::vector<PrecomputedStep> steps2;
-    solver.load_precomputed_steps(STEP_FILE, steps2);
-    solver.adjust_last_step();
-    solver.save_precomputed_steps();
-    solver.load_precomputed_steps(STEP_FILE, solver.steps_);
-    int i = 0;
-    for (; i < steps2.size() - 1; i++) {
-        assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) == 0);
-    }
-    assert(EC_POINT_cmp(ctx->group, solver.steps_[i].point, steps2[i].point, ctx->bn_ctx) != 0);*/
-
-    //测试generate_start_point_with_min_predecessors 效果
-    /* auto sp = solver.generate_start_point_with_min_predecessors(6, 1000000);
-    if (!sp.success) {
-        std::cout << "generate_start_point_with_min_predecessors failed\n";
-        return;
-    }
-    for (int i = 1; i < 11; i++) {
-        solver.load_progress(i);
-    }
-    solver.set_initial(sp.a, sp.b, 0);
-    BIGNUM* found = solver.solve();
-    if (found != nullptr) {
-        BN_free(found);
-    }*/
-}
-
-//========<<<<<<<<<<<<<<
-#endif  //64位曲线
-
 #include <csignal>
+#include <cctype>
+#include <future>
+#include <string>
+#include <thread>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // 进程单例: 同一时刻只允许一个 test_bitcoin 进程
 //
-// 为什么要这个: 本程序的生产状态全在 D:\ 下那几个固定文件里 (iLog.txt /
+// 为什么要这个: 本程序的生产状态全在**exe 同目录**的那几个固定文件里 (iLog.txt /
 // RhoState2.txt / RhoReserve.txt / Dp32Edge.txt / Dp32EdgeState.txt ...), 而且是
 // **每轮整份重写**。两个实例同时跑, 后启动的那个会拿自己的状态覆盖前一个的落盘,
 // 边表还会互相穿插, 结果两边的进度一起作废 —— 而文件本身看不出是谁写坏的。
@@ -1594,12 +128,12 @@ void test_112_helper() {
 //            内核自动关闭句柄、释放占有, **不存在残留锁**, 收工后可以立刻重启。
 //   POSIX:   在 /tmp 的锁文件上加 flock(LOCK_EX | LOCK_NB), fd 随进程关闭一起释放。
 //
-// 名字固定 (不带 PID / 时间戳 / 构建类型): Debug 与 Release、不同构建目录跑起来写的是
-// **同一批** D:\ 文件, 所以必须互斥。Local\ 前缀 = 按登录会话隔离, 同一台机器上另一个
-// 用户再跑一份互不影响。
+// 名字固定 (不带 PID / 时间戳 / 构建类型): Debug 与 Release 若指向同一个 exe 目录,
+// 写的就是**同一批**文件 (把 exe 拷过去跑、或用同一个输出目录时都会发生), 所以一律
+// 互斥。Local\ 前缀 = 按登录会话隔离, 同一台机器上另一个用户再跑一份互不影响。
 //
 // 覆盖范围是整个进程: 生产 (play), 以及 perf / rhoperf / validate 三个常驻入口都算 ——
-// 后两个虽然没有生产副作用, 但它们也要读 D:\RhoState2.txt 等文件, 让它们和正在跑的
+// 后两个虽然没有生产副作用, 但它们也要读 RhoState2.txt 等文件, 让它们和正在跑的
 // 生产实例并存没有意义, 还容易让人误读"两边同时跑"的结果。
 // ---------------------------------------------------------------------------
 #ifdef _WIN32
@@ -1632,8 +166,8 @@ public:
         const unsigned long err = m_handle == nullptr ? (unsigned long)::GetLastError() : 0;
         if (m_handle == nullptr) {
             // 建不出来 (权限 / 句柄耗尽) 不当作"已有实例": 宁可放开, 也不无故拒绝启动。
-            std::cout << "单例: 创建互斥体失败 (GetLastError=" << err
-                      << "), 不做单例限制, 继续启动" << std::endl;
+            cprint() << "单例: 创建互斥体失败 (GetLastError=" << err
+                     << "), 不做单例限制, 继续启动" << std::endl;
             m_acquired = true;
             return;
         }
@@ -1687,31 +221,496 @@ private:
     bool m_acquired = false;
 };
 
+// ---------------------------------------------------------------------------
+// 控制台窗口显示/隐藏热键 (Windows 专用; 其他平台是不做事的桩)
+//
+// 为什么要: 这程序一跑就是几小时到几天, 控制台一直占着半块屏幕。想让它整个退到后台
+// 继续算 (连任务栏按钮一起去掉), 又随时能按一下就调出来看进度。
+//
+// 为什么必须单开一条线程: 全局热键按**线程**投递 (RegisterHotKey 传 NULL 窗口时,
+// WM_HOTKEY 只发给注册它的那个线程), 而主线程正卡在 play()/perf_test() 里 join 工作
+// 线程, 没有消息泵可跑。所以这里起一条专职线程: 注册热键 -> MsgWaitForMultipleObjects
+// 等消息 -> 收到 WM_HOTKEY 就 ShowWindow。
+//
+// ==== 键位 ====
+// 固定 Ctrl+Alt+/，不做配置。选它的理由：带两个修饰键，不会把单个 Ctrl+X 从整个
+// 系统里抢走；而 / 又不是常用组合（不像 Ctrl+Alt+A 撞 QQ 截图、Ctrl+Alt+Z 撞 QQ
+// 消息盒子、Ctrl+Alt+B 撞 VS 断点窗口）。
+// VK_OEM_2 是美式键盘上 /? 那个键；中文输入法下的键位映射由系统给，实测可用。
+//
+// **注册失败就直接报失败**，不换键、不降级：热键被别的程序占了是本程序控制不了的
+// 事，静默换一个别的键反而让人以为按的键没生效。
+//
+// ==== 任务栏图标 ====
+// SW_HIDE 是连任务栏按钮一起隐藏的 (console 窗口是普通顶层窗口)，恢复时 SW_SHOW 会把
+// 按钮一起带回来 —— 这两条在经典 conhost 下都成立，不需要额外的 ITaskbarList 调用。
+// 唯一做不到的是 Windows Terminal: 它把控制台托管在自己的窗口里，GetConsoleWindow()
+// 给到的是个"影子窗口"，SW_HIDE 对它无效，任务栏上留下的是 WT 自己的标签按钮。
+// 那种情况下退一步最小化，并提示一次。
+//
+// 用 .bat 启动的情况 (启动出来的就是经典 conhost，所以能真隐藏):
+//   双击 .bat -> 系统新建一个 conhost 窗口给 cmd.exe -> test_bitcoin 继承它，
+//   GetConsoleWindow() 拿到的就是这个窗口，SW_HIDE 能把它连任务栏按钮一起藏掉。
+//   两种不成立的情形: (a) 已经是 Windows Terminal 里的标签页 (影子窗口问题同上);
+//   (b) 在**已经打开的** cmd 窗口里跑 .bat —— 那是用户自己的会话，隐藏会把这个
+//   cmd 窗口 (以及同一控制台里其它程序) 一起藏掉，再按一次才回来。所以想看干净的
+//   "无窗口"效果，用 .bat 里的 start "" test_bitcoin.exe 单开一个，或直接双击 exe。
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+
+// 固定组合: Ctrl+Alt+/
+static constexpr UINT kHotkeyMods = MOD_CONTROL | MOD_ALT;
+static constexpr UINT kHotkeyVk = VK_OEM_2;   // '/?' 键
+
+// ==== 空闲检测的参数 (只在窗口隐藏期间生效) ====
+// 规则只有一条: **有人在用就停算**。
+//   有人在用 = 最近 kIdlePauseMs 内有过键鼠输入  -> 停算;
+//   人走了   = 连续 kIdleResumeMs 都没有任何输入 -> 才恢复。
+// 恢复之后**没有**任何"至少算满多久"的承诺: 只要有输入, 下一个采样节拍 (1 秒)
+// 就会立刻再停。人回来就停, 不管刚恢复多久。
+//
+// 刚隐藏的 kIdleStartDelayMs 内**不做任何检测**: 隐藏这个动作本身就是按热键干的,
+// 之后往往还要开关别的窗口、敲几下键盘 —— 那些操作跟"有人在用这台机器算不算打扰"
+// 无关, 却会把检测立刻判成"有人在用"从而又停一次。所以先让计算跑满这 5 分钟,
+// 过了才开始看键鼠。
+//
+// 为什么恢复阈值比暂停阈值大这么多 (1 分钟 vs 2 小时): 每停一次, GPU 内核都要走到
+// 下一个 poll 检查点才收尾 (RHO_POLL_BATCHES = 2^12 批, 约 2.4 s) 并整份落盘
+// (~1~2 s), CPU 侧还要走一次 barrier 存档。若"停 30 秒算 30 秒"地来回切, 总产出
+// 反而比一刻不停地跑更低。宽死区纯粹是为了避开这种抖动, 不代表算多久。
+static constexpr ULONGLONG kIdlePauseMs = 60ULL * 1000;          // 最近 1 分钟有输入 => 有人在用 => 停
+static constexpr ULONGLONG kIdleResumeMs = 7200ULL * 1000;       // 连续 2 小时无输入 => 人走了 => 恢复
+static constexpr ULONGLONG kIdleStartDelayMs = 300ULL * 1000;    // 隐藏后先放跑 5 分钟再开检测
+// 采样节拍就是泵线程的等待超时 (1 秒), 见 pump()。
+
+// 距最近一次键鼠输入过去了多少毫秒; 拿不到时返回 0 (= 当作"刚动过", 保守停算)。
+static ULONGLONG input_idle_ms()
+{
+    LASTINPUTINFO li{};
+    li.cbSize = sizeof(li);
+    if (!::GetLastInputInfo(&li)) return 0;
+    // dwTime 与 GetTickCount 同一个时基 (毫秒); 无符号相减扛得住 49.7 天的回绕
+    return (ULONGLONG)(::GetTickCount() - li.dwTime);
+}
+
+class ConsoleToggleHotkey
+{
+public:
+    ConsoleToggleHotkey(const ConsoleToggleHotkey&) = delete;
+    ConsoleToggleHotkey& operator=(const ConsoleToggleHotkey&) = delete;
+    ConsoleToggleHotkey() = default;
+    ~ConsoleToggleHotkey() { stop(); }
+
+    // 注册热键并起消息泵线程。没有控制台窗口或注册失败时返回 false，由调用方报错。
+    bool start()
+    {
+        m_hwnd = ::GetConsoleWindow();
+        if (m_hwnd == nullptr) {
+            cprint() << "[hotkey] 没有控制台窗口 (输出被重定向或当服务跑), 隐藏/显示热键不可用"
+                     << std::endl;
+            return false;
+        }
+
+        // 记下"窗口此刻究竟可不可见"。这条决定了隐藏能不能验证:
+        //   经典 conhost  -> GetConsoleWindow() 是屏幕上那个窗口, WS_VISIBLE 置着, true;
+        //   ConPTY/WT     -> 拿到的是 PseudoConsoleWindow 影子窗口。
+        // ⚠ 影子窗口的 WS_VISIBLE **也是置着的**, 而且 ShowWindow(SW_HIDE) 会把它清掉,
+        //   于是"复核不可见"判成功 —— 但屏幕上的终端窗口属于 WindowsTerminal.exe,
+        //   一点变化都没有。实测 (2026-11-09, WT pid 32496):
+        //     test_bitcoin.exe  pid=32836  class=PseudoConsoleWindow           title=''
+        //     WindowsTerminal.exe pid=32496 class=CASCADIA_HOSTING_WINDOW_CLASS title='D:\test_EC\test_bitcoin.exe'
+        //   所以必须**先按类名认出这是 ConPTY**, 再去别的进程里找真正露着的那个窗口。
+        m_win_was_visible = is_window_visible(m_hwnd);
+        m_console_class = window_class_wide(m_hwnd);
+        m_console_is_pty = (_wcsicmp(m_console_class.c_str(), L"PseudoConsoleWindow") == 0);
+
+        // 匹配宿主窗口用的两个候选标题: 控制台标题 / exe 全路径 (WT 的标签标题就是后者)
+        {
+            wchar_t buf[1024] = {0};
+            if (::GetConsoleTitleW(buf, (DWORD)(sizeof(buf) / sizeof(buf[0]))) > 0) m_console_title = buf;
+            wchar_t exe[1024] = {0};
+            const DWORD n = ::GetModuleFileNameW(nullptr, exe, (DWORD)(sizeof(exe) / sizeof(exe[0])));
+            if (n > 0 && n < (DWORD)(sizeof(exe) / sizeof(exe[0]))) m_exe_path.assign(exe, n);
+        }
+
+        m_stop_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (m_stop_event == nullptr) {
+            cprint() << "[hotkey] 建停止事件失败, 隐藏/显示热键不可用" << std::endl;
+            return false;
+        }
+
+        // ⚠ 热键必须在**泵线程**里注册。hWnd == NULL 时 WM_HOTKEY 只投递到注册它的
+        //   那个线程的消息队列; 在主线程注册、在别的线程 PeekMessage 是一个消息都收不到
+        //   的 —— 主线程正卡在 play() 的 join() 里, 本来也没机会泵消息。
+        //   用 promise 把注册结果同步回来, 让 start() 仍能立刻报成功/失败。
+        std::promise<bool> ready;
+        std::future<bool> ready_fut = ready.get_future();
+        m_thread = std::thread([this, &ready] { pump(ready); });
+        if (!ready_fut.get()) {
+            ::SetEvent(m_stop_event);
+            m_thread.join();
+            ::CloseHandle(m_stop_event);
+            m_stop_event = nullptr;
+            cprint() << "[hotkey] Ctrl+Alt+/ 注册失败 (GetLastError=" << (unsigned long)m_register_error
+                     << "), 已被别的程序占用; 隐藏/显示热键不可用" << std::endl;
+            return false;
+        }
+        m_registered = true;
+        return true;
+    }
+
+    void stop()
+    {
+        resume_compute();   // 退出前必须先放行, 否则 join 会卡在暂停的计算线程上
+        if (m_stop_event != nullptr) ::SetEvent(m_stop_event);
+        // 注销在泵线程里做 (与注册同线程才有意义), 这里只负责等它结束
+        if (m_thread.joinable()) m_thread.join();
+        m_registered = false;
+        if (m_stop_event != nullptr) {
+            ::CloseHandle(m_stop_event);
+            m_stop_event = nullptr;
+        }
+    }
+
+private:
+    // 进程内唯一即可; 与别的程序不冲突 (GlobalAddAtom 的 id 是另一套, 这里够用)
+    static constexpr int kHotkeyId = 0x4B34;
+
+    void pump(std::promise<bool>& ready)
+    {
+        // 注册热键 —— 必须在这个线程里, 理由见 start()
+        if (::RegisterHotKey(nullptr, kHotkeyId, kHotkeyMods, kHotkeyVk) == 0) {
+            m_register_error = (unsigned long)::GetLastError();
+            ready.set_value(false);
+            return;
+        }
+        ready.set_value(true);
+
+        MSG msg;
+        for (;;) {
+            // 1 秒超时 (原来是 INFINITE): 隐藏期间这一秒一次的空转同时充当空闲
+            // 检测的节拍器, 见 idle_tick。没隐藏时它只是每秒醒一次, 代价可忽略。
+            const DWORD r = ::MsgWaitForMultipleObjects(1, &m_stop_event, FALSE, 1000,
+                                                        QS_ALLINPUT);
+            if (r == WAIT_OBJECT_0 + 1) {
+                while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    if (msg.message == WM_HOTKEY && (int)msg.wParam == kHotkeyId) {
+                        toggle();
+                    }
+                }
+            } else if (r == WAIT_TIMEOUT) {
+                idle_tick();
+            } else {
+                break; // 停止信号 (WAIT_OBJECT_0) 或出错
+            }
+        }
+        ::UnregisterHotKey(nullptr, kHotkeyId);
+    }
+
+    // 隐藏期间的节拍器 (每秒一次): 看一次最近输入时间。
+    //   隐藏后不足 kIdleStartDelayMs -> 什么都不做 (把这段时间留给用户自己操作)
+    //   有人在用 (idle < kIdlePauseMs)     -> 停算;
+    //   人走了   (idle >= kIdleResumeMs)   -> 恢复。
+    // 两个条件互斥且各自独立成立, **不存在"恢复后要撑够多久才允许再停"**: 恢复之后
+    // 只要有输入, 下一秒就再停。死区只影响"多久没人用才值得重新开算"。
+    void idle_tick()
+    {
+        if (!m_hidden) return;
+        if ((ULONGLONG)(::GetTickCount() - m_hidden_tick) < kIdleStartDelayMs) return;
+        const ULONGLONG idle = input_idle_ms();
+        if (!m_paused && idle < kIdlePauseMs) {
+            m_paused = true;
+            set_compute_pause(true);
+        } else if (m_paused && idle >= kIdleResumeMs) {
+            m_paused = false;
+            set_compute_pause(false);
+        }
+    }
+
+    // 无条件放行 (显示窗口 / 关闭检测 / 退出时调用)。幂等。
+    void resume_compute()
+    {
+        if (!m_paused) return;
+        m_paused = false;
+        set_compute_pause(false);
+    }
+
+    void toggle()
+    {
+        if (m_hwnd == nullptr) return;
+        if (m_hidden) show_window();
+        else hide_window();
+    }
+
+    // ---- 窗口状态的两个小工具 ----
+
+    // 窗口在屏幕上真的露着吗 (IsWindowVisible 只看 WS_VISIBLE 及其祖先, 最小化仍算可见)
+    static bool is_window_visible(HWND h)
+    {
+        return h != nullptr && ::IsWindowVisible(h) != FALSE;
+    }
+
+    // 窗口类名 (宽字符; ConsoleWindowClass / PseudoConsoleWindow / CASCADIA_... )
+    static std::wstring window_class_wide(HWND h)
+    {
+        wchar_t buf[256] = {0};
+        if (h == nullptr) return std::wstring();
+        const int n = ::GetClassNameW(h, buf, (int)(sizeof(buf) / sizeof(buf[0])));
+        return n > 0 ? std::wstring(buf, (size_t)n) : std::wstring();
+    }
+
+    // 窗口类名 (纯 ASCII, 报错时打到控制台用)
+    static std::string window_class_name(HWND h)
+    {
+        const std::wstring w = window_class_wide(h);
+        if (w.empty()) return std::string("(unknown)");
+        std::string out;
+        out.reserve(w.size());
+        for (const wchar_t c : w) out.push_back(c < 0x80 ? (char)c : '?');
+        return out;
+    }
+
+    // 进程映像名 (不含目录)。取不到返回空串。
+    static std::wstring process_image_name(DWORD pid)
+    {
+        HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (h == nullptr) return std::wstring();
+        wchar_t buf[1024] = {0};
+        DWORD n = (DWORD)(sizeof(buf) / sizeof(buf[0]));
+        const BOOL ok = ::QueryFullProcessImageNameW(h, 0, buf, &n);
+        ::CloseHandle(h);
+        if (!ok || n == 0) return std::wstring();
+        std::wstring p(buf, (size_t)n);
+        const size_t cut = p.find_last_of(L"\\/");
+        return cut == std::wstring::npos ? p : p.substr(cut + 1);
+    }
+
+    // 找 ConPTY 的宿主窗口 (真正露在屏幕上的那个)。
+    //
+    // 为什么非得跨进程找: Windows Terminal 把控制台渲染在自己的窗口里, 我们的
+    // PseudoConsoleWindow 是个 0 尺寸的影子 —— 对它 ShowWindow 只改自己的 WS_VISIBLE,
+    // 屏幕上纹丝不动。真正属于"用户看着的那个窗口"的类名是
+    // CASCADIA_HOSTING_WINDOW_CLASS, 宿主进程是 WindowsTerminal.exe。
+    //
+    // 安全性: 只认两类窗口 (WT 宿主 / 经典 conhost), 且标题必须**完全等于**我们的
+    // 控制台标题或 exe 全路径; 有多个同类同标题的窗口就放弃 (宁可报失败, 不误伤别人
+    // 的终端)。
+    struct HostSearch {
+        const std::wstring* title = nullptr;
+        const std::wstring* exe = nullptr;
+        HWND found = nullptr;
+        int matches = 0;
+    };
+
+    static BOOL CALLBACK find_host_cb(HWND h, LPARAM lp)
+    {
+        HostSearch* s = reinterpret_cast<HostSearch*>(lp);
+        if (!::IsWindowVisible(h) || ::IsIconic(h)) return TRUE;      // 只要露着的
+        if (::GetWindow(h, GW_OWNER) != nullptr) return TRUE;         // 只要顶层无主窗口
+        const std::wstring cls = window_class_wide(h);
+        if (_wcsicmp(cls.c_str(), L"CASCADIA_HOSTING_WINDOW_CLASS") != 0 &&
+            _wcsicmp(cls.c_str(), L"ConsoleWindowClass") != 0) {
+            return TRUE;
+        }
+        wchar_t tt[1024] = {0};
+        if (::GetWindowTextW(h, tt, (int)(sizeof(tt) / sizeof(tt[0]))) <= 0) return TRUE;
+        const bool hit = (s->title != nullptr && !s->title->empty() && _wcsicmp(tt, s->title->c_str()) == 0) ||
+                         (s->exe != nullptr && !s->exe->empty() && _wcsicmp(tt, s->exe->c_str()) == 0);
+        if (!hit) return TRUE;
+        s->found = h;
+        ++s->matches;
+        return TRUE;   // 继续数, 有歧义就放弃
+    }
+
+    HWND find_terminal_host_window() const
+    {
+        HostSearch s;
+        s.title = &m_console_title;
+        s.exe = &m_exe_path;
+        ::EnumWindows(&ConsoleToggleHotkey::find_host_cb, reinterpret_cast<LPARAM>(&s));
+        if (s.matches != 1) {
+            if (s.matches > 1) {
+                cprint() << "[hotkey] 找到 " << s.matches
+                         << " 个标题相同的终端窗口, 无法确定该藏哪一个, 放弃隐藏" << std::endl;
+            }
+            return nullptr;
+        }
+        // 再确认宿主进程确实是控制台宿主 (不是碰巧同名的其它程序)
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(s.found, &pid);
+        const std::wstring proc = process_image_name(pid);
+        if (_wcsicmp(proc.c_str(), L"WindowsTerminal.exe") != 0 &&
+            _wcsicmp(proc.c_str(), L"OpenConsole.exe") != 0 &&
+            _wcsicmp(proc.c_str(), L"conhost.exe") != 0) {
+            return nullptr;
+        }
+        return s.found;
+    }
+
+    // 隐藏: 窗口**和它的任务栏按钮**一起消失, 进程照常跑。
+    // 返回是否真的藏掉了 —— 判据不是"调用没报错", 而是"这个窗口现在不可见了"。
+    bool hide_window_impl()
+    {
+        // (1) 经典 conhost: 我们自己的窗口就是屏幕上那个, 直接藏。
+        //     ⚠ PTY 下必须跳过这一步: 影子窗口的 WS_VISIBLE 会被 SW_HIDE 清掉,
+        //     于是复核"不可见"成立、函数报成功, 但屏幕毫无变化。
+        if (!m_console_is_pty && m_win_was_visible) {
+            ::ShowWindow(m_hwnd, SW_HIDE);
+            if (!is_window_visible(m_hwnd)) return true;
+        }
+
+        // (2) ConPTY (Windows Terminal): 去宿主进程里找真正露着的窗口。
+        if (m_console_is_pty) {
+            HWND host = find_terminal_host_window();
+            if (host != nullptr) {
+                ::ShowWindow(host, SW_HIDE);
+                if (!is_window_visible(host)) {
+                    m_hide_target = host;
+                    return true;
+                }
+                ::ShowWindow(host, SW_SHOW);   // 藏不掉立刻回滚
+                if (::IsIconic(host)) ::ShowWindow(host, SW_RESTORE);
+            }
+        }
+
+        // (3) 影子窗口有时挂在真正的宿主窗口下面: 用根窗口再试一次。
+        //     必须先确认根窗口是"可见且没最小化"的, 否则可能把用户别的窗口弄没。
+        {
+            HWND root = ::GetAncestor(m_hwnd, GA_ROOT);
+            if (root != nullptr && root != m_hwnd && is_window_visible(root) &&
+                !::IsIconic(root)) {
+                ::ShowWindow(root, SW_HIDE);
+                if (!is_window_visible(root)) {
+                    m_hide_target = root;
+                    return true;
+                }
+                ::ShowWindow(root, SW_SHOW);
+            }
+        }
+
+        // (4) 都失败: 至少把桌面让出来, 但**如实报失败**, 不假装成功。
+        if (m_win_was_visible) ::ShowWindow(m_hwnd, SW_MINIMIZE);
+        return false;
+    }
+
+    void hide_window()
+    {
+        m_hidden = true;
+
+        if (!hide_window_impl() && !m_warned) {
+            m_warned = true;
+            cprint() << "[hotkey] 隐藏失败: 控制台窗口是 " << window_class_name(m_hwnd)
+                     << ", 屏幕上那个终端窗口不属于本进程。\n"
+                                "         Windows Terminal (ConPTY) 就是这种情况: 真正露着的窗口\n"
+                                "         在 WindowsTerminal.exe 里 (类名 CASCADIA_HOSTING_WINDOW_CLASS),\n"
+                                "         本进程只能操作那个 0 尺寸的影子窗口, 对它 SW_HIDE 是空操作。\n"
+                                "         已退一步最小化。要真隐藏, 请改用经典控制台:\n"
+                                "         conhost.exe test_EC.exe   或   .bat 里写 start conhost.exe test_EC.exe"
+                     << std::endl;
+        }
+
+        // 隐藏**不**停算: 刚按完热键, 必然算"有人在用", 但那只是隐藏窗口这个动作
+        // 本身。检测在 kIdleStartDelayMs 之后才生效 (见 idle_tick), 期间照常算。
+        // 用幂等的 resume_compute() 而不是直接写 m_paused = false —— 后者在"旗子还
+        // 立着"的情况下会让 m_paused 与实际暂停状态脱节, 计算就永远恢复不了。
+        resume_compute();
+        m_hidden_tick = ::GetTickCount();
+    }
+
+    // 显示: 窗口和任务栏按钮一起回来, 并抢到前台。
+    void show_window()
+    {
+        // 先放行计算, 再显示 —— 免得窗口已经出来了计算还停着, 让人以为进程卡死。
+        resume_compute();
+
+        // 隐藏时若用了宿主窗口 (GA_ROOT), 恢复也得把它带回来
+        if (m_hide_target != nullptr) {
+            ::ShowWindow(m_hide_target, SW_SHOW);
+            if (::IsIconic(m_hide_target)) ::ShowWindow(m_hide_target, SW_RESTORE);
+            m_hide_target = nullptr;
+        }
+        ::ShowWindow(m_hwnd, SW_SHOW);
+        if (::IsIconic(m_hwnd)) ::ShowWindow(m_hwnd, SW_RESTORE);
+        bring_to_front();
+        m_hidden = false;
+    }
+
+    void bring_to_front()
+    {
+        if (::SetForegroundWindow(m_hwnd)) return;
+        // 前台锁 (另一程序正占着前台) 时 SetForegroundWindow 会失败。绕法: 短暂置顶再
+        // 取消置顶 —— 这一步把窗口顶到 z 序最前, 之后 SetForegroundWindow 才成功。
+        ::SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        ::SetWindowPos(m_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        if (!::SetForegroundWindow(m_hwnd)) {
+            ::FlashWindow(m_hwnd, TRUE);   // 最后退一步: 任务栏按钮闪一下提醒用户
+        }
+    }
+
+    HWND m_hwnd = nullptr;
+    HANDLE m_stop_event = nullptr;
+    std::thread m_thread;
+    bool m_registered = false;
+    bool m_hidden = false;
+    bool m_warned = false;
+    bool m_paused = false;   // 是否已向计算侧下过 pause (与 m_hidden 不同: 后者是窗口状态)
+    // 隐藏时刻 (GetTickCount 时基)。隐藏后的 kIdleStartDelayMs 内不做键鼠检测。
+    ULONGLONG m_hidden_tick = 0;
+    // 泵线程里 RegisterHotKey 失败时的 GetLastError, 供 start() 报错用
+    unsigned long m_register_error = 0;
+    // start() 时控制台窗口是否真的可见。区分"经典 conhost 窗口"与"ConPTY 影子窗口"
+    // 的唯一依据 —— 影子窗口创建时就没有 WS_VISIBLE, 对它 SW_HIDE 是空操作。
+    bool m_win_was_visible = false;
+    // 真正被藏起来的窗口。通常就是 m_hwnd; 若走了宿主回退 (ConPTY 的 WT 窗口 /
+    // GA_ROOT) 则指向那个窗口, 恢复时必须把它一起带回来。
+    HWND m_hide_target = nullptr;
+    // 控制台窗口类名 (宽字符), 以及"是不是 ConPTY 影子窗口"。
+    // PTY 下必须跳过我方窗口的 SW_HIDE 复核 —— 影子窗口会"假装藏成功"。
+    std::wstring m_console_class;
+    bool m_console_is_pty = false;
+    // 用来在宿主进程里认出"哪个窗口是我们的终端" (WT 标签标题 = exe 全路径)
+    std::wstring m_console_title;
+    std::wstring m_exe_path;
+};
+
+#else // !_WIN32
+
+class ConsoleToggleHotkey
+{
+public:
+    bool start() { return false; }
+    void stop() {}
+};
+
+#endif // _WIN32
+
 } // namespace
 
 void validate_test();
 void perf_test();
 int main(int argc, char* argv[])
 {
-    // 单例必须在 INIT 之前: INIT 的构造函数就会打开 D:\iLog.txt (append), 而下面
-    // 三个常驻入口 (perf / rhoperf / validate) 也都要读 D:\ 下的状态文件。
+    // 单例必须在 INIT 之前: INIT 的构造函数就会打开 iLog.txt (exe 同目录, append),
+    // 而下面三个常驻入口 (perf / rhoperf / validate) 也都要读那个目录下的状态文件。
     ProcessSingleton singleton;
     if (!singleton.acquired()) {
-        std::cout << "已有一个 test_bitcoin 进程在运行 (单例标识 "
+        cprint() << "已有一个 test_bitcoin 进程在运行 (单例标识 "
 #ifdef _WIN32
-                     "Local\\bitcoin-rho-test-singleton"
+                 "Local\\bitcoin-rho-test-singleton"
 #else
-                     "/tmp/bitcoin-rho-test-singleton.lock"
+                 "/tmp/bitcoin-rho-test-singleton.lock"
 #endif
-                     " 已被占用), 本实例退出。\n"
-                     "同一时刻只允许一个实例: 两个进程同写 D:\\ 下的状态文件会互相覆盖。\n"
-                     "确认是不是上一份还没退干净 (Ctrl+C 之后它要先写完盘); 或者到任务管理器里\n"
-                     "结束那个 test_bitcoin.exe 再启动。"
-                  << std::endl;
+                 " 已被占用), 本实例退出。\n"
+                 "同一时刻只允许一个实例: 两个进程同写一个数据目录会互相覆盖。\n"
+                 "确认是不是上一份还没退干净 (Ctrl+C 之后它要先写完盘); 或者到任务管理器里\n"
+                 "结束那个 test_bitcoin.exe 再启动。"
+              << std::endl;
         return 1;
     }
 
-    // 运行模式：1=仅CPU单线程(无CUDA) 2=multiple=1,CPU 1/4核 3=multiple=2,CPU 1/2核(默认)
+    // 运行模式：1=仅CPU单线程(无CUDA) 2=multiple=1,CPU 1/4核(默认) 3=multiple=2,CPU 1/2核
     //           4=CPU 核数-2 线程(blockSize 与模式无关, 见 cuda.cu 的 get_optimal_block_size)
     // 用法: test_bitcoin 3  或  test_bitcoin.exe -m 4
     for (int i = 1; i < argc; ++i) {
@@ -1742,12 +741,20 @@ int main(int argc, char* argv[])
         else if (arg == "validate") run_validate = true;
     }
     if (run_perf && run_validate) {
-        std::cout << "perf 与 validate 不能同时跑" << std::endl;
+        cprint() << "perf 与 validate 不能同时跑" << std::endl;
         return 1;
     }
 
     // 注册信号处理函数，捕获 SIGINT 信号
     std::signal(SIGINT, signalHandler);
+
+    // 控制台窗口热键: Ctrl+Alt+/ 隐藏/显示本窗口 (连任务栏图标一起)。
+    // 只有 Windows 真正生效; 其他平台或没有控制台窗口时静默跳过。
+    // 热键被别的程序占着会直接报错, 不换键 (详见 ConsoleToggleHotkey 的注释)。
+    // 生命周期绑在 main 上: 跑到末尾那句 cin.get() 等回车时热键仍然有效。
+    // 启停过程不打印任何提示 —— 这几行提示已经删掉了, 需要时报错会走 cprint()。
+    ConsoleToggleHotkey console_hotkey;
+    console_hotkey.start();
 
     INIT _init;
     if (run_perf) {

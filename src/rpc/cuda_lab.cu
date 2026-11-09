@@ -27,7 +27,7 @@
 //   4) layout 相关的东西照抄 cuda.cu 的忠告: uint256_t 的 alignas(16) 是性能关键
 //      (128 位访存), 改布局前先看那边的 static_assert 与量化对账注释。
 //
-// 约定: 只读现有生产状态 (D:\*.bin / RhoState*.txt 等), 不动生产存档、不启动
+// 约定: 只读现有生产状态 (*.bin / RhoState*.txt 等), 不动生产存档、不启动
 //       play、不写设备端生产缓冲, 除非某个试验确实需要并单独说明。
 #include <cuda_runtime.h>
 
@@ -90,7 +90,7 @@
 //
 // ==== 断点续算 ====
 //   状态**只有游标 k 一个整数**: 每轮结束后 cursor += (本轮各线程实际走完的
-//   最少批数)·stride_k, 覆盖写进 D:\<prefix><起点>.state (prefix 按 Q 分:
+//   最少批数)·stride_k, 覆盖写进 <prefix><起点>.state (prefix 按 Q 分:
 //   Kg40_ / Kmvp40_, 两档互不覆盖)。walker 的点不存档 —— 下一轮
 //   重新由游标推出段首点建链即可。所以 Ctrl+C 之后重跑就是接着算, 不需要
 //   RhoState 那种大存档。

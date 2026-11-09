@@ -47,6 +47,25 @@ int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsign
 std::string get_time();
 
 // ---------------------------------------------------------------------------
+// 数据目录: 日志 / 状态 / 库 / DP 表全部落在它下面
+//
+// 历史上所有路径都写死 "D:\\...": 盘上那份积累了几百 GB 的状态就在那儿。现在改成
+// **一律 = exe 所在目录** —— 文件长在 exe 旁边, 整个目录拷走就把状态带走了。
+// 不再探测 D:\ 盘存不存在 (那层判断没有实际价值, 只是多一个分支和一个需要解释的
+// 双档行为)。
+//
+// 目录只算一次 (函数内静态, C++11 起线程安全), 结果缓存在 data_dir() 里, **带尾部
+// 路径分隔符**; data_file() 拼叶子文件名, 并且顺手把叶子前面那段子目录建出来
+// (baby_map 这种), 免得调用方各自 create_directory。
+//
+// 代价要知道: 数据跟 exe 绑在一起 —— 换个构建目录 (Debug/Release)、或者重编一次被
+// 清目录, 状态就"看不见"了 (不是丢了, 是在旧 exe 旁边)。所以想在构建目录之间共享
+// 数据的话, 请把数据的家目录做符号链接/目录联接, 或始终用同一个构建目录。
+// ---------------------------------------------------------------------------
+const std::string& data_dir();
+std::string data_file(const char* leaf);
+
+// ---------------------------------------------------------------------------
 // 控制台输出 (UTF-8 安全)
 //
 // 源码里的字符串是 UTF-8 (MSVC 带 /utf-8), 而中文 Windows 的控制台活动代码页是
@@ -95,12 +114,47 @@ inline CPrintStream cprint() { return CPrintStream(); }
 #endif
 
 void break_rho(bool value);
+
+// ---------------------------------------------------------------------------
+// 计算暂停: 有人在用这台机器就停算
+//
+// 触发端在 test/main.cpp 的控制台热键 (Ctrl+Alt+/ 隐藏窗口, 且要等隐藏满 5 分钟才
+// 开始检测键鼠 —— 刚按完热键的那些操作不算"有人在用"), 这里只
+// 负责"立/撤旗子"和一个等待点。刻意做成**极简**: 一个原子布尔 + 一个 sleep 轮询,
+// 不用 mutex/condition_variable —— 暂停的粒度本来就是"一轮" (CPU 一轮微秒级,
+// GPU 一轮分钟级), 200 ms 轮询的唤醒延迟完全无关紧要, 却省掉了丢唤醒、锁序、
+// 停机时先放行再 join 这一整类麻烦。
+//
+// 提示只印控制台, **不写 iLog**: 这两件事跟生产数据无关, 落进日志只会把日志刷得
+// 看不清。(日志里的进度/命中行那才是需要回溯的东西。)
+//
+// 落盘靠的是**调用点位置**: 每个循环体末尾本来就有自己的落盘动作
+//   CPU   : flush + barrier -> on_barrier -> saveStates()
+//   GPU   : save_edges() / save_dps() / save_RhoStates_dev()
+// 等待点放在这之后, 所以"停"天然等于"先落盘, 再停"。
+//
+//   set_compute_pause(true)  -> 立旗子 + break_rho(true) 让当前这一轮尽早收尾;
+//   set_compute_pause(false) -> 撤旗子 + break_rho(false) 重新发射内核;
+//   compute_pause_active()   -> CPU 侧用它决定"这一轮要不要顺带存档";
+//   wait_while_paused()      -> 停在这里直到撤旗子 (gameover 时也立刻返回)。
+//
+// 响应延迟 (从 set_compute_pause(true) 到内核真的停下来):
+//   CPU : 一轮 (W 个 walker 各走一步, 微秒级) -> 立刻停在 barrier 之后的等待点;
+//   GPU : 内核在 RHO_POLL_BATCHES (2^12 批) 的检查点上读旗子。W=24 下一批
+//         ~587 us, 所以最坏 2^12 批 ≈ 2.4 s 收尾 (原来是 2^18 批 ≈ 2.6 分钟)。
+//         收尾之后照常走 save_edges / save_dps / save_RhoStates_dev。
+//   所以整条链路的"停"是: 检测器最多 1 s + 内核最多 2.4 s + 落盘几秒。
+//   (隐藏后的前 5 分钟不检测, 那段时间里不可能触发暂停。)
+void set_compute_pause(bool pause);
+bool compute_pause_active();
+void wait_while_paused();
+
 void rho_play();
 // 定义在 rpc/cuda.cu (BUILD_BITCOIN_CUDA) 或 rpc/cuda_stub.cpp:
 // 32 位 DP 起点漫游。与 rho_play 跑同一个核 rho_w<W,EDGE>、同一份 fun_add_w /
 // add_dp_to_buffer / reset_start_point, 区别只有编译期那一档: 判据换成 32 位, 命中后
 // 换的是"下一个起点"(取自 DpSource32all.bin) 而不是预备队, 每条边走出来的 (起点
-// 索引, 终点索引, m, n) 追加到 D:\Dp32Edge.txt, 状态落 D:\Dp32EdgeState.txt (文本)。
+// 索引, 终点索引, m, n) 追加到 Dp32Edge.txt, 状态落 Dp32EdgeState.txt (文本)。
 void dp32_edge_play();
 void validate_test();
 void perf_test();
@@ -132,12 +186,12 @@ void rho_affine_prepare();
 //   Special 特殊点: 先吃步进表 adds_pub[0][*] 的 256 条, 吃完再按需现算 1G, 2G, 3G, ...
 //                   (阶梯无上限, 所以这一类取不完)
 //   Dp      可区分点: 从 32 位 DP 源库 DpSource32.bin 里按槽位游标取 (库里 88.7 万条,
-//           取到哪一条由 D:\RhoReserve.txt 里的 cursor 记着; 被征召销账立了墓碑的点不
+//           取到哪一条由 RhoReserve.txt 里的 cursor 记着; 被征召销账立了墓碑的点不
 //           会再发出去)
 // 一个槽位可以用不同来源, 目前的生产配置是全池统一 (见 rho.cpp 的 g_reserve_source)。
 //
 // "点用过即退役"靠库存游标保证, 而游标是**跨进程**的生产状态: rho.cpp 每轮把它连同
-// 账本写到 D:\RhoReserve.txt (格式见 rho.cpp 的"进程级状态落盘"一节)。不落盘的话,
+// 账本写到 RhoReserve.txt (格式见 rho.cpp 的"进程级状态落盘"一节)。不落盘的话,
 // 重启就是游标归零 + 留用队员全丢, 头几批点跟上一次 run 逐字节重复 —— 起点相同、(m,n)
 // 相同的轨迹产出的 DP 记录也完全相同, 而碰撞要的是"同一个 x 配不同的 (m,n)", 这种
 // 记录一条都排不上用场。
@@ -153,7 +207,7 @@ const char*   reserve_source_name(ReserveSource s);
 
 // 建账本。slots = DP 缓冲区的槽位数 (cuda.cu 的 dp_buffer_size, 由 rho_play 传进来),
 // 每轮循环开始前调一次; 轮号与履历都必须跨轮存活, 所以只建一次。
-// persistent = true 时启动即回读 D:\RhoReserve.txt (生产路径 rho_play 用; validate
+// persistent = true 时启动即回读 RhoReserve.txt (生产路径 rho_play 用; validate
 // 一律不碰盘, 免得自检把生产存档盖掉或吃进半份旧状态)。
 void init_reserve_pool(size_t slots, bool persistent = false);
 // 每轮开跑前调一次: 账本补员 (纯主机侧) + 把槽位上的点整块传进设备常量内存。
@@ -170,7 +224,7 @@ void save_reserve_state();
 // 注: "有没有队员占着"按**点**判 (队员的 x 复算索引回源库查槽位), 不能按池子槽位号
 // 当源库槽位号用 —— 两套编号早早就会错开, 见 rho.cpp 里的说明。
 void reserve_retire_consumed();
-// 生产日志 (D:\iLog.txt) 追加一行 —— 日志文件里的文本一律 UTF-8, 所以不走 cprint/
+// 生产日志 (iLog.txt) 追加一行 —— 日志文件里的文本一律 UTF-8, 所以不走 cprint/
 // cprintf 那一层。rport 那些会改变两个 .bin 条数的事件 (预备点被征召销账) 走这里。
 // 定义在 blockchain.cpp; 日志没开 (g_log == nullptr) 时静默。
 void ilog_line(const std::string& utf8);
@@ -222,9 +276,9 @@ void rho_rewalk_probe();
 // 全部去重后的 32 位 DP (含本身就是 40 位 DP 的那 3,323 条) 按索引升序装在一个库里,
 // 没有墓碑也没有征召销账, 运行期只用来跟语料对账。三个库同一套记录格式, 魔数同源。
 // ---------------------------------------------------------------------------
-constexpr const char* DP32_SOURCE_FILE   = "D:\\DpSource32.bin";
-constexpr const char* DP32_DRAFTED_FILE  = "D:\\DpDrafted32.bin";
-constexpr const char* DP32_ALL_FILE      = "D:\\DpSource32all.bin";
+constexpr const char* DP32_SOURCE_NAME   = "DpSource32.bin";
+constexpr const char* DP32_DRAFTED_NAME  = "DpDrafted32.bin";
+constexpr const char* DP32_ALL_NAME      = "DpSource32all.bin";
 constexpr const char* DP32_SOURCE_MAGIC  = "DP32SRC1";
 constexpr const char* DP32_DRAFTED_MAGIC = "DP32DRF1";
 constexpr uint32_t    DP32_VERSION       = 1;
@@ -236,7 +290,7 @@ constexpr uint32_t    DP32_VERSION       = 1;
 //                     ⚠ 边表**只**收可追溯的记录: 槽位活着 (握着库起点) 且 p 自己
 //                     命中 32 位那一种, 所以新写出的行起点列恒为真实库索引。
 //                     GLV 的 βp / β²p 和空槽 (随机起点) 上的点都追不到来源, 不进边表,
-//                     而是改判 40 位落进 D:\DistinguishablePoints.txt (见 cuda.cu 的 rho_w)。
+//                     而是改判 40 位落进 DistinguishablePoints.txt (见 cuda.cu 的 rho_w)。
 //                     ⚠ **旧文件兼容**: 盘上现有文件里有约 7 万行起点列 = 2^64-1
 //                     (EDGE_SRC_NONE) 的记录 —— 那是过去 βp / β²p 命中写下的, 新代码不再
 //                     产生这类行, 但读侧 (count_edge_lines / testmvp 8 2) 必须继续接受,
@@ -251,8 +305,8 @@ constexpr uint32_t    DP32_VERSION       = 1;
 //                     当位置用 —— 换算靠库内二分 (库按索引升序), 见 cuda.cu 的
 //                     dp32_edge_session。
 // 起点索引的哨兵值 EDGE_SRC_NONE 见 cuda.cu。
-constexpr const char* DP32_EDGE_FILE       = "D:\\Dp32Edge.txt";
-constexpr const char* DP32_EDGE_STATE_FILE = "D:\\Dp32EdgeState.txt";
+constexpr const char* DP32_EDGE_NAME       = "Dp32Edge.txt";
+constexpr const char* DP32_EDGE_STATE_NAME = "Dp32EdgeState.txt";
 
 // 头里的 records 既是条数也是完整性凭据: 跟文件长度对不上就说明被截断/写坏了。
 #pragma pack(push, 1)
@@ -304,10 +358,12 @@ class Dp32Store
 public:
     // 载入两个库的索引。任一库读不了 (缺失 / 魔数 / 版本 / 记录长度 / 条数与文件长度
     // 对不上 / 源库不再升序) ⇒ 整体失败, 并把已建的索引清掉 —— 不做"尽力恢复"。
-    // drf_path 传 nullptr (或空串) ⇒ 只载前一个库: 全量库 DpSource32all.bin 就是这么
-    // 载的 —— 它一个库装完语料里全部去重后的 32 位 DP, 既没有已征召库也没有墓碑。
-    bool load(const char* src_path = DP32_SOURCE_FILE,
-              const char* drf_path = DP32_DRAFTED_FILE);
+    // 两个路径都走 data_file(), 调用方一般直接传 data_file(DP32_SOURCE_NAME) 之类。
+    // src_path 为空 ⇒ 用默认源库; drf_path 为空 ⇒ 只载前一个库: 全量库
+    // DpSource32all.bin 就是这么载的 —— 它一个库装完语料里全部去重后的 32 位 DP,
+    // 既没有已征召库也没有墓碑。(老接口用 nullptr 表示空, 现在统一用空串。)
+    bool load(const std::string& src_path = std::string(),
+              const std::string& drf_path = std::string());
     void unload();
     bool loaded() const { return m_loaded; }
 
@@ -364,7 +420,7 @@ private:
 // 全局唯一实例, 以及幂等载入。漫步热路径用它查。
 //
 // 载入结果只说给控制台听 (走 cprint, 见上): 每次启动都有的例行一行, 留在生产日志
-// D:\iLog.txt 里没有价值 (库里有几条, 看那两个 .bin 的大小即可)。
+// iLog.txt 里没有价值 (库里有几条, 看那两个 .bin 的大小即可)。
 // 载入**失败**是异常, 除控制台外还会记进生产日志。载入是幂等的, 最多印一次。
 Dp32Store& dp32_store();
 bool dp32_store_init();
@@ -444,7 +500,7 @@ static_assert(RHO_WALKERS >= 1 && RHO_WALKERS <= RHO_WALKERS_MAX, "RHO_WALKERS �
 // RhoState 槽位总数: play() 的 rs[] 数组与 initRhoState 生成器共用。
 // 槽位按线程分段独占: 线程0 占 [0, RHO_WALKERS0), 线程 i>0 各占连续
 // RHO_WALKERS 个; 线程数上限 = 1 + (RHO_STATE_SLOTS - RHO_WALKERS0)/RHO_WALKERS
-// (play() 里的 n_tasks 已按此 clamp)。扩容不影响 D:\RhoState.txt 旧档的读取:
+// (play() 里的 n_tasks 已按此 clamp)。扩容不影响 RhoState.txt 旧档的读取:
 // play() 是部分加载, 条数不足时只把缺的槽补随机。
 constexpr int RHO_STATE_SLOTS = 1024;
 
@@ -480,8 +536,8 @@ void perf_test_rho_affine_walkers();
 // 进来); 主机侧 (起点解析、文件名、断点游标、DP 落盘) 在 rpc/rho_lab.cpp。
 //
 // ==== 基准点 Q: 第二个形参 use_mvp ====
-//   k40_play(spec, false)  Q = G    扫 k·G    —— 原来的 kg40, 落盘 D:\Kg40_<起点>.*
-//   k40_play(spec, true)   Q = MVP  扫 k·MVP  —— 落盘 D:\Kmvp40_<起点>.* (不碰 Kg40_*)
+//   k40_play(spec, false)  Q = G    扫 k·G    —— 原来的 kg40, 落盘 Kg40_<起点>.*
+//   k40_play(spec, true)   Q = MVP  扫 k·MVP  —— 落盘 Kmvp40_<起点>.* (不碰 Kg40_*)
 // 两档除了 Q 完全同构: 第 m 个被检点永远是 P0 + m·Q, 记下来的 k 就是 m。
 // 设备侧内核对这个区别**完全无感** —— 主机把 Q 与 stride_k·Q 分别送进两个
 // __constant__ 符号, 内核只管"每步加一个常量点"。所以换链不用改 CMake、不用
@@ -505,12 +561,12 @@ void perf_test_rho_affine_walkers();
 //   起点本身的 a/b 偏移不算进 k)。所以 Q=G 时 "0" 的第一个被检点是 1·G (k=1),
 //   "7g" 的第一个被检点是 8·G (k=8); Q=MVP 时 "0" 的第一个被检点是 1·MVP。
 //
-// 落盘 (每个起点一套; 两档前缀不同, 所以也不会互相覆盖):
-//   D:\<prefix><起点>.txt     每行 "<k> <索引>", 追加写, 首行是 # 注释
-//   D:\<prefix><起点>.state   断点游标 (已覆盖的 k 上界), 每轮覆盖写
+// 落盘 (每个起点一套; 两档前缀不同, 所以也不会互相覆盖; 都在数据目录下):
+//   <prefix><起点>.txt     每行 "<k> <索引>", 追加写, 首行是 # 注释
+//   <prefix><起点>.state   断点游标 (已覆盖的 k 上界), 每轮覆盖写
 //   prefix = "Kg40_" (use_mvp=false) / "Kmvp40_" (use_mvp=true)
 // 把 .state 删掉就从 k=0 重来。
-// 起点标签里的 '+' 在文件名里写成 '_', 例: 3mvp+7g -> D:\Kg40_3mvp_7g.txt。
+// 起点标签里的 '+' 在文件名里写成 '_', 例: 3mvp+7g -> Kg40_3mvp_7g.txt。
 //
 // ⚠ GLV 之后 .txt 里的 k 是**命中那个点自己的**链系数, 不再是扫描位置:
 //     p        = k·Q            -> (k,        索引0)
