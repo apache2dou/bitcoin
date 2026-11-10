@@ -3151,6 +3151,14 @@ bool compute_pause_active()
 
 void set_compute_pause(bool pause)
 {
+    // 停机之后不再理会暂停/恢复。两个理由:
+    //   1) 语义上没必要 —— 计算侧已经在收尾, 各个退出路径都会自己落盘;
+    //   2) 安全: GPU 线程退出时会 free_break_flag(), 而这里会调 break_rho()
+    //      (它解引用 break_flag_host)。如果泵线程在 GPU 线程释放那块 pinned 内存的
+    //      同时才进来, 就是一个跨线程的 use-after-free。早退把这条路径堵死。
+    //      (Ctrl+C -> stop_game() 也会调 break_rho, 但它自己会先置 gameover,
+    //       而 free_break_flag 已改成先摘指针再释放。)
+    if (gameover) return;
     if (pause == compute_pause_active()) return;   // 幂等: 状态没变就什么都不做
     g_compute_paused.store(pause, std::memory_order_relaxed);
     // GPU: 内核只在 RHO_POLL_BATCHES (2^12 批) 的 poll 检查点上看 break_flag
@@ -3158,8 +3166,8 @@ void set_compute_pause(bool pause)
     // 最坏 2^12 批 ≈ 2.4 s; 不立旗子就要等它自己走完一整轮 (生产路
     // RHO_ROUND_BATCHES_PROD = 2^21 批 ≈ 20 分钟, 起点漫游路 2^24 批 ≈ 2.7 小时)。
     // 撤旗子时清回去, 下一轮才发射得出去。
-    // gameover 时不要清: 那是停机指令, 清掉内核会再跑满一整轮。
-    if (pause || !gameover) break_rho(pause);
+    // (上面已经 gameover 早退, 所以这里不必再防"停机时把旗子清掉"。)
+    break_rho(pause);
     // 只印控制台: 这两个事件跟生产数据无关, 写进 iLog 只会把日志刷得看不清。
     cprintf("%s : %s\n", get_time().c_str(), pause ? "有人在用, 计算暂停" : "计算恢复");
 }
@@ -4908,37 +4916,45 @@ void play() {
         uint64_t count_try{0};
         unsigned int count_dstg{0};
         auto start = std::chrono::high_resolution_clock::now();
-        while (!gameover) {
+        // ⚠ 这里是 for(;;) 而不是 while (!gameover): 循环的**唯一出口**在 barrier
+        //   之后 (见下面那个 break)。理由: on_barrier 要等 n_tasks 个线程全部到齐,
+        //   如果允许线程各自在 barrier 之前退出 (旧写法 while (!gameover) 就是这样),
+        //   就会出现这种情况 —— 线程 0 置了 pause 已经在 barrier 上等, 而某线程恰好在
+        //   pause 被置起**之前**通过了判断, 它不会去 barrier, 而是回循环头发现
+        //   gameover 为真直接退出; 于是 barrier 永远凑不齐, 线程 0 和已经到达的线程
+        //   永久阻塞在 arrive_and_wait 上, join() 挂死、进程只能强杀。
+        //   (周期性落盘那条 "game pause!" 路径也有同样的栅栏窗口, 与暂停/隐藏无关。)
+        // 收口到 barrier 之后: 让"谁进 barrier"这个集合永远一致 —— 收到停机时线程 0
+        // 也置 pause, 于是所有线程都会到 barrier 汇合一次, 然后才一起退出。
+        for (;;) {
             try {
                 ++count_try;
                 _player.shoot(i, rs_i, count_dstg, _logvec[i]);
             } catch (...) {
                 stop_game();
             }
-            if (i == 0 && (count_try & 0x3FFFFFFF) == 0) {
-                pause = true;
-                std::cout << get_time() << " : game pause!" << std::endl;
-            }
-            // 外部要求停算 (有人在用本机, 见 test/main.cpp 的 ConsoleToggleHotkey):
-            // 借既有的 pause/barrier 通道先落一次盘, 再停在这个等待点上。
-            // 只有线程 0 置 pause; 其余线程靠**每轮重新看一次** pause 来"到达"。
-            // on_barrier 会把 pause 清回 false, 所以暂停不会重复触发。
-            if (i == 0 && compute_pause_active()) {
-                pause = true;
+            // 线程 0 汇总"这一轮要不要落盘": 周期到 / 外部要求暂停 / 收到停机。
+            // 后两条必须由线程 0 转成 pause —— 其余线程只看 pause, 保证大家判据一致。
+            if (i == 0) {
+                if ((count_try & 0x3FFFFFFF) == 0) {
+                    pause = true;
+                    std::cout << get_time() << " : game pause!" << std::endl;
+                }
+                // 外部要求停算 (有人在用本机, 见 test/main.cpp 的 ConsoleToggleHotkey):
+                // 借既有的 pause/barrier 通道先落一次盘, 再停在这个等待点上。
+                if (compute_pause_active() || gameover) {
+                    pause = true;
+                }
             }
             if (pause) {
                 // 暂停存档前把缓存写回 rs: on_barrier -> saveStates 读的是 rs,
                 // 而 rho_affine_FW 平时不写 rs (只在 DP 命中时写)
                 _player.flush(i, rs_i);
                 barrier.arrive_and_wait();
-                // ⚠ 等待必须放在 barrier **之内**: barrier 要等 n_tasks 个线程全部
-                //   到齐。如果某线程在 pause 被置起之前就通过了上面的判断, 它会跳过
-                //   barrier 直接落到等待点上睡住 (pause 期间 compute_pause_active()
-                //   一直是 true) —— 于是线程 0 永远等不到它, barrier 不齐, 连 Ctrl+C
-                //   都退不出去。放在这里则"漏掉的线程"只是再跑一轮 shoot() 然后补上
-                //   这次 barrier, 不会阻塞任何人。
-                // 落盘发生在 on_barrier (saveStates) 里, 所以这里 = "状态已在盘上再停"。
-                wait_while_paused();
+                // 落盘发生在 on_barrier (saveStates) 里, 且它把 pause 清回 false,
+                // 所以走到这里 = "状态已经在盘上", 可以安全地退出或原地等待。
+                if (gameover) break;        // 唯一出口: 全员到齐之后一起走
+                wait_while_paused();        // 暂停期间停在这里, 撤旗子后继续
             }
         }
         // 线程退出前同样要写回: 线程局部缓存随线程销毁, 主线程 join 之后的

@@ -659,12 +659,15 @@ private:
 
         // 隐藏时藏的是宿主窗口 (PTY 的 owner / 兜底找到的那个), 恢复也必须把它带回来。
         // 记下来再清空: 后面抢前台要用这个窗口, 而不是 0 尺寸的影子窗口。
-        HWND shown = m_hide_target;
-        if (m_hide_target != nullptr) {
-            ::ShowWindow(m_hide_target, SW_SHOW);
-            if (::IsIconic(m_hide_target)) ::ShowWindow(m_hide_target, SW_RESTORE);
-            m_hide_target = nullptr;
+        // ⚠ 隐藏期间终端窗口可能已经被关掉/重建 (WT 重开标签、切页后重建宿主),
+        //   句柄会失效。对失效句柄调 ShowWindow/SetForegroundWindow 不会崩, 但那些
+        //   调用全是空操作; 这里用 IsWindow 过滤掉, 让"抢前台"直接落到自己的窗口上。
+        HWND shown = (m_hide_target != nullptr && ::IsWindow(m_hide_target)) ? m_hide_target : nullptr;
+        if (shown != nullptr) {
+            ::ShowWindow(shown, SW_SHOW);
+            if (::IsIconic(shown)) ::ShowWindow(shown, SW_RESTORE);
         }
+        m_hide_target = nullptr;
         ::ShowWindow(m_hwnd, SW_SHOW);
         if (::IsIconic(m_hwnd)) ::ShowWindow(m_hwnd, SW_RESTORE);
         bring_to_front(shown != nullptr ? shown : foreground_target());

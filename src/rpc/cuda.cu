@@ -1841,11 +1841,17 @@ void init_break_flag()
 }
 
 // 释放break_flag内存
+// ⚠ 必须**先摘指针再释放**: break_rho 跑在另一条线程上 (热键泵 -> set_compute_pause,
+//   或者 Ctrl+C -> stop_game), 它读的是 `if (break_flag_host) *break_flag_host = ...`。
+//   如果先 cudaFreeHost 再置空, 对方可能已经通过了非空判断、正要写这块已释放的内存
+//   —— use-after-free。先置空之后, 新的调用一律看到 nullptr 直接跳过; 已经越过判断的
+//   那一个靠 set_compute_pause 的 gameover 早退避开 (见 blockchain.cpp 的说明)。
 void free_break_flag()
 {
-    if (break_flag_host) {
-        CHECK_CUDA(cudaFreeHost(break_flag_host));
-        break_flag_host = nullptr;
+    bool* p = break_flag_host;
+    break_flag_host = nullptr;
+    if (p != nullptr) {
+        CHECK_CUDA(cudaFreeHost(p));
     }
 }
 
@@ -3169,7 +3175,19 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
         // 等于"数据落在盘上再停"。必须在 break_rho(false) **之前**: 暂停时旗子是立着
         // 的, 提前清掉内核就会再跑满一整轮; 顺序反过来才是"放行之后才重新发射"。
         wait_while_paused();
+        // ⚠ 必须是 gameover → break, 不能接着往下走: wait_while_paused 也会因为
+        //   gameover 而返回, 而下一句 break_rho(false) 会把 stop_game() 刚立起来的
+        //   停机旗子**清掉** —— 内核照样发射, 跑满一整轮 (2^24 批 ≈ 2.7 小时) 才回到
+        //   循环头。暂停中按 Ctrl+C 就会命中这条。
+        if (gameover) break;
+        // ⚠ 极小窗口: 刚等到放行、又立刻被暂停 (set_compute_pause(true) 正在执行)。
+        //   这时不能清旗子, 否则那一轮的暂停被静默吃掉; 回循环头重新等一轮。
+        if (compute_pause_active()) continue;
         break_rho(false);
+        // 竞态兜底: 上面那次 check 与本句清旗子之间若刚好被暂停/停机, 旗子会被清掉,
+        //   内核就会跑满一整轮才收尾。这里再补一次 —— 真立上了也只是在下个 poll 点
+        //   (RHO_POLL_BATCHES ≈ 2.4 s) 多走一点点, 比整轮短三个量级。
+        if (compute_pause_active() || gameover) break_rho(true);
 
         // 铺起点池 (与 init_RhoStates_reserve 同一时序位: 每轮开始重铺一次池子)。
         // 注意**不动 cursor** —— 池子是个窗口, 只有真被用掉的那 n 个池位才推游标,
@@ -3331,7 +3349,19 @@ static void rho_play_impl()
             // 上一轮末尾已经 save_reserve_state / save_RhoStates_dev 过, 所以停在这里
             // 等于"数据落在盘上再停"。顺序与起点漫游路一致: 先等放行, 再清 break_flag。
             wait_while_paused();
+            // ⚠ 必须是 gameover → break, 不能接着往下走: wait_while_paused 也会因为
+            //   gameover 而返回, 而下一句 break_rho(false) 会把 stop_game() 刚立起来的
+            //   停机旗子**清掉** —— 内核照样发射, 跑满一整轮 (2^21 批 ≈ 20 分钟) 才回到
+            //   循环头。暂停中按 Ctrl+C 就会命中这条。
+            if (gameover) break;
+            // ⚠ 极小窗口: 刚等到放行、又立刻被暂停 (set_compute_pause(true) 正在执行)。
+            //   这时不能清旗子, 否则那一轮的暂停被静默吃掉; 回循环头重新等一轮。
+            if (compute_pause_active()) continue;
             break_rho(false);
+            // 竞态兜底: 上面那次 check 与本句清旗子之间若刚好被暂停/停机, 旗子会被清掉,
+            //   内核就会跑满一整轮才收尾。这里再补一次 —— 真立上了也只是在下个 poll 点
+            //   (RHO_POLL_BATCHES ≈ 2.4 s) 多走一点点, 比整轮短三个量级。
+            if (compute_pause_active() || gameover) break_rho(true);
             // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由账本决定
             init_RhoStates_reserve();
             const auto t0 = std::chrono::steady_clock::now();
