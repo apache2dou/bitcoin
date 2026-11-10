@@ -74,6 +74,12 @@ std::string get_time();
 const std::string& data_dir();
 std::string data_file(const char* leaf);
 
+// 把文件内容真正刷到物理介质 (= POSIX fsync / Windows FlushFileBuffers)。定义在
+// blockchain.cpp。ofstream::flush 只交给操作系统页缓存, 掉电就丢, 所以凡是"重启后
+// 绝不能重发/绝不能丢"的状态 (预备队游标、源库墓碑、已征召库) 写完都要再刷一次。
+// 写完并 close 之后再调; 返回 false 表示刷不下去 (文件不存在/被占用/介质报错)。
+bool fsync_path(const std::string& path);
+
 // ---------------------------------------------------------------------------
 // 控制台输出 (UTF-8 安全)
 //
@@ -179,7 +185,7 @@ void validate_rho_affine();
 void rho_affine_prepare();
 
 // ---------------------------------------------------------------------------
-// 预备队 (RhoStates_reserve) 的来源与账本
+// 预备队 (RhoStates_reserve) 的来源 (没有账本)
 //
 // 池子的唯一用途: 某个 walker 命中可区分点时, 用池里对应槽位的一份独立点把它的
 // (x, m, n) 整体顶替掉 (见 cuda.cu 的 reset_start_point), 让它从这份新起点继续走。
@@ -188,22 +194,26 @@ void rho_affine_prepare();
 //
 // 逻辑全在 rpc/rho.cpp (纯主机侧, 一行 CUDA 代码都不需要)。设备端只保留那份
 // RhoStates_reserve 常量内存, 装载走 upload_RhoStates_reserve。
+//
+// 三条来源都不建账本: 每一轮现从来源处取一窗点, 取完就上传, 不记"谁在哪个槽位",
+// 也不留履历。池子就是一扇滑动的窗 (与起点漫游路的 edge 池同一个套路)。
 // ---------------------------------------------------------------------------
 
 // 点的来源:
-//   Random  现行做法: 每轮整池换新随机点, 没有账本 (也就是改造前的行为)
-//   Special 特殊点: 先吃步进表 adds_pub[0][*] 的 256 条, 吃完再按需现算 1G, 2G, 3G, ...
-//                   (阶梯无上限, 所以这一类取不完)
-//   Dp      可区分点: 从 32 位 DP 源库 DpSource32.bin 里按槽位游标取 (库里 88.7 万条,
-//           取到哪一条由 RhoReserve.txt 里的 cursor 记着; 被征召销账立了墓碑的点不
-//           会再发出去)
-// 一个槽位可以用不同来源, 目前的生产配置是全池统一 (见 rho.cpp 的 g_reserve_source)。
+//   Random  每轮整窗换新随机点 (也就是改造前的行为)
+//   Special 特殊点: 序列 = 步进表 adds_pub[0][*] 的 256 条, 之后按需现算 1G, 2G, 3G, ...
+//                   (阶梯无上限, 所以这一类取不完); 第 pos 条由 pos 现算
+//   Dp      可区分点: 32 位 DP 源库 DpSource32.bin 里的活记录 (库里 88.7 万条)。
+//           **每轮都从槽位 0 起扫, 墓碑跳过**, 取前 N 条 —— 不需要任何游标或账本:
+//           被征调用掉的点当场立墓碑, 于是"活记录"就是"还没用过", 上一轮取了没被
+//           征调的下轮仍在队首 (原样重发, 一条不丢)。
+// 当前的生产配置是整池统一 (见 rho.cpp 的 g_reserve_source)。
 //
-// "点用过即退役"靠库存游标保证, 而游标是**跨进程**的生产状态: rho.cpp 每轮把它连同
-// 账本写到 RhoReserve.txt (格式见 rho.cpp 的"进程级状态落盘"一节)。不落盘的话,
-// 重启就是游标归零 + 留用队员全丢, 头几批点跟上一次 run 逐字节重复 —— 起点相同、(m,n)
-// 相同的轨迹产出的 DP 记录也完全相同, 而碰撞要的是"同一个 x 配不同的 (m,n)", 这种
-// 记录一条都排不上用场。
+// 只有 2 类需要跨进程的游标 (序列走到第几条): 步进是确定性的, 起点定死则整条轨迹定死,
+// 同一个点入池两次走出的 (m,n) 完全相同, 产出的 DP 记录逐字节重复 —— 而碰撞要的是
+// "同一个 x 配不同的 (m,n)", 这种记录一条都排不上用场。所以那个游标每轮写进
+// RhoReserve.txt (格式见 rho.cpp 的"进程级状态落盘"一节)。
+// 3 类不需要游标 (墓碑位图本身就是账本), 1 类也没有进度可丢。
 enum class ReserveSource {
     Random,
     Special,
@@ -214,25 +224,21 @@ enum class ReserveSource {
 ReserveSource reserve_configured_source();
 const char*   reserve_source_name(ReserveSource s);
 
-// 建账本。slots = DP 缓冲区的槽位数 (cuda.cu 的 dp_buffer_size, 由 rho_play 传进来),
-// 每轮循环开始前调一次; 轮号与履历都必须跨轮存活, 所以只建一次。
-// persistent = true 时启动即回读 RhoReserve.txt (生产路径 rho_play 用; validate
-// 一律不碰盘, 免得自检把生产存档盖掉或吃进半份旧状态)。
+// 建池。slots = DP 缓冲区的槽位数 (cuda.cu 的 dp_buffer_size, 由 rho_play 传进来),
+// 只建一次 (轮号与 2 类游标跨轮存活)。persistent = true 时启动即回读 RhoReserve.txt
+// (生产路径 rho_play 用; validate 一律不碰盘, 免得自检把生产存档盖掉)。
 void init_reserve_pool(size_t slots, bool persistent = false);
-// 每轮开跑前调一次: 账本补员 (纯主机侧) + 把槽位上的点整块传进设备常量内存。
+// 每轮开跑前调一次: 从来源现取一窗点 + 整块传进设备常量内存。
 void init_RhoStates_reserve();
-// 账本记账: 这一轮设备换起点了 dp_count 次 (注意不是**记录条数** —— GLV 之后一条
-// walker 一次命中可产生 1~3 条记录, 但只消费一个槽位; 设备端由 reset_start_point
+// 轮末结算: 这一轮设备换起点了 dp_count 次 (注意不是**记录条数** —— GLV 之后一条
+// walker 一次命中可产生 1~3 条记录, 但只消费一个池位; 设备端由 reset_start_point
 // 的独立计数器 dp_reset_count 数着, 主机用 DpManager::last_reset_count() 取)。
+// 做两件事: 3 类被消费的那些池位对应的源库记录销账 (立墓碑 + 追加已征召库);
+// 2 类的游标推过被消费的那 dp_count 条 (1、3 类没有游标要推)。
 void note_reserve_dps(unsigned int dp_count);
-// 把货源游标与账本落盘 (游标丢了 = 重启后重复用点, 所以每轮结束后都要落一次)。
+// 把 2 类的货源游标与轮号落盘 (游标丢了 = 重启后重复用点, 所以每轮结束后都要落一次)。
 // 只在 init_reserve_pool(.., true) 之后有作用。
 void save_reserve_state();
-// 载入存档后的对账 (定义在 rho.cpp, 由 rho_play 在库载入之后调一次): 把"游标已经
-// 推过、池子里又没有队员占着"的那几条源库记录销账 (立墓碑 + 追加进已征召库)。幂等。
-// 注: "有没有队员占着"按**点**判 (队员的 x 复算索引回源库查槽位), 不能按池子槽位号
-// 当源库槽位号用 —— 两套编号早早就会错开, 见 rho.cpp 里的说明。
-void reserve_retire_consumed();
 // 生产日志 (iLog.txt) 追加一行 —— 日志文件里的文本一律 UTF-8, 所以不走 cprint/
 // cprintf 那一层。rport 那些会改变两个 .bin 条数的事件 (预备点被征召销账) 走这里。
 // 定义在 blockchain.cpp; 日志没开 (g_log == nullptr) 时静默。
@@ -241,10 +247,9 @@ void ilog_line(const std::string& utf8);
 void upload_RhoStates_reserve(const RhoPoint* points, size_t count);
 
 // 验证用 (都定义在 rho.cpp):
-void validate_reserve_pool_state();   // 账本状态机自测 (合成供应器 + 合成记录条数)
-void validate_reserve_supplies();     // 真货源装载 + 抽样的点自洽
-void validate_reserve_state_file();   // 状态存档往返自测 (写临时路径, 不碰生产存档)
-bool reserve_slot_tracked(size_t slot);   // 槽位当前有没有队员 (随机点占位 = 没有)
+void validate_reserve_supplies();     // 真货源取点: 座标 -> 点自洽 + 序列不重复
+void validate_reserve_state_file();   // 状态存档往返 + 旧版兼容 + 坏档丢弃 (临时路径)
+bool reserve_slot_sourced(size_t slot);   // 槽位这一轮的点是不是真来自来源
 // 定义在 cuda.cu: 按**当前配置**把生产启动那一步 (建池 -> 取满 -> 上传) 走一遍并逐槽
 // 核对 —— 换货源之后想知道"这套配置真能跑生产了吗"就调它, 不必跑全量 validate。
 void validate_reserve_prod_config();
@@ -274,7 +279,7 @@ void rho_rewalk_probe();
 //
 // 两个库记的是**同一批点**: 源库里被立墓碑的那条, 就是已征召库里追加的那条。什么
 // 时候销这笔账: 拿这个点当起点的那份预备队员**被征召** (它那一记漫步走到 DL 端点,
-// 由 reset_start_point 换掉) 的时候 —— 见 rho.cpp 的 retire_dp_member。所以 3 类货源
+// 由 reset_start_point 换掉) 的时候 —— 见 rho.cpp 的 retire_dp_slot。所以 3 类货源
 // 每被用掉一个, 源库就少一条活的、已征召库多一条, 两库之和不变。
 // 建库那一轮 (离线) 还写过一次已征召库: 语料里本身也是 40 位 DP 的那批不进源库,
 // 直接计入已征召库。运行期的写作口只剩预备点被征召销账这一个。
@@ -394,7 +399,7 @@ public:
     bool read(Dp32File which, uint32_t slot, Dp32Record& r) const;
 
     // ---- 生产侧的落盘写口 ----
-    // 应用内只有这一个写口: 预备点被征召销账 (rho.cpp 的 retire_dp_member)。那是
+    // 应用内只有这一个写口: 预备点被征召销账 (rho.cpp 的 retire_dp_slot)。那是
     // "这一条已经用过了": 先 drf_append 再 src_tombstone, 两笔账一起记。(离线建库脚本
     // 另算, 不在应用内 —— 应用内没有重建入口, 见下面 validate_dp32_corpus。)
     //

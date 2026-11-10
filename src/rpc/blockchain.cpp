@@ -52,11 +52,17 @@
 #include <validationinterface.h>
 #include <versionbits.h>
 
-#ifdef WIN32
+// 判据用 _WIN32 而不是 WIN32: fsync_path 两个分支用的就是 _WIN32, 两处必须同口径
+// (MSVC 两者都定义, 但别指望所有工具链都定义 WIN32; 一旦错开, 就是"取了 POSIX 分支
+//  却没引入 <fcntl.h>/<unistd.h>" 这种难查的编译错)。
+#ifdef _WIN32
 #include <compat/compat.h> // 必须先于 windows.h 引入 winsock2.h
 #include <windows.h>
 #else
 #include <sched.h>
+
+#include <fcntl.h>   // open / O_RDWR  (fsync_path 的非 Windows 分支)
+#include <unistd.h>  // fsync / close
 #endif
 
 #include <stdint.h>
@@ -2863,6 +2869,34 @@ std::string data_file(const char* leaf)
     return p;
 }
 
+// 把文件内容真正刷到物理介质 (= POSIX fsync / Windows FlushFileBuffers)。
+//
+// 为什么 flush() 不够: ofstream::flush 只把用户态缓冲交给**操作系统**, 掉电或硬复位时
+// 那些字节还躺在系统页缓存里 —— 对"重启后不许重复发点"这类要求, 那等于没写。生产侧
+// 只在每轮末尾落一两次盘, 所以多一次 FlushFileBuffers (通常 1~5 ms) 完全可以接受。
+//
+// 用法: 写完并 close() 之后再调 (Windows 上 CreateFileW 打不开仍开着的独占句柄)。
+// 返回 false 表示刷不下去 (文件不存在 / 被占用 / 介质报错), 调用方自己决定是否当失败。
+bool fsync_path(const std::string& path)
+{
+#ifdef _WIN32
+    const fs::path p = fs::PathFromString(path);
+    // GENERIC_WRITE + FILE_SHARE_READ: 只要写得开就能刷; 别独占, 免得与别的句柄打架。
+    HANDLE h = CreateFileW(p.wstring().c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const BOOL ok = FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok != FALSE;
+#else
+    const int fd = ::open(path.c_str(), O_RDWR);
+    if (fd < 0) return false;
+    const int rc = ::fsync(fd);
+    ::close(fd);
+    return rc == 0;
+#endif
+}
+
 static RecursiveMutex find_mutex;
 bool save_key(CKey& secret)
 {
@@ -4021,6 +4055,14 @@ bool Dp32Store::src_tombstone(uint32_t slot)
 
     m_src_dead[slot / 64] |= (1ULL << (slot % 64));
     ++m_src_dead_n;
+    // 刷到物理介质: 墓碑是"这个点已经用掉了"的**唯一凭据**, 内存位图只在本次进程内
+    // 有效。墓碑丢了 = 重启后会把这个点再发一遍。
+    // 刷不下去**不回滚内存状态** —— 写入已经交给操作系统了, 同一进程内把它当活点会
+    // 立刻重发一次重复轨迹; 耐久性风险只能报出来 (重启后靠启动对账与墓碑位图自愈)。
+    if (!fsync_path(m_src_path)) {
+        cprint() << get_time() << " : Dp32 源库墓碑 fsync 失败 (耐久性风险): "
+                 << m_src_path << std::endl;
+    }
     return true;
 }
 
@@ -4056,6 +4098,13 @@ bool Dp32Store::drf_append(uint64_t index, const unsigned char* m, const unsigne
 
     m_drf[index].push_back((uint32_t)slot);
     m_drf_count = records;
+    // 刷盘: 已征召库是"这个点已经用掉了"的账本副本, 也是启动对账
+    // (rho.cpp 的 reserve_reconcile_drafted) 的依据 —— 掉电丢了它, 那条预点就可能在
+    // 重启后被再发一次。同上: 刷不下去不回滚内存状态, 只报告。
+    if (!fsync_path(m_drf_path)) {
+        cprint() << get_time() << " : Dp32 已征召库 fsync 失败 (耐久性风险): "
+                 << m_drf_path << std::endl;
+    }
     return true;
 }
 

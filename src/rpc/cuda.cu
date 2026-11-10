@@ -1918,7 +1918,7 @@ public:
                 // 调用原始 saveDP 函数。
                 // 注: 走出来的 40 位 DP 只进文本归档 (DistinguishablePoints.txt), **不碰**
                 // 那两个 .bin —— 它们记的是"被征召的预备点"这本账 (源库立墓碑 + 已征召库
-                // 追加), 见 rho.cpp 的 retire_dp_member。
+                // 追加), 见 rho.cpp 的 retire_dp_slot。
                 _saveDP(dp.d, dp.sp);
             }
             // 重置设备缓冲区计数
@@ -3323,24 +3323,21 @@ static void rho_play_impl()
         init_adds_pub_dev();
         // 初始化break_flag
         init_break_flag();
-        // 预备队账本: 槽位数 = DP 缓冲区槽位数。来源与账本本身都在 rho.cpp。
-        // persistent = true: 启动时回读 RhoReserve.txt (货源游标 + 留用队员)。
-        // 不落盘的话游标重启归零, 头几批点跟上一次 run 逐字节重复 —— 重复的那批 DP
+        // 预备队: 池子没有账本, 每轮现从来源取一窗点 (逻辑全在 rho.cpp)。
+        // persistent = true: 启动时回读 RhoReserve.txt (只有货源游标 + 轮号)。
+        // 不落盘的话游标重启归零, 头几段点跟上一次 run 逐字节重复 —— 重复的那批 DP
         // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
         // ⚠ 来源配成 Random (当前配置) 时 rho.cpp 会把这条通道整个关掉: 既不回读也不
         //   写盘, 那份存档原样留着给将来的 Dp/Special 用 (见 init_reserve_pool 的注释)。
         init_reserve_pool(dp_buffer_size, true);
         // 32 位 DP 库 (瘦索引: 源库 + 已征召库)。只有 3 类货源 (Dp) 从这儿取点,
         // 所以只在来源配成 Dp 时载索引; 载不进来这一类就回退随机点 (见 rho.cpp 的
-        // reserve_load_dp)。载入结果印在控制台上 (见 dp32_store_init), 不写生产日志。
+        // reserve_pull)。载入结果印在控制台上 (见 dp32_store_init), 不写生产日志。
         // 来源配成 Random (当前配置) 时整段跳过 —— 库归起点漫游路用, 生产路不碰。
         if (reserve_configured_source() == ReserveSource::Dp) {
             if (!dp32_store_init()) {
                 cprintf("%s : Dp32 库不可用, 3 类货源(来源 3)回退随机点\n", get_time().c_str());
             }
-            // 库载进来之后, 先把存档里"已经取走、又被征召掉"的那几个 3 类队员销一次账 ——
-            // 被征召的队员不进存档, 只能从"游标推过、槽位空着"反推出来 (见 rho.cpp)。
-            reserve_retire_consumed();
         }
         uint64_t round_no = 0;
         (void)round_no;   // 轮号已不再进汇总行 (见 flush_round_rate), 留着只为可选调试
@@ -3362,17 +3359,17 @@ static void rho_play_impl()
             //   内核就会跑满一整轮才收尾。这里再补一次 —— 真立上了也只是在下个 poll 点
             //   (RHO_POLL_BATCHES ≈ 2.4 s) 多走一点点, 比整轮短三个量级。
             if (compute_pause_active() || gameover) break_rho(true);
-            // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由账本决定
+            // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由游标 + 来源现算
             init_RhoStates_reserve();
             const auto t0 = std::chrono::steady_clock::now();
             rho_w<W><<<gridSize, blockSize>>>();
             // 等待核函数完成
             CHECK_CUDA(cudaDeviceSynchronize());
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            // 把这一轮**换起点的次数**喂给账本 (记录条数不等于征调槽位数), 然后落盘
+            // 把这一轮**换起点的次数**喂给池子 (记录条数不等于消费的池位数), 然后落盘
             const unsigned int hits = dp_manager.save_dps();
-            // GLV 之后每条记录不一定消费预备队槽位 —— 只有"p 自己命中"的那几条
-            // 才换了起点, 所以账本按换起点次数记账, 不能按记录条数。
+            // GLV 之后每条记录不一定消费一个预备池位 —— 只有"p 自己命中"的那几条
+            // 才换了起点, 所以按换起点次数结算, 不能按记录条数。
             note_reserve_dps(dp_manager.last_reset_count());
             unsigned long long batches = 0;
             CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
@@ -4294,7 +4291,7 @@ void validate_test()
     std::remove(fn_.c_str());
     std::remove(fn2_.c_str());
 
-    // 预备队: 账本取点 + 整块上传的结果。生产路径里它每轮 rho_play 开跑前都跑,
+    // 预备队: 取点 + 整块上传的结果。生产路径里它每轮 rho_play 开跑前都跑,
     // 而 validate 不跑 rho_play, 所以这里单独跑一次, 回读设备常量内存逐槽核对 ——
     // 一份都必须是能独立起步的点 (m/n/x 自洽), 且彼此不同 (起点相同的两条链会
     // 逐点重合)。上传若写错偏移或长度, 只有这里看得见。
@@ -4313,12 +4310,12 @@ void validate_test()
             for (size_t j = 0; j < i; j++) {
                 HOST_ASSERT(memcmp(&pool[i], &pool[j], 129) != 0);
             }
-            if (reserve_slot_tracked(i)) ++tracked;
+            if (reserve_slot_sourced(i)) ++tracked;
         }
-        // "该不该有队员"随来源变, 不能写死成"全随机池":
-        //   1 类 不留履历, 所以一个槽位也不该进账本;
-        //   2 类 货源无上限 (阶梯由游标现算), 每个槽位都该是一位队员;
-        //   3 类 受存档条数所限, 取不到就**永久**降级成随机点, 只要求至少有一位。
+        // "该不该来自来源"随来源变, 不能写死成"全随机池":
+        //   1 类 每轮整窗随机, 所以一个槽位也不该标成来自来源;
+        //   2 类 货源无上限 (阶梯由游标现算), 每个槽位都该来自来源;
+        //   3 类 受源库条数所限, 取不到就回退随机点, 只要求至少有一位。
         const ReserveSource rsrc = reserve_configured_source();
         if (rsrc == ReserveSource::Random) {
             HOST_ASSERT(tracked == 0);
@@ -4327,13 +4324,12 @@ void validate_test()
         } else {
             HOST_ASSERT(tracked >= 1);
         }
-        printf("reserve pool: %d slots ok (%d tracked, source %s)\n", (int)dp_buffer_size,
+        printf("reserve pool: %d slots ok (%d sourced, source %s)\n", (int)dp_buffer_size,
                (int)tracked, reserve_source_name(rsrc));
     }
-    // 账本状态机 (主机侧, 合成供应器 + 合成记录条数)、两类真货源的装载自检、以及
-    // 状态存档的往返自测, 都在 rho.cpp 里 —— 预备队逻辑整段搬过去了。
+    // 两条真货源的取点口径、以及状态存档的往返/兼容自测, 都在 rho.cpp 里 ——
+    // 预备队逻辑整段搬过去了。
     // (上面 init_reserve_pool 用的是默认 persistent = false: 自检绝不碰生产存档。)
-    validate_reserve_pool_state();
     validate_reserve_supplies();
     validate_reserve_state_file();
     // 32 位 DP 库的瘦索引 (载入 / 升序查找 / 墓碑 / 同索引多桶 / 坏库拒绝 / 真库抽样复算)
@@ -4360,11 +4356,11 @@ void validate_test()
 // 来源 3 (Dp) 的"能不能跑生产"自检 —— 把生产启动那一步原样走一遍, 不跑那套 25 分钟的
 // 全量 validate (入口: testmvp 120 891)。
 //
-// 要证的就一条: 按**当前配置**建池 -> 账本取点 -> 上传设备常量内存之后, 110 个槽位
+// 要证的就一条: 按**当前配置**建池 -> 从来源取点 -> 上传设备常量内存之后, 110 个槽位
 // 拿到的都是能独立起步、彼此不同的点; 来源配成 3 类时还必须是源库里的 32 位 DP。
 //
-// 前面几个自检都是拿独立实例 + 合成供应器验的 (reserve_load_dp / reserve_take 各一段),
-// 只有这里把"全局供应器 + 全局账本 + 真库存"串成生产那一串 —— 库不在盘上、游标落进
+// 前面几个自检都是拿局部游标验的 (special_point / dp_point 各一段),
+// 只有这里把"真库 + 真游标 + 上传"串成生产那一串 —— 库不在盘上、游标落进
 // 墓碑堆、上传偏移写错, 都只有这里看得见。
 //
 // persistent = false: 只读不写, 绝不碰生产存档 RhoReserve.txt。
@@ -4381,7 +4377,7 @@ void validate_reserve_prod_config()
     CHECK_CUDA(cudaMemcpyFromSymbol(pool.data(), RhoStates_reserve,
                                     dp_buffer_size * sizeof(RhoPoint_dev)));
 
-    size_t tracked = 0;
+    size_t sourced = 0;
     size_t is_dp = 0;
     for (size_t i = 0; i < pool.size(); ++i) {
         RhoPoint r;
@@ -4393,28 +4389,28 @@ void validate_reserve_prod_config()
         for (size_t j = 0; j < i; ++j) {
             HOST_ASSERT(memcmp(&pool[i], &pool[j], 129) != 0);
         }
-        if (reserve_slot_tracked(i)) {
-            ++tracked;
+        if (reserve_slot_sourced(i)) {
+            ++sourced;
             uint64_t idx = 0;
             if (dp32_test(r.x, idx)) ++is_dp;
         }
     }
 
     if (rsrc == ReserveSource::Dp) {
-        // 真库存 88.7 万条 >> 槽位数, 所以一位都不许回退随机: 110 个槽位全在账本里,
+        // 真库存 88.7 万条 >> 槽位数, 所以一位都不许回退随机: 110 个槽位全来自源库,
         // 且全是源库的 32 位 DP (3 类的定义就是这个)。有一条不是, 说明库存没接上。
-        HOST_ASSERT(tracked == pool.size());
+        HOST_ASSERT(sourced == pool.size());
         HOST_ASSERT(is_dp == pool.size());
-        cprintf("reserve prod config: ok (%d slots, %d tracked, %d are 32-bit DP)\n",
-                (int)pool.size(), (int)tracked, (int)is_dp);
+        cprintf("reserve prod config: ok (%d slots, %d sourced, %d are 32-bit DP)\n",
+                (int)pool.size(), (int)sourced, (int)is_dp);
     } else if (rsrc == ReserveSource::Special) {
-        // 2 类货源无上限 (阶梯由游标现算), 每个槽位都该是一位队员。
-        HOST_ASSERT(tracked == pool.size());
-        printf("reserve prod config: ok (%d slots, %d tracked)\n", (int)pool.size(),
-               (int)tracked);
+        // 2 类货源无上限 (阶梯由游标现算), 每个槽位都该来自来源。
+        HOST_ASSERT(sourced == pool.size());
+        printf("reserve prod config: ok (%d slots, %d sourced)\n", (int)pool.size(),
+               (int)sourced);
     } else {
-        // 1 类不留履历: 一个槽位也不该进账本。
-        HOST_ASSERT(tracked == 0);
+        // 1 类每轮整窗随机: 一个槽位也不该标成来自来源。
+        HOST_ASSERT(sourced == 0);
         cprintf("reserve prod config: ok (%d slots, all random)\n", (int)pool.size());
     }
 }

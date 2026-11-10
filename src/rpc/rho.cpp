@@ -22,15 +22,18 @@
 //       进本翻译单元, 不会与已链接的 libsecp256k1 静态库产生符号冲突。
 #include "common.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -1106,55 +1109,53 @@ void rho_affine_prepare()
 }
 
 // ===========================================================================
-// 预备队 (RhoStates_reserve) 的来源与账本
+// 预备队 (RhoStates_reserve) 的来源 —— 没有账本
 //
 // 位置说明: 这一整段都是纯主机侧逻辑, 不需要一行 CUDA 代码, 所以就在 rho.cpp;
 // 设备侧 (cuda.cu) 只留 RhoStates_reserve 那份常量内存 + 一个上传函数
 // upload_RhoStates_reserve。池子的用途见 common.h 的 ReserveSource 那段。
 //
-// 三类来源里只有 2、3 类需要账本:
+// 三条来源都不建账本: **每一轮现从来源处取一窗点**, 取完就上传, 不记"谁在哪个槽位",
+// 也不留履历。池子就是一扇滑动的窗 —— 与起点漫游路 (cuda.cu 的 dp32_edge_session)
+// 铺起点池是同一个套路。
 //
-//   1 类 Random   每轮整池换新随机点。不需要账本 —— 这正是改造前的行为, 所以全池
-//                 用 Random 时, 行为与改造前一致。
-//   2 类 Special  先吃步进表 adds_pub[0][*] 的 256 条, 吃完再按 k = 1, 2, 3, ... 现算
-//                 k*G 接上。阶梯不预生成也没有上限, 所以 2 类取不完。
-//   3 类 Dp       旧的可区分点 (从 DP 存档里取), 相当于把以前被切断的轨迹接上。
+//   1 类 Random   每轮整窗换新随机点 (改造前的行为)。
+//   2 类 Special  序列 = adds_pub[0][*] 的 256 条, 之后接无限阶梯 1G, 2G, 3G, ...
+//                 第 pos 条直接由 pos 现算 (阶梯不物化、没有上限, 所以取不完)。
+//   3 类 Dp       源库 DpSource32.bin 的活记录: **每轮从槽位 0 起扫, 墓碑跳过**。
 //
-// 2、3 类为什么要账本 (1 类为什么不要):
+// 只有 2 类需要跨进程的游标 (序列走到第几条), 因为它的"用过即退役"是**靠位置**保证的,
+// 位置丢了就只能重发。步进是确定性的: 起点定死则整条轨迹定死, 同一个点入池两次走出的
+// (m, n) 完全相同, 产出的 DP 记录逐字节重复 —— 而碰撞判定要的是"同一个 x 配不同的
+// (m, n)", 重复记录一条都排不上用场。所以游标必须落盘。
 //
-//   (i)  步进表是确定性的: 起点定死则整条轨迹定死 (走到的点、累计的 m/n 全可预测)。
-//        同一个点入池两次, 走的轨迹连 (m,n) 都完全相同, 产出的 DP 记录逐字节重复;
-//        而碰撞判定要的是"同一个 x 配不同的 (m,n)", 重复记录一条都排不上用场。所以
-//        每个**点**最多入池一次, 用过即退役; 槽位可以重复用, 但里面换成新点。
-//   (ii) 池子每轮开跑前要重填, 而该填哪些槽位取决于上一轮谁被征调过 —— 不记账就
-//        无从判断; 整池乱换又会把还没用上的好点丢掉。
+// 3 类**什么游标都不需要** —— 源库的墓碑位图本身就是账本:
+//   · 被征调用掉的点当场立墓碑 (retire_dp_slot), 墓碑 = "这个点用过了";
+//   · 活着的记录 = "还没用过": 还没发出去, 或者发出去了但没被征调;
+//   · 于是"从 0 起取前 N 条活记录"恰好就是把所有没用过的点排成一队、取前 N 个。
+//   上一轮取了但没被征调的那几个本轮仍在队首, 原样重发, 一条不丢 (这就是"不浪费");
+//   被征调的下轮已变墓碑, 自然被扫过 (这就是"不重发")。所以 3 类既不需要账本, 也不需要
+//   游标 —— 旧版存档里那 109 条"取过但一直没被征调"的留用点也会因此自动回到队里。
 //
-// 于是账本就记两件事: 槽位现在装着谁 (slot_serial_), 以及这位队员的履历
-// (members_: 入池轮号 / 有没有被征调)。**没被征调过的队员无限期留用** —— 既没
-// 浪费库存, 也不必为了"再确认一次"把它换掉。
+// 2 类的游标怎么推进 —— 这是"不记账也不浪费"的关键:
+//   设备端每轮换起点的次数 = dp_reset_count, 而 DpManager::save_dps 读完就把它清零,
+//   reset_start_point 里的 pi 又是从 0 起 atomicAdd, 所以一轮内被消费的池位**集合恰好
+//   是 {0, 1, ..., r-1}** (顺序不定, 但无重复无空洞)。于是下一轮的座标只要推到"本轮
+//   第 r 条取出来的点"那里就行 —— 没被消费的那些下轮原样再取一次; 它们没用过, 重取
+//   不会让轨迹重复, 所以既不浪费库存, 也不会重发。
 //
-// 履历不能直接挂在槽位上 (槽位会被补员, 而"这位点以前干过什么"要一直记得), 所以
-// 槽位通过只增不减的流水号间接指向履历; 流水号 0 是哨兵, 表示"这个槽位没有队员"
-// (也就是随机点占位 —— 1 类不进账本)。
+// 于是 2、3 类的**来源数据一点不浪费**:
+//   · 2 类: 座标推过的每个点都已经真被用掉, 没推到的下轮原样重发, 一条不丢;
+//   · 3 类: 活记录一条不丢 (下轮仍在队里), 跳过的墓碑都是**以前**被征调用掉的。
+// 1 类是唯一"整窗换新"的来源, 但它的来源是随机数, 没有可浪费的库存。
 //
 // 池子大小是 dp_buffer_size, 而 reset_start_point 取用的池位下标不止到 max_size - 1
 // (max_size = dp_buffer_size - 20, 见 cuda.cu 的 edge_pool_size 那段):
 // 池位消费量 (dp_reset_count) 的上界是记录条数, 而记录是**先写入再判 break** 的,
 // 所以下标还会往上走一点 —— 同一批里每线程 W 个 walker 最多各命中一次, 而
-// break_flag 要等各线程轮询到才生效 (轮询间隔 2^18 批), 超出的量都是个位数
-// (期望 ~3 条), 数组比 max_size 多留的 20 项就是给这段的。
-//
-// 库存要够首轮一次性填满 dp_buffer_size 个槽位 (之后每轮只补被征调的): 2 类的 256 条
-// + 无上限阶梯绰绰有余, 3 类看存档有多少。真取不到时走 begin_round 的耗尽处理 ——
-// 那些槽位**永久**回退随机点 (只有 3 类会走到, 2 类的阶梯取不完)。
-//
-// (i) 那条要求是**跨进程**成立的: 游标和账本都是生产状态, 所以每轮落盘一份 (见下面
-// 的"进程级状态落盘"一节)。不落盘就等于每次重启把游标退回起点, 头几批点跟上一次 run
-// 逐字节重复, 顺带把整池还没用上的留用队员丢掉重抽。
+// break_flag 要等各线程轮询到才生效 (轮询间隔 RHO_POLL_BATCHES 批), 超出的量都是个
+// 位数 (期望 ~3 条), 数组比 max_size 多留的 20 项就是给这段的。
 // ===========================================================================
-
-// 流水号 0 = "没有队员"。
-constexpr uint64_t RESERVE_NONE = 0;
 
 // 名字给日志用。cuda.cu 的 validate_test 也要打它, 所以不 static。
 const char* reserve_source_name(ReserveSource s)
@@ -1175,256 +1176,247 @@ static bool reserve_source_by_name(const std::string& s, ReserveSource& out)
     return false;
 }
 
-// 当前用哪一类来源。来源是按槽位存的, 这里只是"全池统一"的开关 —— 要换来源就改
-// 这一行 (不提供运行期切换: 换了之后池子里已有的队员怎么算, 是另一回事)。
+// 当前用哪一类来源。要换来源就改这一行 (不提供运行期切换)。
 //
-// 当前配置 = 1 类 (Random): 每轮整池换新随机点, 不建账本、不碰
-// RhoReserve.txt 的货源游标, 也不载 32 位 DP 库 (cuda.cu 的 rho_play 按这个
-// 来源跳过 dp32_store_init / reserve_retire_consumed, 见那边 EDGE=false 那一支)。
-// 这样生产路与 32 位 DP 库彻底解耦: 库只归起点漫游 (dp32_edge_play) 用。
+// 当前配置 = 1 类 (Random): 每轮整窗换新随机点, 不碰 RhoReserve.txt 的货源游标,
+// 也不载 32 位 DP 库 (cuda.cu 的 rho_play 按这个来源跳过 dp32_store_init, 见那边
+// EDGE=false 那一支)。这样生产路与 32 位 DP 库彻底解耦: 库只归起点漫游用。
 //
-// 换回 3 类 (Dp) 时的前提 (改下面那一行即可, 其余代码不用动): 队员从
-// DpSource32.bin 的源库按槽位游标现取, 库取完 (或库不在盘上) 就整池逐槽回退
-// 随机点。换之前先确认两件事:
-//   1. 源库/已征召库在盘上 (不在就静默回退随机, 见 reserve_load_dp —— 池子照跑,
-//      只是又变回"全随机起点");
-//   2. RhoReserve.txt 里的 "supply Dp <游标>" 还指得准。游标存的是源库**槽位号**,
-//      而源库是离线脚本一次生成的快照 (应用内没有重建入口), 所以重新离线建库之后槽位
-//      会整体挪位, 那时要把这个游标清零。
+// 换回 3 类 (Dp) 时的前提 (改下面那一行即可, 其余代码不用动): 点从 DpSource32.bin
+// 的源库从 0 起扫活记录取, 库取完 (或库不在盘上) 就整窗回退随机点。换之前只需确认
+// 源库/已征召库在盘上 (不在就静默回退随机 —— 池子照跑, 只是又变回"全随机起点")。
+//
+// ⚠ 3 类**没有游标可对**: 状态就是源库的墓碑位图 + 已征召库。重新离线建库之后, 新库
+//   里没有旧墓碑, 于是旧进度就丢了 (那些点会被再发一遍) —— 要么别重建库, 要么重建后
+//   接受这一遍重发 (它不会被立墓碑, 只是白走一趟)。1、2 类与库完全无关, 不受影响。
 static ReserveSource g_reserve_source = ReserveSource::Random;
 
-// 给 cuda.cu 的 validate_test 用: 池子里"该不该有队员"随来源变 (1 类不留履历,
-// 2/3 类每槽都是队员), 那一段自检不能写死成"全随机池"。
+// 给 cuda.cu 的 validate_test 用。
 ReserveSource reserve_configured_source() { return g_reserve_source; }
 
-// 2 类来源的物化库存: 就是步进表 adds_pub[0][*] 那 256 条 (条数由声明数出来)。
-// 阶梯 (k*G) 不进这里 —— 它由供应器按需现算, 见 reserve_supply_default。
+// 2 类序列里物化段的条数 = 步进表 adds_pub[0][*] 那 256 条 (由声明数出来)。
+// 越过物化段就是阶梯 (k*G), 不物化也不预生成, 由座标现算。
 constexpr size_t RHO_RESERVE_STEPS = sizeof(adds_pub[0]) / sizeof(adds_pub[0][0]);
-// 3 类来源的库存: 32 位 DP 的**源库** (DpSource32.bin, 格式见 common.h)。库存不物化
-// 进内存 —— 按槽位游标在库里现取, 见 reserve_load_dp / reserve_take。
 
-// 预备队的**进程级状态**落盘路径 (货源游标 + 账本, 格式见下面的存档一节)。
+// 预备队的**进程级状态**落盘路径 (只有游标 + 轮号, 格式见下面的存档一节)。
 // 只有生产路径 (rho_play) 读写它, validate 一律不碰。
 static const std::string RHO_RESERVE_STATE_FILE = data_file("RhoReserve.txt");
 
-// 一位预备队员的履历。只有 source != Random 才建 (1 类不需要账本)。
-struct ReserveMember {
-    size_t        slot = 0;            // 入池时占的槽位
-    ReserveSource source = ReserveSource::Random;
-    RhoPoint      point;               // 入池的点 (x 与 m/n 自洽)
-    uint64_t      placed_round = 0;    // 第几轮入池 (轮号从 1 起)
-    bool          drafted = false;     // 有没有被征调过
-    uint64_t      drafted_round = 0;
+// 只需要一个跨进程游标: 2 类序列 (address 表 + 阶梯) 的"已经发出去多少条"。
+// 3 类**不需要游标** —— 源库的墓碑位图本身就是账本 (见 reserve_pull 的注释)。
+//   取值越大表示 2 类序列走得越远 (物化段与阶梯共用同一座标)。
+struct ReserveCursors {
+    uint64_t special = 0;
 };
+static ReserveCursors g_cursors;
 
-// 供应器: 按需给池子供点。取不到 (库存耗尽 / 点不自洽) 返回 false, 池子回退随机点。
-// 做成函数指针是为了 validate 能塞一个合成供应器, 把状态转移直接逼出来。
-using ReserveSupplyFn = bool (*)(ReserveSource src, RhoPoint& out);
+// 槽位没有对应的源库记录 (1、2 类 / 3 类回退的随机点)。
+constexpr uint32_t RESERVE_NO_SLOT = 0xFFFFFFFFu;
 
-// 库存。游标只增不减: 用过的点不再回收 (见上面第 (i) 条理由)。只存 (m, n) 标量对
-// —— x 等到真正入池时再算 (create), 免得为一条只用一次的点提前付标量乘法的代价。
-//
-// 三种形态共用**同一个游标**, 不另存"阶梯走到第几级""取到库里第几条"这类状态:
-//   from_lib == true       源库段 (3 类): 库存不物化, 游标就是 32 位 DP 源库的**槽位
-//                          号**, 每次现查下一条活记录 (墓碑跳过)。
-//   cursor <  list.size()  物化段: 事先备好的有限清单 (2 类 = adds_pub 那 256 条),
-//                          直接按游标取。
-//   cursor >= list.size()  阶梯段: 只有 ladder == true 的供应器有 (2 类)。**不物化**
-//                          而是现算, 级数 k = cursor - list.size() + 1 直接由游标推出来
-//                          —— 于是阶梯没有上限, 2 类来源不存在"用完"这回事。
-//   ladder == false        取完物化段就真没有了, 池子回退随机点。
-struct ReserveSupply {
-    std::vector<SecPair> list;
-    size_t   cursor = 0;        // 已取条数 (源库段: 源库槽位号); 越过 list.size() 就进阶梯
-    bool     ladder = false;    // 物化段取完之后是否接无限阶梯
-    bool     from_lib = false;  // 3 类: 库存不在内存里, 直接查 32 位 DP 源库
-    bool     tried = false;
+// 本轮这一窗点。只有 3 类需要 slot_of (轮末销账要知道"第 r 条取自源库哪个槽位");
+// 1、2 类的座标直接由游标算得出来, 不必另记。
+struct ReserveWindow {
+    std::vector<RhoPoint> points;                // 槽位 -> 点
+    std::vector<uint32_t> slot_of;               // 槽位 -> 源库槽位 (非 3 类恒 RESERVE_NO_SLOT)
+    ReserveSource         source = ReserveSource::Random;
 };
-
-static ReserveSupply g_supply_special;
-static ReserveSupply g_supply_dp;
+static ReserveWindow g_window;
+// 池子槽位数 (0 = 没建池)。轮号跨轮存活, 只为日志连续。
+static size_t   g_slots = 0;
+static uint64_t g_round = 0;
 // 是否读写状态存档 = 是不是生产路径 (只有 rho_play 打开; validate 一律不碰盘)。
 // 另外: 来源配成 Random 时即使传 persistent = true 也一律关掉 (见 init_reserve_pool) ——
-// 这个池子没有队员、没有货源游标, 存档里那两项对它全是空的, 读写只是在糟鸥别人的进度。
+// 这个池子没有货源游标, 存档里那一项对它没意义, 读写只是在糟鸥别人的进度。
 static bool g_reserve_persistent = false;
 
-// 十六进制 -> 字节。本翻译单元不引 util/strencodings.h (那是 bitcoin 的头, 与这里
-// 的 secp256k1 内部头部混在一起容易打架), 所以自带一个只认定长十六进制的小解析器。
-static bool reserve_hex_to_bytes(const std::string& s, unsigned char* out, size_t n)
+// (m, n) -> 点: 现算 x 并自检。全零的 (m, n) 算出来是个非法点, 而 check() 比的是
+// "照 m/n 重算出来的那个 x" —— 自己验自己, 这种情况看不出来, 所以先挡一道。
+static bool reserve_point_from_mn(const unsigned char* m, const unsigned char* n, RhoPoint& out)
 {
-    if (s.size() != n * 2) return false;
-    const auto nib = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    for (size_t i = 0; i < n; ++i) {
-        const int hi = nib(s[2 * i]);
-        const int lo = nib(s[2 * i + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = (unsigned char)((hi << 4) | lo);
-    }
-    return true;
-}
-
-// 反过来: n 字节 -> 2n 字符小写 hex + 结尾 NUL (写状态存档用)。
-static void reserve_hex_from_bytes(const unsigned char* src, size_t n, char* dst)
-{
-    static const char D[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; ++i) {
-        *dst++ = D[src[i] >> 4];
-        *dst++ = D[src[i] & 0x0F];
-    }
-    *dst = '\0';
-}
-
-// 2 类库存: 只物化步进表那 256 条, 阶梯交给取点函数现算 (见 reserve_take)。
-// 注意这里只搬标量, 不现算 x —— 真入池时由 reserve_take 算。
-// 按参数装货: validate 用独立实例装一遍做自检, 免得动到生产那份的游标。
-// 全局那份只在启动时调一次 (tried 守卫): 重调等于把同一批点又搬一遍。
-// **不动 cursor**: 游标是跨进程的生产状态, 由存档回读 (见存档一节), 装货时清零就
-// 等于每重启一次把库存头一段重发一遍。
-static void reserve_load_special(ReserveSupply& sup)
-{
-    sup.list.clear();
-    sup.list.reserve(RHO_RESERVE_STEPS);
-    for (size_t i = 0; i < RHO_RESERVE_STEPS; ++i) {
-        // adds_pub[0][i] 的 (x, m, n) 三者自洽 (blockchain.cpp 装载时验过), 所以
-        // 一条就是一个可以直接入池的队员。
-        SecPair sp;
-        memcpy(sp.m, adds_pub[0][i].m, sizeof(sp.m));
-        memcpy(sp.n, adds_pub[0][i].n, sizeof(sp.n));
-        sup.list.push_back(sp);
-    }
-    sup.ladder = true;   // 物化段吃完接阶梯 (k 由游标现算)
-    sup.tried = true;
-    std::cout << get_time() << " : reserve supply Special loaded: " << sup.list.size()
-              << " points (adds_pub) + ladder 1G, 2G, 3G, ... on demand (cursor "
-              << sup.cursor << ")" << std::endl;
-}
-
-// 3 类库存: 32 位 DP 的源库 (DpSource32.bin, 由离线脚本从 data 目录下的
-// DistinguishablePoints*.txt 语料合并而来 —— 应用内没有重建入口)。**不物化**: 取点时
-// 按槽位游标在库里往前找下一条活记录 (墓碑由 src_next 跳过), 所以磁盘上那 88.7 万条就是
-// 库存本身, 而且被征召销账立了墓碑的点自然不会再发出去。
-//
-// 与 2 类同一约定: 按参数装货, 全局那份只在启动时调一次 (tried 守卫); 不动 cursor ——
-// 游标是**生产状态** (这里是源库槽位号), 由存档一节按同一字段存盘。槽位只增不减、
-// 墓碑不移位, 所以同一个游标跨进程总指同一条记录。
-// 前提: 源库在两次 run 之间没被重建过 (重建会移动槽位; 那之后游标至多指偏 —— 不崩,
-// 只是可能重复发出几条已经用过的点)。
-static void reserve_load_dp(ReserveSupply& sup)
-{
-    sup.list.clear();
-    sup.ladder = false;    // 3 类没有阶梯: 源库取完就真没了
-    sup.from_lib = true;   // 库里现取 (见 reserve_take)
-    sup.tried = true;
-    // 载入是幂等的: 第一个来取货的地方载入, 载入结果印在控制台上 (见 dp32_store_init)。
-    if (!dp32_store_init()) {
-        cprint() << get_time() << " : reserve supply Dp: 32 位源库不可用 ("
-                 << data_file(DP32_SOURCE_NAME) << "), 该类回退随机点" << std::endl;
-        return;
-    }
-    const Dp32Store& lib = dp32_store();
-    cprint() << get_time() << " : reserve supply Dp: 源库 " << lib.src_count() << " 条 (墓碑 "
-             << lib.src_dead_count() << "), 按槽位游标取 (cursor " << sup.cursor << ")"
-             << std::endl;
-}
-
-// 从一份库存里取下一个没用过的 (m, n) 并现算 x。两段都由**同一个游标**推进:
-// 物化段按游标取, 越过 list.size() 之后按 ladder 现算阶梯的第 k = cursor - size + 1 级。
-static bool reserve_take(ReserveSupply& sup, RhoPoint& out)
-{
-    SecPair sp;                    // SecPair 自带 {0} 初值, 阶梯段的 n 天然是 0
-    if (sup.from_lib) {
-        // 3 类: 源库按槽位取。游标就是槽位号, 只增不减; 墓碑由 src_next 跳过。
-        // 库没载入 (文件缺失/损坏) 一律当作"库存为空" -> 池子回退随机点。
-        if (sup.cursor > 0xFFFFFFFFULL) return false;   // 存档被改坏了: 别截断成另一个槽位
-        const Dp32Store& lib = dp32_store();
-        if (!lib.loaded()) return false;
-        Dp32Record rec;
-        uint32_t slot = (uint32_t)sup.cursor;
-        if (!lib.src_next(slot, rec)) return false;     // 源库取完了
-        sup.cursor = slot;                              // 推到该槽位之后
-        memcpy(sp.m, rec.m, sizeof(sp.m));
-        memcpy(sp.n, rec.n, sizeof(sp.n));
-    } else if (sup.cursor < sup.list.size()) {
-        sp = sup.list[sup.cursor++];
-    } else if (sup.ladder) {
-        // 阶梯: k = 1, 2, 3, ... 现算 k*G (create(m, n) = m*G + n*MVP, 取 n = 0)。
-        // k 不另存, 直接由游标推出来; 游标只增不减, 所以每一级都是新点 (第 (i) 条),
-        // 也没有上限。
-        const uint64_t k = (uint64_t)(sup.cursor - sup.list.size()) + 1;
-        set_int(sp.m, (int64_t)k);
-        ++sup.cursor;
-    } else {
-        return false;   // 物化段取完又没有阶梯 = 真没有了, 池子回退随机点
-    }
-    // 全零的 (m, n) 会算出一个非法的 x, 而 check() 比的是"自己算出来的那个", 这种
-    // 情况它看不出来, 所以这里先挡一道。
     static const unsigned char zeros[32] = {0};
-    if (memcmp(sp.m, zeros, 32) == 0 && memcmp(sp.n, zeros, 32) == 0) return false;
-
-    memcpy(out.m, sp.m, sizeof(out.m));
-    memcpy(out.n, sp.n, sizeof(out.n));
+    if (memcmp(m, zeros, 32) == 0 && memcmp(n, zeros, 32) == 0) return false;
+    memcpy(out.m, m, sizeof(out.m));
+    memcpy(out.n, n, sizeof(out.n));
     create(ctx, &out.x, out.m, out.n);
+    return check(ctx, &out.x, out.m, out.n) == 1;
+}
+
+// 2 类序列的第 pos 条 (pos 从 0 起):
+//   pos < 256   物化段: 步进表 adds_pub[0][pos] (它的 x/m/n 三者自洽, 装载时验过)
+//   pos >= 256  阶梯第 k = pos - 255 级, 即 k*G (create(m = k, n = 0), 大端)
+// 阶梯由 pos 现算, 不另存"走到第几级", 也没有上限 —— 所以 2 类取不完。
+static bool special_point(uint64_t pos, RhoPoint& out)
+{
+    if (pos < RHO_RESERVE_STEPS) {
+        return reserve_point_from_mn(adds_pub[0][pos].m, adds_pub[0][pos].n, out);
+    }
+    const uint64_t k = pos - RHO_RESERVE_STEPS + 1;
+    if (k > 0x7FFFFFFFFFFFFFFFULL) return false;   // 存档被改坏了, 别让 set_int 截断
+    unsigned char m[32] = {0};
+    unsigned char n[32] = {0};
+    set_int(m, (int64_t)k);
+    return reserve_point_from_mn(m, n, out);
+}
+
+// 3 类: 从源库槽位 *scan 起往后找下一条活记录 (墓碑跳过), 找到就把 *scan 推到它之后。
+// **库见底 / 库没载入**才返回 false (该槽位本轮回退随机点)。
+//
+// 单条记录读不出来或算不出点属于"这条永远用不了" (载库时已经对过'条数 == 文件长度',
+// 所以只会是坏盘/坏记录): 当墓碑跳过并印一行, 不返回 false —— 否则一个坏槽位会让它
+// 之后的整窗都退化成随机点, 那才是真的把后面的来源数据浪费掉。
+static bool dp_point(uint64_t& scan, RhoPoint& out, uint32_t* got_slot)
+{
+    const Dp32Store& lib = dp32_store();
+    if (!lib.loaded()) return false;
+    while (scan < lib.src_count()) {
+        const uint32_t slot = (uint32_t)scan;
+        ++scan;
+        if (lib.src_dead(slot)) continue;                      // 墓碑: 这个点已经用掉了
+        Dp32Record rec;
+        if (!lib.read(Dp32File::Source, slot, rec)) {
+            cprint() << get_time() << " : reserve: 源库槽位 " << slot
+                     << " 读不出来, 跳过 (当墓碑)" << std::endl;
+            continue;
+        }
+        if (!reserve_point_from_mn(rec.m, rec.n, out)) {
+            cprint() << get_time() << " : reserve: 源库槽位 " << slot
+                     << " 的 (m, n) 算不出合法点, 跳过 (当墓碑)" << std::endl;
+            continue;
+        }
+        if (got_slot != nullptr) *got_slot = slot;
+        return true;
+    }
+    return false;
+}
+
+// 启动对账: "已征召库里有的点, 源库里必须已经是墓碑"。
+//
+// 为什么需要: 销账 retire_dp_slot 是**两步写** —— 先在已征召库追加这条记录, 再在源库里
+// 立墓碑 (顺序不能反: 只有追加成功才敢抹掉源库, 否则这个点会从两个库里凭空消失)。
+// 两步之间若断电/被杀, 盘上就是"已征召库有这条, 源库仍是活的", 于是下一轮从 0 扫时
+// 这个点会被**再发一遍** —— 走出完全相同的轨迹、产出逐字节重复的 DP 记录, 白烧算力。
+//
+// 对账只按索引比 (已征召库里每条记录的 index 回源库查槽位), 与游标无关, 天然幂等:
+// 已经是墓碑的直接跳过。条数只有几千 (已征召库 240 KB / 72 B ≈ 3334 条), 启动跑一次,
+// 代价可忽略。
+static void reserve_reconcile_drafted()
+{
+    Dp32Store& lib = dp32_store();
+    if (!lib.loaded()) return;
+    const uint64_t n = lib.drf_count();
+    if (n == 0) return;
+
+    uint64_t fixed = 0;
+    for (uint64_t s = 0; s < n; ++s) {
+        Dp32Record rec;
+        if (!lib.read(Dp32File::Drafted, (uint32_t)s, rec)) continue;
+        if (dp32_is_tombstone(rec)) continue;       // 已征召库理论上没有墓碑, 防手改
+        uint32_t slot = 0;
+        // 源库里已经是墓碑 (正常情况) / 不在源库 (无从销账) 都跳过
+        if (lib.src_find(rec.index, slot) != Dp32Hit::Live) continue;
+        if (lib.src_tombstone(slot)) ++fixed;
+    }
+    if (fixed != 0) {
+        std::cout << get_time() << " : reserve: 启动对账补立 " << fixed
+                  << " 个源库墓碑 (已征召库里有、源库还是活的: 上次在两步写之间被打断)"
+                  << std::endl;
+        ilog_line("Dp32 启动对账: 补立 " + std::to_string(fixed) +
+                  " 个源库墓碑 (已征召库有记录、源库仍活的; 源库墓碑 " +
+                  std::to_string(lib.src_dead_count()) + " 条 / 已征召库 " +
+                  std::to_string(lib.drf_count()) + " 条)");
+    }
+}
+
+// 3 类的库载入**只尝试一次**: 库不在盘上就是不在, 每轮重试只会把同一行字反复印到
+// 控制台并重复扫一遍 64 MB 库的索引。载入成功之后 dp32_store_init 本身是幂等的
+// (loaded() 直接返回 true), 所以这里只需把"失败"这个结论记住。
+//
+// 载入成功之后顺手跑一次启动对账 (只在生产路径: 自测一律不碰那两个 .bin)。
+static bool reserve_dp_lib_ready()
+{
+    static bool tried = false;
+    static bool ok = false;
+    if (tried) return ok;
+    tried = true;
+    ok = dp32_store_init();
+    if (!ok) {
+        cprint() << get_time() << " : reserve: 32 位源库不可用 ("
+                 << data_file(DP32_SOURCE_NAME) << "), 3 类回退随机点" << std::endl;
+        return false;
+    }
+    if (g_reserve_persistent) reserve_reconcile_drafted();
     return true;
 }
 
-// 阶梯段下一级的 k (不在阶梯段则为 0)。这就是"由游标现算"那条规则本身, 抽出来
-// 只给日志和自检读。
-static uint64_t reserve_next_ladder_k(const ReserveSupply& sup)
+// 从来源现取一窗点填进 g_window。
+//
+//   1 类 Random  整窗新随机点, 不看任何状态。
+//   2 类 Special 从游标 g_cursors.special 按序取, 取不到的槽位回退随机点。
+//   3 类 Dp      **每轮都从源库槽位 0 开始扫**, 墓碑跳过, 取前 g_slots 条活记录。
+//
+// 3 类为什么从 0 扫而不延续上轮的扫描位置 —— 这就是"不建账本也不浪费"的全部奥妙:
+//   · 被征调用掉的点**当场立墓碑** (见 retire_dp_slot), 所以墓碑 = "这个点用过了";
+//   · 活着的记录 = "还没用过": 还没发出去, 或者发出去了但没被征调;
+//   · 于是"从 0 起取前 N 条活记录"恰好就是"把还没用过的点全部排成一队, 取前 N 个"。
+//   上一轮取了但没被征调的那几个活记录, 本轮仍然排在队首 —— **原样重发, 一条不丢**;
+//   这一轮被征调的当场变墓碑, 下一轮自然被扫过。历史上那 109 条 "取过但一直没被
+//   征调" 的留用点也因此自动回到队里 (旧版靠账本留用它们, 账本没了靠墓碑反过来认)。
+//   代价是每轮要从头走一遍墓碑前缀 —— 那个前缀只含位图读取 (src_dead 是纯内存),
+//   而墓碑总是集中在库首 (我们一直从最低的活槽开始取), 所以是一小段顺序位图扫描。
+static void reserve_pull()
 {
-    if (!sup.ladder || sup.cursor < sup.list.size()) return 0;
-    return (uint64_t)(sup.cursor - sup.list.size()) + 1;
+    ReserveWindow& w = g_window;
+    w.points.assign(g_slots, RhoPoint());
+    w.slot_of.assign(g_slots, RESERVE_NO_SLOT);
+    w.source = g_reserve_source;
+
+    if (w.source == ReserveSource::Dp) {
+        // 3 类的库存是盘上的源库: 载不进来就整窗回退随机点 (池子照跑, 不崩)。
+        (void)reserve_dp_lib_ready();
+    }
+
+    uint64_t scan = 0;                     // 3 类: 本轮的扫描位置 (每轮从 0 起)
+    for (size_t i = 0; i < g_slots; ++i) {
+        bool ok = false;
+        if (w.source == ReserveSource::Special) {
+            ok = special_point(g_cursors.special + i, w.points[i]);
+        } else if (w.source == ReserveSource::Dp) {
+            uint32_t slot = RESERVE_NO_SLOT;
+            ok = dp_point(scan, w.points[i], &slot);
+            if (ok) w.slot_of[i] = slot;
+        }
+        if (!ok) w.points[i].rand();
+    }
 }
 
-// 默认供应器: 从对应库存里取下一个点 (首次调用时懒装货)。
-static bool reserve_supply_default(ReserveSource src, RhoPoint& out)
-{
-    if (src == ReserveSource::Special) {
-        if (!g_supply_special.tried) reserve_load_special(g_supply_special);
-        return reserve_take(g_supply_special, out);
-    }
-    if (src == ReserveSource::Dp) {
-        if (!g_supply_dp.tried) reserve_load_dp(g_supply_dp);
-        return reserve_take(g_supply_dp, out);
-    }
-    return false;   // 随机点不走供应器
-}
-
-// 被征召的 3 类队员销账: 这个点已经用掉了 —— 源库里那条立墓碑 + 追加进已征召库。
+// 被征召的 3 类点销账: 这个点已经用掉了 —— 源库里那条立墓碑 + 追加进已征召库。
 //
 // 两个库记的是**同一批点**: 源库里被立墓碑的那条, 就是已征召库里追加的那条。所以
 // 必须一起做 —— 只立墓碑会让这个点从两个库里凭空消失, 只追加会让源库把用过的点再
 // 发给下一个 walker。顺序: 先追加, 后立墓碑 (中间崩了记录还在, 能补)。
 //
-// 判等用队员自己的 x 复算出来的 32 位索引 (源库按索引唯一), 不认别的字段。
-// 单线程前提: 只在轮边界调 (note_reserve_dps -> note_drafted), 与 rho_play
-// 里其他读写这两个库的代码同线程 (已征召库的桶没有加锁, 见 common.h)。
+// 判等**用源库槽位号**, 不再拿点的 x 复算 32 位索引去反查: 池子里的点就是从这条槽位
+// 取出来的, 一一对应 (slot_of[] 记着), 比反查可靠也便宜。
+// 单线程前提: 只在轮边界调 (note_reserve_dps), 与 rho_play 里其他读写这两个库的代码
+// 同线程 (已征召库的桶没有加锁, 见 common.h)。
 // who: 销账的是谁 (写生产日志用 —— 两个库的条数变了, 得能回溯是哪个槽位的事)。
 enum class RetireResult {
     Done,        // 立了墓碑 + 追加了已征召库
     DryRun,      // 非持久模式 (自测): 绝不碰生产那两个 .bin
-    NoLib,       // 库没载入: 降级模式, 槽位本来就回退随机点
-    NotDp32,     // 这个点本身不满足 32 位条件: 不可能是源库里的东西 (2 类 / 随机点)
-    Absent,      // 源库里没有这个索引
+    NoLib,       // 库没载入: 降级模式, 这些槽位本来就回退随机点
     AlreadyDead, // 库里那条已经是墓碑: 这笔账早销过了 (幂等命中, 正常)
     ReadFail,    // 读不出源库那条记录
     WriteFail,   // 已征召库追加不上, 什么都没改
 };
 
 // 日志里"这一笔账"的说法。Done 之外的都带上原因 —— 只印一句"没销账"看不出是幂等
-// 命中 (正常) 还是"这个点根本不在源库里" (说明取点那条路出了问题)。
+// 命中 (正常) 还是真出了问题。
 static const char* retire_result_note(RetireResult r)
 {
     switch (r) {
     case RetireResult::Done:        return " [源库立墓碑 + 已征召库追加]";
     case RetireResult::DryRun:      return " [自测模式, 不碰两个库]";
     case RetireResult::NoLib:       return " [源库未载入, 不销账]";
-    case RetireResult::NotDp32:     return " [不是 32 位点, 不销账]";
-    case RetireResult::Absent:      return " [源库里没有这个点, 不销账]";
     case RetireResult::AlreadyDead: return " [源库里那条已是墓碑, 早销过账]";
     case RetireResult::ReadFail:    return " [源库那条读不出来, 不销账]";
     case RetireResult::WriteFail:   return " [已征召库写盘失败, 不销账]";
@@ -1432,20 +1424,15 @@ static const char* retire_result_note(RetireResult r)
     return "";
 }
 
-static RetireResult retire_dp_member(const RhoPoint& p, const std::string& who)
+static RetireResult retire_dp_slot(uint32_t slot, const std::string& who)
 {
     if (!g_reserve_persistent) return RetireResult::DryRun;   // 自测一律不动真库
     Dp32Store& lib = dp32_store();
     if (!lib.loaded()) return RetireResult::NoLib;
-    uint64_t idx32 = 0;
-    if (!dp32_test(p.x, idx32)) return RetireResult::NotDp32;     // 复算不上 32 位点
-    uint32_t slot = 0;
-    const Dp32Hit hit = lib.src_find(idx32, slot);
-    if (hit == Dp32Hit::Absent) return RetireResult::Absent;
-    if (hit == Dp32Hit::Tombstone) return RetireResult::AlreadyDead;
+    if (lib.src_dead(slot)) return RetireResult::AlreadyDead;
     Dp32Record rec;
     if (!lib.read(Dp32File::Source, slot, rec)) return RetireResult::ReadFail;
-    if (!lib.drf_append(idx32, rec.m, rec.n)) return RetireResult::WriteFail;
+    if (!lib.drf_append(rec.index, rec.m, rec.n)) return RetireResult::WriteFail;
     lib.src_tombstone(slot);                                  // 先追加后立墓碑
     ilog_line("Dp32 征召销账: " + who + " -> 源库槽位 " + std::to_string(slot) +
               " 立墓碑 + 已征召库追加 (源库墓碑 " + std::to_string(lib.src_dead_count()) +
@@ -1453,184 +1440,29 @@ static RetireResult retire_dp_member(const RhoPoint& p, const std::string& who)
     return RetireResult::Done;
 }
 
-// 落盘的那两样"货源游标" (= ReserveSupply::cursor 本身, 与装没装货无关)。
-struct ReserveCursors {
-    uint64_t special = 0;
-    uint64_t dp = 0;
-};
-
-// 预备队账本。只跑在主机侧, 设备端看不见它 —— 设备端只需要 RhoStates_reserve
-// 这份常量内存, 以及"DP 记录的下标就是被征调的槽位"这条对应关系。
-class ReservePool
-{
-public:
-    ReservePool(size_t slots, ReserveSource src = ReserveSource::Random,
-                ReserveSupplyFn fn = reserve_supply_default)
-        : slot_source_(slots, src),
-          slot_serial_(slots, RESERVE_NONE),
-          slot_point_(slots),
-          members_(1),                          // 0 号是哨兵, 不指向任何队员
-          supply_(fn)
-    {
-    }
-
-    // 每轮开跑前调用一次: 决定各槽位这一轮放什么点 (纯主机侧, 不碰设备内存)。
-    void begin_round()
-    {
-        ++round_;
-        for (size_t i = 0; i < slot_source_.size(); ++i) {
-            const ReserveSource src = slot_source_[i];
-            const uint64_t serial = slot_serial_[i];
-            const bool have = (serial != RESERVE_NONE);
-
-            // 这个槽位要不要换点:
-            //   Random      -> 每轮都换 (老行为: 110 个槽位每轮全是新随机点)
-            //   Special/Dp  -> 只在"还没有队员"或"队员已被征调"时换。没被征调过的点
-            //                  继续留用 (无限期), 既没浪费库存, 也不必凭空多一条履历。
-            if (src != ReserveSource::Random && have && !members_[serial].drafted) continue;
-
-            if (have && members_[serial].drafted) {
-                std::cout << get_time() << " : reserve: slot " << i << " replenished (member #"
-                          << serial << " retired, drafted in round "
-                          << members_[serial].drafted_round << ")" << std::endl;
-            }
-
-            RhoPoint p;
-            if (src == ReserveSource::Random) {
-                p.rand();
-                place(i, ReserveSource::Random, p);
-                continue;
-            }
-
-            // 2、3 类: 先跟供应器要, 要不到就**永久**回退成随机点。永久而不是每轮
-            // 重试, 是因为库存游标只增不减 —— 重试不会有新结果, 只会每轮刷同一行日志。
-            if (supply_(src, p) && check(ctx, &p.x, p.m, p.n) == 1) {
-                place(i, src, p);
-            } else {
-                std::cout << get_time() << " : reserve: no more " << reserve_source_name(src)
-                          << " supply for slot " << i << ", falls back to random" << std::endl;
-                slot_source_[i] = ReserveSource::Random;
-                p.rand();
-                place(i, ReserveSource::Random, p);
-            }
-        }
-    }
-
-    size_t               size() const { return slot_point_.size(); }
-    const RhoPoint&      point(size_t i) const { return slot_point_[i]; }
-    ReserveSource        source_of(size_t i) const { return slot_source_[i]; }
-    uint64_t             serial_of(size_t i) const { return slot_serial_[i]; }
-    uint64_t             round() const { return round_; }
-    const ReserveMember& member(uint64_t serial) const { return members_[serial]; }
-    size_t               member_count() const { return members_.size(); }
-
-    // ---- 只有回读状态存档时才用 (见存档一节) ----
-    void set_round(uint64_t r) { round_ = r; }
-    void set_slot_source(size_t i, ReserveSource src) { slot_source_[i] = src; }
-    // 把一位"留用队员"放回槽位 i, 并补一条履历。点是存档里读回来的 (m, n), x 由
-    // 调用方现算并验过, 所以这里只认账。
-    void restore_member(size_t i, ReserveSource src, const RhoPoint& p, uint64_t placed_round)
-    {
-        slot_source_[i] = src;
-        slot_point_[i] = p;
-        members_.push_back(ReserveMember());
-        ReserveMember& m = members_.back();
-        m.slot = i;
-        m.source = src;
-        m.point = p;
-        m.placed_round = placed_round;
-        slot_serial_[i] = (uint64_t)(members_.size() - 1);
-    }
-
-    // 记账: 记录下标 j 就是被征调的槽位。随机点占位的槽位没有队员, 直接跳过;
-    // 已经登记过的队员不重复记 (同一轮同一槽位只会被征调一次, 但这里不依赖它)。
-    void note_drafted(size_t j)
-    {
-        const uint64_t serial = slot_serial_[j];
-        if (serial == RESERVE_NONE) return;
-        ReserveMember& m = members_[serial];
-        if (m.drafted) return;
-        m.drafted = true;
-        m.drafted_round = round_;
-        // 3 类队员的点是从源库取出来的: "被征召" = 这个点用掉了, 所以源库那条立墓碑 +
-        // 追加进已征召库 (两个库记同一批点, 见 retire_dp_member)。2 类的货源是 adds_pub
-        // 那 256 条, 库里没有它们的记录, 不销账。
-        const char* acct = "";
-        if (m.source == ReserveSource::Dp) {
-            const std::string who = "预备队员 #" + std::to_string(serial) + " (槽位 " +
-                                    std::to_string(j) + ") 被征召";
-            acct = retire_result_note(retire_dp_member(m.point, who));
-        }
-        std::cout << get_time() << " : reserve: member #" << serial
-                  << " (slot " << j << ", " << reserve_source_name(m.source)
-                  << ") drafted in round " << round_ << acct << std::endl;
-    }
-
-private:
-    // 把点放进槽位 i。src == Random 时不留履历 (1 类不需要账本)。
-    void place(size_t i, ReserveSource src, const RhoPoint& p)
-    {
-        slot_point_[i] = p;
-        if (src == ReserveSource::Random) {
-            slot_serial_[i] = RESERVE_NONE;
-            return;
-        }
-        members_.push_back(ReserveMember());
-        ReserveMember& m = members_.back();
-        m.slot = i;
-        m.source = src;
-        m.point = p;
-        m.placed_round = round_;
-        slot_serial_[i] = (uint64_t)(members_.size() - 1);
-    }
-
-    std::vector<ReserveSource> slot_source_;   // 槽位 -> 配的来源 (耗尽后会被改成 Random)
-    std::vector<uint64_t>      slot_serial_;   // 槽位 -> 当前队员流水号 (0 = 无队员)
-    std::vector<RhoPoint>      slot_point_;    // 槽位 -> 待上传的点
-    std::vector<ReserveMember> members_;       // 流水号 -> 履历 (0 号哨兵)
-    ReserveSupplyFn            supply_;
-    uint64_t                   round_ = 0;
-};
-
-// 生产用的账本。建一次, 之后一直复用 —— 轮号与履历都必须跨轮存活。槽位数 = 设备
-// DP 缓冲区的槽位数, 由 rho_play 传进来 (dp_buffer_size 定义在 cuda.cu 里)。
-static ReservePool* g_reserve_pool = nullptr;
-// g_reserve_persistent 定义在上面货源一节 (自测要不要写生产日志也看它)。
-
 // ============================ 进程级状态落盘 ============================
 //
-// 为什么必须落盘: "点用过即退役"完全靠库存游标保证 (第 (i) 条), 而游标原本只在内存里
-// —— 进程一重启就归零, 头几批点跟上一次 run **逐字节重复**。重复的危害不是多算了几条
-// ——两者算出来的 x 完全相同, 于是 DP 记录里 m/n 也完全相同, 而碰撞要的是"同一个 x
-// 配不同的 (m, n)", 这种记录一条都排不上用场, 纯属白烧算力。留用队员同理: 不落盘就
-// 等于每次重启都把整池还没用上的点丢掉重抽。
+// 为什么必须落盘: 2 类序列的座标 ("已经发出去多少条") 只在内存里, 进程一重启就归零,
+// 头几段点跟上一次 run **逐字节重复**。重复的危害不是多算了几条 —— 两者算出来的 x
+// 完全相同, 于是 DP 记录里 m/n 也完全相同, 而碰撞要的是"同一个 x 配不同的 (m, n)",
+// 这种记录一条都排不上用场, 纯属白烧算力。
+//
+// 3 类**不需要这个存档**: 它的状态就是源库的墓碑位图 + 已征召库, 两者每轮已经落盘。
+// 1 类也不需要 (随机点没有"进度"可丢)。
 //
 // 存档 (纯文本, RhoReserve.txt, 每轮 rho_play 落一次):
-//     RhoReserve 1                                     版本号, 不认就整份丢掉
-//     round <n>                                        当前轮号 (日志轮号跨进程连续)
-//     supply <来源名> <游标>                            货源游标 = 已经发出去的条数
-//     slots <n>                                        槽位数 (跟 dp_buffer_size 不符就丢)
-//     slot <i> <来源> empty                            空槽 (队外随机 / 待补员 / 已退役)
-//     slot <i> <来源> held <入池轮号> <m-hex> <n-hex>    留用队员 (m/n 各 64 字符 hex)
+//     RhoReserve 3                        版本号, 不认就整份丢掉
+//     round <n>                           当前轮号 (日志轮号跨进程连续)
+//     supply Special <n>                  2 类序列已经发出去的条数
+//     slots <n>                           槽位数 (只做告警: 与 dp_buffer_size 不符时提示)
 //
-// 只存"还没被征调过"的队员: 被征调过的槽位下一轮 begin_round 一定会换新点, 存了也用
-// 不上。x 不存, 回读时由 (m, n) 用 create() 现算, 顺带立刻 check() 一遍 —— 存档小一半,
-// 还把"标量 -> 点"的口径验了一次。
-//
-// 游标存的是 ReserveSupply::cursor 本身, 与供应器装没装货无关 (装货不动游标), 所以
-// 换来源跑一轮再换回来, 进度也不会丢。
-
-// 当前该落盘的游标。
-static void reserve_cursors(ReserveCursors& out)
-{
-    out.special = g_supply_special.cursor;
-    out.dp = g_supply_dp.cursor;
-}
-
-// 落盘。先写临时文件再 rename —— 存档自己若被写到一半打断就报废, 那它防的"意外关机"
-// 就白防了。Windows 上 rename 不覆盖已存在的目标, 所以先撞一次, 撞不动再删一次重试。
-static bool reserve_state_write(const ReservePool& pool, const ReserveCursors& cur,
-                                const std::string& path)
+// 向后兼容: 读侧接受 1、2、3 三个版本。旧版还会写
+//     supply Dp <游标>                     (2/3 版) —— 已无意义, 读到就忽略
+//     slot <i> <来源> empty|held ...       (1 版)   —— 账本行, 读到就跳过
+// 所以已经跑了一段时间的来源 3 的进度**不需要靠游标继承** —— 墓碑位图本身就是进度,
+// 而从 0 起扫活记录的取点法会自然把旧版那些 "取过但没被征调" 的留用点重新排回队里。
+static bool reserve_state_write(const std::string& path, const ReserveCursors& cur,
+                                uint64_t round, size_t slots)
 {
     const std::string tmp = path + ".tmp";
     {
@@ -1639,43 +1471,70 @@ static bool reserve_state_write(const ReservePool& pool, const ReserveCursors& c
             std::cout << get_time() << " : reserve state: cannot write " << tmp << std::endl;
             return false;
         }
-        out << "RhoReserve 1\n";
-        out << "round " << pool.round() << '\n';
+        out << "RhoReserve 3\n";
+        out << "round " << round << '\n';
         out << "supply Special " << cur.special << '\n';
-        out << "supply Dp " << cur.dp << '\n';
-        out << "slots " << pool.size() << '\n';
-        for (size_t i = 0; i < pool.size(); ++i) {
-            const uint64_t serial = pool.serial_of(i);
-            out << "slot " << i << ' ' << reserve_source_name(pool.source_of(i)) << ' ';
-            if (serial == RESERVE_NONE || pool.member(serial).drafted) {
-                out << "empty\n";
-                continue;
-            }
-            const ReserveMember& m = pool.member(serial);
-            char hex_m[65];
-            char hex_n[65];
-            reserve_hex_from_bytes(m.point.m, sizeof(m.point.m), hex_m);
-            reserve_hex_from_bytes(m.point.n, sizeof(m.point.n), hex_n);
-            out << "held " << m.placed_round << ' ' << hex_m << ' ' << hex_n << '\n';
-        }
+        out << "slots " << slots << '\n';
         out.flush();
         if (!out) return false;
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(path.c_str());
-        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-            std::cout << get_time() << " : reserve state: cannot replace " << path << std::endl;
-            std::remove(tmp.c_str());
-            return false;
+    // close() 之后先把它刷到物理介质, 再改名 —— 否则断电时可能出现"名字换了、内容还在
+    // 页缓存里"的中间态, 读回来是空档或旧档。落不进盘就当这一轮没落 (游标留在旧值,
+    // 下轮重试), 宁可重复几条也不假装成功。
+    if (!fsync_path(tmp)) {
+        std::cout << get_time() << " : reserve state: fsync failed on " << tmp << std::endl;
+        std::remove(tmp.c_str());
+        return false;
+    }
+    // 先写临时文件再原子替换 —— 存档自己若被写到一半打断就报废, 那它防的"意外关机"
+    // 就白防了。
+    //
+    // 用 std::filesystem::rename 而不是 std::rename: 前者在 Windows 上是
+    // MoveFileEx(MOVEFILE_REPLACE_EXISTING), **一步覆盖、没有中间态**; std::rename
+    // 目标已存在会直接失败 (EACCES), 那就只能"先删旧的再改名", 而那个窗口里如果改名
+    // 也失败了, 存档就真没了 (游标归零 = 2 类序列从头重发一遍)。这是唯一可能丢进度的
+    // 路径, 所以必须堵住。
+    {
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            // 极少数文件系统不支持覆盖式改名: 退回到"旧档挪走 -> 新档就位"。
+            // ⚠ 这里**绝不删旧档**: 旧档里那个游标是唯一能让 2 类序列不重发的凭据,
+            //   为了这一次落盘把它删掉是本末倒置。挪不动就放弃这一轮 (下轮重试),
+            //   最多重复几条点, 绝不会丢进度。
+            const std::string bak = path + ".bak";
+            std::error_code ec2;
+            std::filesystem::rename(path, bak, ec2);      // 旧档移到 .bak
+            if (ec2) {
+                std::error_code ecr;
+                std::filesystem::remove(tmp, ecr);        // 只清临时档, 不动旧档
+                std::cout << get_time() << " : reserve state: cannot move old archive aside ("
+                          << ec2.message() << "), skip this round" << std::endl;
+                return false;
+            }
+            std::error_code ec3;
+            std::filesystem::rename(tmp, path, ec3);
+            if (ec3) {
+                // 新档就位失败: 把旧档还原回去, 宁可这一轮不落盘也不能把进度弄丢。
+                std::error_code ec4;
+                std::filesystem::rename(bak, path, ec4);
+                std::error_code ec5;
+                std::filesystem::remove(tmp, ec5);
+                std::cout << get_time() << " : reserve state: cannot replace " << path
+                          << " (" << ec3.message() << ")" << std::endl;
+                return false;
+            }
+            std::error_code ec6;
+            std::filesystem::remove(bak, ec6);
         }
     }
     return true;
 }
 
-// 回读。任何一处不合 (版本号不认 / 槽位数不符 / 下标越界 / hex 长度不对 / 来源名不认 /
-// 点不自洽) 都整份放弃 —— 存档担的是"别重复用点", 不该把一次坏存档变成一次崩溃, 或者
-// 更糟: 变成一批错点。所以宁可从头开始 (游标归 0, 重新发一遍), 也不"尽力恢复"。
-static bool reserve_state_read(ReservePool& pool, const std::string& path, ReserveCursors& cur)
+// 回读。任何一处不合都整份放弃 —— 存档担的是"别重复用点", 不该把一次坏存档变成一次
+// 崩溃, 也不该把游标读成另一个值。宁可从头开始 (游标归 0), 也不"尽力恢复"。
+static bool reserve_state_read(const std::string& path, ReserveCursors& cur,
+                               uint64_t& round, size_t slots)
 {
     std::ifstream in(path);
     if (!in.is_open()) return false;
@@ -1687,115 +1546,79 @@ static bool reserve_state_read(ReservePool& pool, const std::string& path, Reser
     };
 
     std::string line;
-    if (!std::getline(in, line) || line != "RhoReserve 1") return discard("header");
+    if (!std::getline(in, line)) return discard("header");
+    // 1 = 最早那版 (后面跟账本行), 2 = 只有两个游标, 3 = 只有 2 类游标。三种都认。
+    if (line != "RhoReserve 1" && line != "RhoReserve 2" && line != "RhoReserve 3") {
+        return discard("header");
+    }
 
     bool have_round = false;
-    bool have_slots = false;
-    uint64_t round = 0;
+    uint64_t r = 0;
+    ReserveCursors c;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         std::istringstream ls(line);
         std::string what;
         if (!(ls >> what)) continue;
         if (what == "round") {
-            if (!(ls >> round)) return discard("round");
+            if (!(ls >> r)) return discard("round");
             have_round = true;
         } else if (what == "supply") {
             std::string name;
             uint64_t cursor = 0;
             if (!(ls >> name >> cursor)) return discard("supply");
-            if (name == "Special") {
-                cur.special = cursor;
-            } else if (name == "Dp") {
-                cur.dp = cursor;
-            } else {
-                return discard("supply name");
+            ReserveSource src = ReserveSource::Random;
+            if (!reserve_source_by_name(name, src)) return discard("supply name");
+            // 只有 2 类还有游标。旧版写的 "supply Dp <游标>" 已无意义 (3 类的状态
+            // 就是墓碑位图), 读到就忽略 —— 但名字要认得, 否则整份存档会被当成坏的。
+            if (src == ReserveSource::Special) {
+                c.special = cursor;
+                // 座标大得离谱说明存档被改坏了: 别让它变成一次巨大的 set_int。
+                if (c.special > (1ULL << 62)) return discard("cursor range");
             }
         } else if (what == "slots") {
-            size_t slots = 0;
-            if (!(ls >> slots)) return discard("slots");
-            // 槽位数=设备 DP 缓冲区大小 (dp_buffer_size)。对不上说明这份存档来自另一套
-            // 配置, 下标全都不作数了。
-            if (slots != pool.size()) return discard("slots mismatch");
-            have_slots = true;
+            size_t n = 0;
+            if (!(ls >> n)) return discard("slots");
+            // 槽位数对不上只是提示: 账本没了, 游标跟槽位数无关, 不该因此丢进度。
+            if (n != slots) {
+                std::cout << get_time() << " : reserve state: slots " << n
+                          << " != dp_buffer_size " << slots << " (游标照用)" << std::endl;
+            }
         } else if (what == "slot") {
-            size_t i = 0;
-            std::string src_name;
-            std::string state;
-            if (!(ls >> i >> src_name >> state)) return discard("slot");
-            if (i >= pool.size()) return discard("slot index");
-            ReserveSource src = ReserveSource::Random;
-            if (!reserve_source_by_name(src_name, src)) return discard("slot source");
-            if (state == "empty") {
-                pool.set_slot_source(i, src);
-                continue;
-            }
-            if (state != "held") return discard("slot state");
-            uint64_t placed = 0;
-            std::string hex_m;
-            std::string hex_n;
-            if (!(ls >> placed >> hex_m >> hex_n)) return discard("held fields");
-            RhoPoint p;
-            if (!reserve_hex_to_bytes(hex_m, p.m, sizeof(p.m))) return discard("m hex");
-            if (!reserve_hex_to_bytes(hex_n, p.n, sizeof(p.n))) return discard("n hex");
-            // 全零的 (m, n) 算出来是个非法点, 而 check() 比的是"照 m/n 现算的那个 x"
-            // —— 它自己算的自己, 这种情况看不出来 (reserve_take 里有同一道挡)。
-            // 合法存档不会有这种条目, 只有手改出来的才有。
-            static const unsigned char zero32[32] = {0};
-            if (memcmp(p.m, zero32, sizeof(zero32)) == 0 &&
-                memcmp(p.n, zero32, sizeof(zero32)) == 0) {
-                return discard("zero point");
-            }
-            create(ctx, &p.x, p.m, p.n);
-            if (check(ctx, &p.x, p.m, p.n) != 1) return discard("point");
-            pool.restore_member(i, src, p, placed);
+            continue;   // 旧版的账本行: 已经没有账本了, 跳过 —— 兼容就靠这一行
         } else {
             return discard("unknown key");
         }
     }
-    if (!have_round || !have_slots) return discard("missing fields");
-    pool.set_round(round);
-    return true;
-}
-
-// 只有持久化模式才调 (启动时一次)。回读成功就把游标交回给全局供应器 —— 游标是"生产
-// 状态", 供应器装货时不动它, 所以这里直接赋值即可。返回 false 时池子可能已经被塞进
-// 半份旧状态, 由调用方重建。
-static bool reserve_state_restore(ReservePool& pool)
-{
-    ReserveCursors cur;
-    if (!reserve_state_read(pool, RHO_RESERVE_STATE_FILE, cur)) return false;
-    g_supply_special.cursor = cur.special;
-    g_supply_dp.cursor = cur.dp;
-    std::cout << get_time() << " : reserve state restored from " << RHO_RESERVE_STATE_FILE
-              << ": round " << pool.round() << ", " << (pool.member_count() - 1)
-              << " held members, cursor Special " << cur.special << ", Dp " << cur.dp
-              << std::endl;
+    if (!have_round) return discard("missing fields");
+    cur = c;
+    round = r;
     return true;
 }
 
 void init_reserve_pool(size_t slots, bool persistent)
 {
-    delete g_reserve_pool;
-    g_reserve_pool = new ReservePool(slots, g_reserve_source);
-    // 来源是 Random 时**整条存档通道关掉**: 不回读、也不落盘 (写的那一侧靠下面这个
-    // 标志拦, 见 save_reserve_state)。与 cuda.cu 里"只有 Dp 才载库"是同一个守卫。
-    // 理由: 1 类池子没有队员也没有货源游标, 存档里那两项对它全是空的 ——
-    //   回读: 会把上一段 Dp/Special 配置的游标与队员回填进来, 又被 begin_round 当成
-    //         "已退役/待补员"重新算一遍, 白花力气还容易误销账 (见 reserve_retire_consumed);
-    //   写入: 每轮重写会把上一段的游标/队员冲成 0 与全空, 将来换回 Dp 时进度就丢了。
-    // 所以 Random 期间那份存档**原样留着**, 换回 Dp/Special 只需要改 g_reserve_source。
+    g_slots = slots;
+    g_round = 0;
+    g_cursors = ReserveCursors();
+    g_window = ReserveWindow();
+    g_window.points.assign(slots, RhoPoint());
+    g_window.slot_of.assign(slots, RESERVE_NO_SLOT);
+    // 来源是 Random 时**整条存档通道关掉**: 这类池子没有货源游标, 读写只会踩别人的
+    // 进度。那份存档**原样留着**, 换回 Dp/Special 时接着用 (只改 g_reserve_source)。
     g_reserve_persistent = persistent && g_reserve_source != ReserveSource::Random;
     if (!g_reserve_persistent) return;
 
-    // 回读失败 (存档不存在 / 坏掉) 时 reserve_state_read 可能已经往池子里塞了半份,
-    // 所以整份丢掉重建 —— 要么是整份旧状态, 要么是干净起点, 不留半真半假的中间态。
-    if (!reserve_state_restore(*g_reserve_pool)) {
+    if (!reserve_state_read(RHO_RESERVE_STATE_FILE, g_cursors, g_round, slots)) {
         std::cout << get_time() << " : reserve state: starting fresh (no usable archive at "
                   << RHO_RESERVE_STATE_FILE << ")" << std::endl;
-        delete g_reserve_pool;
-        g_reserve_pool = new ReservePool(slots, g_reserve_source);
+        g_cursors = ReserveCursors();
+        g_round = 0;
+        return;
     }
+    std::cout << get_time() << " : reserve state restored from " << RHO_RESERVE_STATE_FILE
+              << ": round " << g_round << ", cursor Special " << g_cursors.special
+              << std::endl;
 }
 
 // 落一次盘 (每轮 loop 末了一次, 紧跟 note_reserve_dps)。
@@ -1803,106 +1626,75 @@ void init_reserve_pool(size_t slots, bool persistent)
 // 不打开 RhoReserve.txt, 也不写它的 .tmp。
 void save_reserve_state()
 {
-    if (g_reserve_pool == nullptr || !g_reserve_persistent) return;
-    if (g_reserve_source == ReserveSource::Random) return;
-    ReserveCursors cur;
-    reserve_cursors(cur);
-    reserve_state_write(*g_reserve_pool, cur, RHO_RESERVE_STATE_FILE);
+    if (!g_reserve_persistent) return;
+    reserve_state_write(RHO_RESERVE_STATE_FILE, g_cursors, g_round, g_slots);
 }
 
-// 重填预备队 (每轮 loop 开跑前一次): 账本补员 (主机侧) + 整块上传 (设备常量内存)。
+// 重填预备队 (每轮 loop 开跑前一次): 从来源现取一窗点 + 整块上传 (设备常量内存)。
 void init_RhoStates_reserve()
 {
-    if (g_reserve_pool == nullptr) init_reserve_pool(0);
-    g_reserve_pool->begin_round();
-    std::vector<RhoPoint> staging(g_reserve_pool->size());
-    for (size_t i = 0; i < staging.size(); ++i) staging[i] = g_reserve_pool->point(i);
-    upload_RhoStates_reserve(staging.data(), staging.size());
+    if (g_slots == 0) return;
+    ++g_round;
+    reserve_pull();
+    upload_RhoStates_reserve(g_window.points.data(), g_window.points.size());
 }
 
-// 账本记账: 这一轮设备实际**换了 dp_count 次起点** (= 被征调的槽位数)。
+// 轮末结算: 这一轮设备实际**换了 dp_count 次起点** (= 被消费的池位数), 于是
+//   1) 3 类: 被消费的那些池位对应的源库记录销账 (立墓碑 + 追加已征召库);
+//   2) 2 类: 游标只推被消费的那几条 —— 没被征调的 [consumed, slots) 下轮原样再取。
+// 1、3 类都不推游标: 1 类每轮整窗随机; 3 类的状态就是墓碑位图本身。
 // 不能传记录条数: GLV 之后每步判 p / beta*p / beta^2*p 三个代表, 每个命中各记一条,
-// 但只有 p 自己命中才换起点 (reset_start_point), 所以记录条数 >= 征调数。
+// 但只有 p 自己命中才换起点 (reset_start_point), 所以记录条数 >= 换起点次数。
 // 调用方传 DpManager::last_reset_count()。
 void note_reserve_dps(unsigned int dp_count)
 {
-    if (g_reserve_pool == nullptr) return;
-    for (unsigned int j = 0; j < dp_count; ++j) {
-        // 池位下标可以超出槽位数: 它的上界是记录条数, 而记录是"先写入再判 break"的
-        // (最多超 W-1 项), 那些超界的池位只是从备用项里取了点, 没有账本条目对应,
-        // 自然不记账。
-        if (j >= g_reserve_pool->size()) break;
-        g_reserve_pool->note_drafted(j);
+    if (g_slots == 0) return;
+    const ReserveWindow& w = g_window;
+    // 池位下标可以超出槽位数: 消费量的上界是记录条数, 而记录是"先写入再判 break"的
+    // (最多超 W-1 项), 那些超界的池位只是从备用项里取了点, 没有对应的事要记。
+    const size_t consumed = std::min<size_t>((size_t)dp_count, g_slots);
+
+    // 1) 3 类销账。判据是 slot_of[] —— 池子里的点就是从那条槽位取出来的, 一一对应。
+    if (w.source == ReserveSource::Dp) {
+        for (size_t j = 0; j < consumed; ++j) {
+            if (w.slot_of[j] == RESERVE_NO_SLOT) continue;   // 回退的随机点: 不销账
+            const std::string who = "槽位 " + std::to_string(j) + " (源库槽位 " +
+                                    std::to_string(w.slot_of[j]) + ") 被征召";
+            const RetireResult rr = retire_dp_slot(w.slot_of[j], who);
+            if (rr != RetireResult::Done) {
+                std::cout << get_time() << " : reserve: " << who << " 不销账"
+                          << retire_result_note(rr) << std::endl;
+            }
+        }
+    }
+
+    // 2) 推游标。2 类只推被消费的那几条: 池位 {0..consumed-1} 才是真正上了 walker 的,
+    //    所以下轮从"座标 + consumed"接着取 —— 没被征调的 [consumed, slots) 原样再取
+    //    一次, 它们没用过, 重取不会让轨迹重复。于是 2 类也**不会浪费来源**:
+    //    游标推过的每一个点都已经真被用掉, 没推到的点一条不丢。
+    if (w.source == ReserveSource::Special) {
+        g_cursors.special += consumed;
+    }
+    // 1 类不动游标: 每轮整窗换新随机点, 没有"用过即退役"这回事。
+    // 3 类不动游标 (已没有游标): 被征调的那几条当场变墓碑, 下一轮从 0 扫时自然跳过。
+
+    if (consumed != 0) {
+        std::cout << get_time() << " : reserve: " << consumed << " slot(s) consumed ("
+                  << reserve_source_name(w.source) << ")";
+        if (w.source == ReserveSource::Special) std::cout << ", cursor Special " << g_cursors.special;
+        if (w.source == ReserveSource::Dp) {
+            const Dp32Store& lib = dp32_store();
+            std::cout << ", 源库墓碑 " << lib.src_dead_count() << " 条 / 已征召库 "
+                      << lib.drf_count() << " 条";
+        }
+        std::cout << std::endl;
     }
 }
 
-// 载入存档之后的对账: 把"游标已经推过、当前又不在池子里"的那几条源库记录销账。
-//
-// 为什么需要它: 被征召过的队员不进存档 (reserve_state_write 只存"还没被征调过"的),
-// 所以一个点被征召之后留下的只有"游标推过去了"这一个痕迹。销账本身是随每轮 rho_play
-// 现做的 (retire_dp_member), 而这一步在旧版代码里根本没有, 中途崩在"征召了但还没落盘"
-// 之间也一样会漏。所以载完存档按同一个口径补一次:
-//
-//   源库槽位号 < 游标 且 池子里没有队员占着这个点 且 库里那条还是活的 ⇒ 立墓碑 + 追加
-//
-// 槽位号 < 游标 = 这个槽位已经被取出去过; 池子里没队员占着 = 那位队员已经退役 (被征召);
-// 库里还是活的 = 这笔账还没销过 (上一轮销掉的那些已是墓碑, 跳过)。三条合起来,
-// 剩下的正好就是"取出去又被征召掉、还没销账"的点。幂等: 销过账的下次不再进来。
-// 库没载入 / 没回过存档 (非持久模式) / 存档游标与库对不上 (库被重建过) ⇒ 什么都不做。
-//
-// ⚠ "池子里有没有队员占着"**只能按点判, 不能按槽位号判** —— 池子槽位号和源库槽位号
-// 是两套编号, 只在最开始重合: 队员被征召后空出来的池子槽位 i 会被**下一个**取出来的
-// 点填上, 而下一个点来自源库槽位 j (j 一般 != i)。实测池子槽位 1 装的就是源库槽位 112
-// 的点。早先按号对号的那一版两个方向都错: 把"还占着"的 112 误销成墓碑 (点还在池子里
-// 用), 又漏掉了"真没占"的 1。所以改成按点判: 拿每个队员占着的 x 复算出 32 位索引,
-// 回源库查出它的槽位号 (墓碑也算占着 —— 点还在池子里), 标进位图; 游标以内没被标到的,
-// 才是真没占的。
-void reserve_retire_consumed()
+// 槽位这一轮的点是不是真来自来源 (而不是回退的随机点)。validate 用它, 生产代码不用。
+bool reserve_slot_sourced(size_t slot)
 {
-    if (g_reserve_pool == nullptr || !g_reserve_persistent) return;
-    Dp32Store& lib = dp32_store();
-    if (!lib.loaded()) return;
-    const uint64_t cursor = g_supply_dp.cursor;
-    if (cursor > lib.src_count()) return;   // 库被重建过: 槽位号已经不作数, 宁可不动账
-    if (cursor == 0) return;                // 游标还没推过: 一个点都没取
-
-    std::vector<char> held((size_t)cursor, 0);
-    for (size_t j = 0; j < g_reserve_pool->size(); ++j) {
-        if (g_reserve_pool->serial_of(j) == RESERVE_NONE) continue;   // 随机点占位
-        uint64_t idx32 = 0;
-        if (!dp32_test(g_reserve_pool->point(j).x, idx32)) continue;  // 不是源库里的点
-        uint32_t slot = 0;
-        if (lib.src_find(idx32, slot) == Dp32Hit::Absent) continue;
-        if (slot < cursor) held[(size_t)slot] = 1;   // 这条还在池子里用着
-    }
-
-    uint64_t retired = 0;
-    for (uint64_t s = 0; s < cursor; ++s) {
-        if (held[(size_t)s]) continue;          // 有队员占着: 这个点还没被征召
-        Dp32Record rec;
-        if (!lib.read(Dp32File::Source, (uint32_t)s, rec)) continue;
-        if (dp32_is_tombstone(rec)) continue;   // 已经销过账
-        RhoPoint p;
-        memcpy(p.m, rec.m, sizeof(p.m));
-        memcpy(p.n, rec.n, sizeof(p.n));
-        create(ctx, &p.x, p.m, p.n);
-        const std::string who = "源库槽位 " + std::to_string(s) +
-                                " (游标已推过, 池子里没队员占着: 载档补账)";
-        if (retire_dp_member(p, who) == RetireResult::Done) ++retired;
-    }
-    if (retired != 0) {
-        cprint() << get_time() << " : reserve: 补齐 " << retired
-                 << " 个已征召但没销账的 3 类队员 (源库立墓碑 + 已征召库追加), 源库墓碑 "
-                 << lib.src_dead_count() << " 条 / 已征召库 " << lib.drf_count() << " 条"
-                 << std::endl;
-    }
-}
-
-// 槽位当前有没有队员 (随机点占位 = 没有)。validate 用它, 生产代码不用。
-bool reserve_slot_tracked(size_t slot)
-{
-    return g_reserve_pool != nullptr && slot < g_reserve_pool->size() &&
-           g_reserve_pool->serial_of(slot) != RESERVE_NONE;
+    return slot < g_window.slot_of.size() && g_window.slot_of[slot] != RESERVE_NO_SLOT;
 }
 
 // ===========================================================================
@@ -1919,278 +1711,172 @@ bool reserve_slot_tracked(size_t slot)
         } \
     } while (0)
 
-// 账本状态机的自测。
-//
-// 关键转移在真实运行里"上千轮才走一步" (DP 平均 2^40 步, 一轮才 2^26), 生产里等不
-// 出来, 所以这里塞一个合成供应器和合成记录条数, 把转移直接逼出来:
-//   (a) 没被征调过的槽位不补员 -> 跨轮原样保留 (不整池乱换, 无限期留用)
-//   (b) 被征调过的槽位补员     -> 换新队员, 老队员退役但履历留着
-//   (c) 库存耗尽               -> 该槽位永久回退随机点, 且不留履历
-//   (d) 随机点占位的槽位不进账本
-void validate_reserve_pool_state()
-{
-    // 合成库存: 给 32 条就够这几轮用 (逼出"库存耗尽"的那条另开一个小池子验)。
-    const auto supply = [](ReserveSource, RhoPoint& out) -> bool {
-        static int fed = 0;
-        if (fed >= 32) return false;
-        ++fed;
-        out.rand();
-        return true;
-    };
-
-    constexpr size_t SLOTS = 4;
-    ReservePool pool(SLOTS, ReserveSource::Special, supply);
-
-    // ---- 第 1 轮: 4 个槽位都还没有队员 -> 全部入池, 各建一条履历 ----
-    pool.begin_round();
-    RESERVE_CHECK(pool.round() == 1);
-    const uint64_t s0 = pool.serial_of(0);
-    const uint64_t s1 = pool.serial_of(1);
-    const uint64_t s2 = pool.serial_of(2);
-    const uint64_t s3 = pool.serial_of(3);
-    RESERVE_CHECK(s0 != RESERVE_NONE && s1 != RESERVE_NONE && s2 != RESERVE_NONE &&
-                  s3 != RESERVE_NONE);
-    RESERVE_CHECK(pool.member_count() == 5);   // 4 位队员 + 0 号哨兵
-    RESERVE_CHECK(pool.member(s0).source == ReserveSource::Special);
-    RESERVE_CHECK(pool.member(s0).placed_round == 1);
-    RESERVE_CHECK(pool.member(s0).slot == 0);
-    RESERVE_CHECK(!pool.member(s0).drafted);
-
-    // ---- 第 1 轮的 DP: 4 条记录 -> 记录下标 0/1/2/3 = 4 个槽位各征调一位 ----
-    for (size_t j = 0; j < SLOTS; ++j) pool.note_drafted(j);
-    RESERVE_CHECK(pool.member_count() == 5);   // 征调本身不新增履历
-    RESERVE_CHECK(pool.member(s0).drafted && pool.member(s1).drafted &&
-                  pool.member(s2).drafted && pool.member(s3).drafted);
-    RESERVE_CHECK(pool.member(s0).drafted_round == 1);
-
-    // ---- 第 2 轮: 4 个槽位都被征调过 -> 全部补员, 老队员退役 (履历还在) ----
-    pool.begin_round();
-    RESERVE_CHECK(pool.round() == 2);
-    const uint64_t s0b = pool.serial_of(0);
-    const uint64_t s1b = pool.serial_of(1);
-    RESERVE_CHECK(s0b != RESERVE_NONE && s0b != s0);
-    RESERVE_CHECK(s1b != RESERVE_NONE && s1b != s1);
-    RESERVE_CHECK(pool.serial_of(2) != s2 && pool.serial_of(3) != s3);
-    RESERVE_CHECK(pool.member_count() == 9);       // 哨兵 + 4 位老队员 + 4 位新队员
-    RESERVE_CHECK(pool.member(s0b).placed_round == 2);
-    RESERVE_CHECK(pool.member(s0).drafted);        // 履历留着
-
-    // ---- 第 2 轮的 DP: 只有 1 条记录 -> 只征调槽位 0 ----
-    pool.note_drafted(0);
-    RESERVE_CHECK(pool.member(s0b).drafted);
-    RESERVE_CHECK(!pool.member(s1b).drafted);
-
-    // ---- 第 3 轮: 只有槽位 0 补员; 1/2/3 没被征调过 -> 原样保留 (无限期留用) ----
-    pool.begin_round();
-    RESERVE_CHECK(pool.round() == 3);
-    RESERVE_CHECK(pool.serial_of(0) != s0b);
-    RESERVE_CHECK(pool.serial_of(1) == s1b);
-    RESERVE_CHECK(pool.member_count() == 10);      // 只多了槽位 0 的新队员
-    RESERVE_CHECK(pool.member(pool.serial_of(0)).placed_round == 3);
-    RESERVE_CHECK(pool.member(s1b).placed_round == 2);
-
-    // ---- 库存耗尽: 供应器直接说"没有了" -> 槽位**永久**回退随机点, 不留履历 ----
-    {
-        ReservePool p2(2, ReserveSource::Dp,
-                       [](ReserveSource, RhoPoint&) -> bool { return false; });
-        p2.begin_round();
-        RESERVE_CHECK(p2.serial_of(0) == RESERVE_NONE);
-        RESERVE_CHECK(p2.serial_of(1) == RESERVE_NONE);
-        RESERVE_CHECK(p2.source_of(0) == ReserveSource::Random);   // 已永久回退
-        RESERVE_CHECK(p2.member_count() == 1);                     // 只有哨兵
-        p2.begin_round();
-        RESERVE_CHECK(p2.source_of(0) == ReserveSource::Random);
-        RESERVE_CHECK(p2.source_of(1) == ReserveSource::Random);
-        RESERVE_CHECK(p2.member_count() == 1);
-    }
-
-    // ---- 随机点占位的槽位不进账本: 记录落在随机槽位的下标上, 什么都不记 ----
-    {
-        ReservePool p3(2, ReserveSource::Random);
-        p3.begin_round();
-        p3.note_drafted(0);
-        RESERVE_CHECK(p3.member_count() == 1);
-        RESERVE_CHECK(p3.serial_of(0) == RESERVE_NONE);
-    }
-
-    std::cout << "reserve pool state machine: ok (draft / replenish / exhausted / random)"
-              << std::endl;
-}
-
-// 两类真货源各装一次货, 并抽样确认"标量 -> 点"的换算口径没跑偏。
-// 装货本身只搬标量 (x 等真正入池时再算), 所以很便宜。
-//
-// ⚠ 这里一律用**独立实例**装货自检, 不碰全局供应器: 全局那份的游标是**生产状态**,
-// 来源配成 2/3 类时, 上面 init_RhoStates_reserve 已经把整池灌满, 游标早就不是 0 了
-// (写死"刚装好"的断言等于假定池子必为随机)。
+// 两条真货源各取几条, 验"座标 -> 点"的口径 (x/m/n 自洽) 与序列不重复。
+// 一律用**局部游标**, 不碰全局 g_cursors —— 那是生产状态。
 void validate_reserve_supplies()
 {
-    ReserveSupply sup;
-    reserve_load_special(sup);
-    // 物化段只有 adds_pub 那 256 条; 阶梯不预生成, 游标停在物化段开头。
-    RESERVE_CHECK(sup.list.size() == RHO_RESERVE_STEPS);
-    RESERVE_CHECK(sup.cursor == 0);
-    RESERVE_CHECK(reserve_next_ladder_k(sup) == 0);   // 还在物化段, 没进阶梯
-
-    // 取点函数从物化段抽一条: 现算的 x 也得自洽 (check 拿 m/n 重算并与 x 对拍)。
+    // ---- 2 类: 物化段 256 条 + 无限阶梯, 座标直接算出点 ----
     {
         RhoPoint p;
-        RESERVE_CHECK(reserve_take(sup, p));
+        // 物化段首条就是 adds_pub[0][0] (x/m/n 三者自洽, 装载时验过)
+        RESERVE_CHECK(special_point(0, p));
         RESERVE_CHECK(check(ctx, &p.x, p.m, p.n) == 1);
-        RESERVE_CHECK(sup.cursor == 1);                   // 只增不减
-        RESERVE_CHECK(reserve_next_ladder_k(sup) == 0);   // 还没进阶梯
-    }
+        RESERVE_CHECK(memcmp(p.m, adds_pub[0][0].m, 32) == 0);
+        RESERVE_CHECK(memcmp(p.n, adds_pub[0][0].n, 32) == 0);
+        // 物化段末条
+        RESERVE_CHECK(special_point(RHO_RESERVE_STEPS - 1, p));
+        RESERVE_CHECK(memcmp(p.m, adds_pub[0][RHO_RESERVE_STEPS - 1].m, 32) == 0);
+        RESERVE_CHECK(memcmp(p.n, adds_pub[0][RHO_RESERVE_STEPS - 1].n, 32) == 0);
 
-    // 阶梯段: 把游标一次推过物化段, 连抽三级 (k = 1, 2, 3), 验"k 由游标现算"、
-    // set_int 的大端字节序、"n = 0 就得到 k*G"的口径、以及游标只增不减 (第 (i) 条:
-    // 点不重复)。"create(1,0) 就是设备常量里的 G"那条对拍要拿设备常量比, 放在 cuda.cu。
-    {
-        sup.cursor = sup.list.size();
+        // 阶梯第 k 级 = k*G: 连取三级 (k = 1, 2, 3), 验"k 由座标现算"、set_int 的
+        // 大端字节序、"n = 0 就得到 k*G"的口径。"create(1,0) 就是设备常量里的 G"
+        // 那条对拍要拿设备常量比, 放在 cuda.cu。
         for (unsigned char k = 1; k <= 3; ++k) {
-            RhoPoint p;
-            RESERVE_CHECK(reserve_next_ladder_k(sup) == k);   // 级数就是游标算出来的
-            RESERVE_CHECK(reserve_take(sup, p));
+            RESERVE_CHECK(special_point(RHO_RESERVE_STEPS + k - 1, p));
             RESERVE_CHECK(check(ctx, &p.x, p.m, p.n) == 1);
-            RESERVE_CHECK(p.m[31] == k && p.m[30] == 0);   // 大端: k 落在最后一个字节
-            for (int i = 0; i < 32; ++i) RESERVE_CHECK(p.n[i] == 0);   // n = 0 -> k*G
-            RESERVE_CHECK(sup.cursor == sup.list.size() + k);
+            RESERVE_CHECK(p.m[31] == k && p.m[30] == 0);                // 大端: k 落在最后一个字节
+            for (int i = 0; i < 32; ++i) RESERVE_CHECK(p.n[i] == 0);    // n = 0 -> k*G
         }
-        RESERVE_CHECK(reserve_next_ladder_k(sup) == 4);
+
+        // 相邻两级必须不同 (游标只增不减 => 序列不重复)
+        RhoPoint a, b;
+        RESERVE_CHECK(special_point(RHO_RESERVE_STEPS, a));
+        RESERVE_CHECK(special_point(RHO_RESERVE_STEPS + 1, b));
+        RESERVE_CHECK(memcmp(&a, &b, sizeof(a)) != 0);
+
+        std::cout << get_time() << " : reserve supply Special: " << RHO_RESERVE_STEPS
+                  << " points (adds_pub) + ladder on demand (k from cursor) ok" << std::endl;
     }
 
-    std::cout << get_time() << " : reserve supply Special: " << sup.list.size()
-              << " points (adds_pub) + ladder on demand (k from cursor), next ladder k = "
-              << reserve_next_ladder_k(sup) << std::endl;
-
-    // 3 类来源靠外部库存 (32 位 DP 源库): 库不在就只印一行; 在就必须取出下一条活记录,
-    // 且现算的 x 与 (m, n) 自洽、确实是 32 位可区分点。
-    ReserveSupply dp;
-    reserve_load_dp(dp);
-    RESERVE_CHECK(!dp.ladder);            // 3 类没有阶梯, 取完就是取完
-    RESERVE_CHECK(dp.cursor == 0);
-    RESERVE_CHECK(dp.tried);              // 装货只做一次 (tried 守卫)
-    if (dp32_store().loaded() && dp32_store().src_count() > dp32_store().src_dead_count()) {
+    // ---- 3 类: 源库从 0 起扫活记录。库不在就只印一行 ----
+    {
+        if (!dp32_store_init() || !dp32_store().loaded()) {
+            cprint() << get_time() << " : reserve supply Dp: 源库不可用, 跳过抽样" << std::endl;
+            return;
+        }
+        uint64_t scan = 0;                 // 局部扫描位置: 绝不碰生产用的状态
         RhoPoint p;
-        RESERVE_CHECK(reserve_take(dp, p));
+        uint32_t slot = RESERVE_NO_SLOT;
+        if (!dp_point(scan, p, &slot)) {
+            cprint() << get_time() << " : reserve supply Dp: 源库全是墓碑, 跳过抽样" << std::endl;
+            return;
+        }
+        RESERVE_CHECK(slot != RESERVE_NO_SLOT);
+        RESERVE_CHECK(!dp32_store().src_dead(slot));      // 交出来的都是活记录
+        RESERVE_CHECK(scan == (uint64_t)slot + 1);        // 扫描位置推到取出那条之后
         RESERVE_CHECK(check(ctx, &p.x, p.m, p.n) == 1);
-        RESERVE_CHECK(dp.cursor > 0);                    // 游标 = 槽位号, 只增不减
-        RESERVE_CHECK(reserve_next_ladder_k(dp) == 0);   // 没有阶梯 -> 永远是 0
         uint64_t idx = 0;
-        RESERVE_CHECK(dp32_test(p.x, idx));              // 源库里的记录都是 32 位 DP
+        RESERVE_CHECK(dp32_test(p.x, idx));               // 源库里的记录都是 32 位 DP
+        // 库内按索引唯一: 复算出来的索引必须与记录自己的 index 字段一致
+        Dp32Record rec;
+        RESERVE_CHECK(dp32_store().read(Dp32File::Source, slot, rec));
+        RESERVE_CHECK(rec.index == idx);
+
+        // 从 0 起扫的**确定性**: 同一位置再扫一次必须拿到同一条 (这是"不浪费"的前提
+        // —— 上轮取了没被征调的点下轮必须原样再出现)。
+        uint64_t scan2 = 0;
+        RhoPoint p2;
+        uint32_t slot2 = RESERVE_NO_SLOT;
+        RESERVE_CHECK(dp_point(scan2, p2, &slot2));
+        RESERVE_CHECK(slot2 == slot);
+        RESERVE_CHECK(memcmp(&p2, &p, sizeof(p)) == 0);
+
         cprint() << get_time() << " : reserve supply Dp: 源库抽样 ok (取到槽位 "
-                 << (dp.cursor - 1) << " 的记录, 32 位索引 " << idx << ")" << std::endl;
-    } else {
-        cprint() << get_time() << " : reserve supply Dp: 源库不可用, 跳过抽样" << std::endl;
+                 << slot << " 的记录, 32 位索引 " << idx << ")" << std::endl;
     }
 }
 
-// 状态存档自测: 建池 -> 灌满 -> 征调一位 -> 落盘 -> 新池回读 -> 逐项对拍 -> 续跑一轮。
-// 用合成供应器 (每槽一个真随机点, 不吃真库存), 写路径 + ".selftest", 绝不碰生产存档
-// (RhoReserve.txt)。
+// 状态存档自测: 写 -> 读 -> 逐项对拍, 再验"旧版 (带账本行) 的存档照样读得进来"。
+// 全程用 ".selftest" 临时路径, 绝不碰生产存档 RhoReserve.txt。
 void validate_reserve_state_file()
 {
     const std::string path = RHO_RESERVE_STATE_FILE + ".selftest";
-    const ReserveSupplyFn supply = [](ReserveSource, RhoPoint& out) -> bool {
-        out.rand();
-        return true;
+    const auto write = [&](const ReserveCursors& c, uint64_t r, size_t n) {
+        return reserve_state_write(path, c, r, n);
     };
-    const size_t SLOTS = 4;
+    const auto read = [&](ReserveCursors& c, uint64_t& r, size_t n) {
+        return reserve_state_read(path, c, r, n);
+    };
+    const auto put = [&](const std::string& body) {
+        std::ofstream out(path, std::ios::trunc);
+        out << body;
+    };
 
-    // 游标: 假装 2 类已经吃掉 366 条、3 类 7 条。
-    ReserveCursors cur;
-    cur.special = 366;
-    cur.dp = 7;
-
-    ReservePool p1(SLOTS, ReserveSource::Special, supply);
-    p1.begin_round();                            // 首轮 -> 4 个槽位都进队员
-    RESERVE_CHECK(p1.member_count() == SLOTS + 1);
-    p1.note_drafted(2);                          // 只征调槽位 2 -> 存档里它该是 empty
-    RESERVE_CHECK(reserve_state_write(p1, cur, path));
-
-    // 回读: 轮号 / 槽位来源 / 留用队员 / 游标 逐项对拍。
-    ReservePool p2(SLOTS, ReserveSource::Special, supply);
-    ReserveCursors cur2;
-    RESERVE_CHECK(reserve_state_read(p2, path, cur2));
-    RESERVE_CHECK(cur2.special == 366 && cur2.dp == 7);
-    RESERVE_CHECK(p2.round() == p1.round());
-    RESERVE_CHECK(p2.member_count() == SLOTS);   // 哨兵 + 3 位留用 (被征调那位不存)
-    for (size_t i = 0; i < SLOTS; ++i) {
-        RESERVE_CHECK(p2.source_of(i) == p1.source_of(i));
-        if (i == 2) {
-            RESERVE_CHECK(p2.serial_of(i) == RESERVE_NONE);   // 已退役 -> 下一轮补员
-            continue;
-        }
-        const uint64_t s1 = p1.serial_of(i);
-        const uint64_t s2 = p2.serial_of(i);
-        RESERVE_CHECK(s2 != RESERVE_NONE);
-        RESERVE_CHECK(p2.member(s2).placed_round == p1.member(s1).placed_round);
-        RESERVE_CHECK(memcmp(p1.point(i).m, p2.point(i).m, 32) == 0);
-        RESERVE_CHECK(memcmp(p1.point(i).n, p2.point(i).n, 32) == 0);
-        // x 不落盘, 回读时从 (m, n) 现算 —— 顺手验一下口径没跑偏。
-        RESERVE_CHECK(check(ctx, &p2.point(i).x, p2.point(i).m, p2.point(i).n) == 1);
-    }
-
-    // 续跑一轮 (就当是重启之后接着跑): 只有被征调过的槽位换新点, 其余原样留用。
-    uint64_t kept[4];
-    for (size_t i = 0; i < SLOTS; ++i) kept[i] = p2.serial_of(i);
-    p2.begin_round();
-    RESERVE_CHECK(p2.round() == p1.round() + 1);
-    RESERVE_CHECK(p2.serial_of(2) != RESERVE_NONE && p2.serial_of(2) != kept[2]);
-    for (size_t i = 0; i < SLOTS; ++i) {
-        if (i == 2) continue;
-        RESERVE_CHECK(p2.serial_of(i) == kept[i]);
-        RESERVE_CHECK(memcmp(p2.point(i).m, p1.point(i).m, 32) == 0);
-    }
-
-    // 游标是跨进程状态, 装货**不能**把它冲掉 —— 冲掉就等于每次启动把库存头一段重发
-    // 一遍 (这正是要修的那个 bug)。这里把游标推过物化段, 验取出来的是阶梯而不是
-    // adds_pub[0]。
+    // ---- 往返: 游标与轮号一个不差 ----
     {
-        ReserveSupply sup;
-        sup.cursor = RHO_RESERVE_STEPS + 7;      // 存档里是"已经吃掉 263 条"
-        reserve_load_special(sup);
-        RESERVE_CHECK(sup.cursor == RHO_RESERVE_STEPS + 7);
-        RESERVE_CHECK(reserve_next_ladder_k(sup) == 8);
-        RhoPoint p;
-        RESERVE_CHECK(reserve_take(sup, p));
-        RESERVE_CHECK(p.m[31] == 8);             // 大端: 阶梯第 8 级
-        RESERVE_CHECK(sup.cursor == RHO_RESERVE_STEPS + 8);
+        ReserveCursors c1;
+        c1.special = 366;                 // 假装 2 类已经吃掉 366 条
+        RESERVE_CHECK(write(c1, 12, 4));
+        ReserveCursors c2;
+        uint64_t round = 0;
+        RESERVE_CHECK(read(c2, round, 4));
+        RESERVE_CHECK(c2.special == 366);
+        RESERVE_CHECK(round == 12);
     }
 
-    // 坏存档必须**整份**丢弃, 而不是"尽力恢复"成一批半真半假的点。
+    // ---- 旧版兼容: 已经跑了一段时间的来源 3 (RhoReserve 1 + 账本行) ----
+    // 账本行与 "supply Dp" 都必须被**忽略**, 而 2 类游标照读。3 类的进度不靠这份
+    // 存档继承 (源库墓碑位图就是进度), 所以读不进来也不影响"不浪费"。
     {
-        const std::string bad = path + ".bad";
-        ReservePool p3(SLOTS, ReserveSource::Special, supply);
-        ReserveCursors cur3;
-        {
-            std::ofstream out(bad, std::ios::trunc);
-            out << "RhoReserve 2\n";                              // 版本号不认
-        }
-        RESERVE_CHECK(!reserve_state_read(p3, bad, cur3));
-        {
-            std::ofstream out(bad, std::ios::trunc);
-            out << "RhoReserve 1\nround 1\nslots 4\n"
-                << "slot 0 Special held 1 00 00\n";               // hex 长度不对
-        }
-        RESERVE_CHECK(!reserve_state_read(p3, bad, cur3));
-        {
-            std::ofstream out(bad, std::ios::trunc);
-            out << "RhoReserve 1\nround 1\nslots 5\n";            // 槽位数与池子不符
-        }
-        RESERVE_CHECK(!reserve_state_read(p3, bad, cur3));
-        {
-            // 格式全对但点是 (0, 0): check() 自己算的自己, 看不出来, 得靠显式的全零挡。
-            const std::string z(64, '0');
-            std::ofstream out(bad, std::ios::trunc);
-            out << "RhoReserve 1\nround 1\nslots 4\n"
-                << "slot 0 Special held 1 " << z << ' ' << z << '\n';
-        }
-        RESERVE_CHECK(!reserve_state_read(p3, bad, cur3));
-        std::remove(bad.c_str());
+        const std::string hexm(64, 'a');
+        const std::string hexn(64, 'b');
+        put("RhoReserve 1\n"
+            "round 9\n"
+            "supply Special 0\n"
+            "supply Dp 122\n"
+            "slots 4\n"
+            "slot 0 Dp empty\n"
+            "slot 1 Dp held 8 " + hexm + " " + hexn + "\n"
+            "slot 2 Dp empty\n");
+        ReserveCursors c3;
+        uint64_t round = 0;
+        RESERVE_CHECK(read(c3, round, 4));
+        RESERVE_CHECK(c3.special == 0);
+        RESERVE_CHECK(round == 9);
+
+        // 槽位数不符只告警、不丢进度
+        ReserveCursors c3b;
+        uint64_t round3b = 0;
+        RESERVE_CHECK(read(c3b, round3b, 7));
+        RESERVE_CHECK(round3b == 9);
+
+        // 现在的写格式 (v3) 只有 2 类游标, 而且自己写得进读得出
+        ReserveCursors c5;
+        c5.special = 12345;
+        RESERVE_CHECK(write(c5, 7, 4));
+        ReserveCursors c6;
+        uint64_t round6 = 0;
+        RESERVE_CHECK(read(c6, round6, 4));
+        RESERVE_CHECK(c6.special == 12345 && round6 == 7);
+    }
+
+    // ---- 坏存档必须**整份**丢弃, 而不是"尽力恢复"成一批半真半假的游标 ----
+    {
+        ReserveCursors c4;
+        uint64_t r4 = 0;
+
+        put("RhoReserve 9\nround 1\n");                                // 版本号不认
+        RESERVE_CHECK(!read(c4, r4, 4));
+
+        put("RhoReserve 3\n");                                        // 缺 round
+        RESERVE_CHECK(!read(c4, r4, 4));
+
+        put("RhoReserve 3\nround 1\nsupply Bogus 5\n");                // 来源名不认
+        RESERVE_CHECK(!read(c4, r4, 4));
+
+        put("RhoReserve 3\nround 1\nwhat 1\n");                        // 未知键
+        RESERVE_CHECK(!read(c4, r4, 4));
+
+        put("RhoReserve 3\nround 1\nsupply Special 5000000000000000000\n"); // 游标 > 2^62
+        RESERVE_CHECK(!read(c4, r4, 4));
+
+        put("RhoReserve 3\nround 1\nsupply Special\n");                // 游标缺失
+        RESERVE_CHECK(!read(c4, r4, 4));
     }
 
     std::remove(path.c_str());
-    std::cout << "reserve state file: ok (round-trip / discard on corrupt)" << std::endl;
+    std::cout << "reserve state file: ok (round-trip / v1v2 compat / discard on corrupt)"
+              << std::endl;
 }
 
 #undef RESERVE_CHECK
