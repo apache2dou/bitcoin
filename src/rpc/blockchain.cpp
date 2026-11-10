@@ -3123,6 +3123,8 @@ bool saveRhoState(const RhoState* s, int num, const std::string& name)
 
 bool gameover = false;
 int g_run_mode = 2; // 默认模式2：multiple=1，CPU 1/4 核
+// GPU 跑哪一路 (见 common.h 的说明与 play() 里的分派)。命令行 -edge 置 true。
+bool g_use_edge_play = false;
 void break_rho(bool f);
 
 static int64_t BabyNUM = 0x3fffffff;
@@ -3153,7 +3155,8 @@ void set_compute_pause(bool pause)
     g_compute_paused.store(pause, std::memory_order_relaxed);
     // GPU: 内核只在 RHO_POLL_BATCHES (2^12 批) 的 poll 检查点上看 break_flag
     // (见 cuda.cu 的 rho_w)。立旗子让**当前这一轮**尽早收尾并落盘 —— W=24 下
-    // 最坏 2^12 批 ≈ 2.4 s; 不立旗子就要等它自己走完 2^24 批 (约 2.7 小时)。
+    // 最坏 2^12 批 ≈ 2.4 s; 不立旗子就要等它自己走完一整轮 (生产路
+    // RHO_ROUND_BATCHES_PROD = 2^21 批 ≈ 20 分钟, 起点漫游路 2^24 批 ≈ 2.7 小时)。
     // 撤旗子时清回去, 下一轮才发射得出去。
     // gameover 时不要清: 那是停机指令, 清掉内核会再跑满一整轮。
     if (pause || !gameover) break_rho(pause);
@@ -4963,16 +4966,17 @@ void play() {
         threads.emplace_back(T, i);
     }
     if (g_run_mode != 1) {
-        // 模式1不启动CUDA线程
-        // threads.emplace_back(rho_play); 
-        // 32 位 DP 起点漫游。
+        // 模式1不启动CUDA线程。
+        //
+        // GPU 两路**二选一** (-edge 切换, 见 common.h 的 g_use_edge_play):
+        //   默认  rho_play()       40 位判据, 命中进 DistinguishablePoints.txt + 换预备队
+        //   -edge  dp32_edge_play() 32 位判据, 写边表 Dp32Edge.txt
         // ⚠ 这两条路**不能同时启动**: 它们各自在入口处构造一个 DpManager, 而 DpManager
         //   的构造函数会往**同一个** __device__ 符号 dp_device_buffer 写设备指针 ——
         //   后构造的覆盖前一个, 先构造那条路的 DP 命中就会静默落进别人的缓冲区。
-        //   同理 break_flag_dev 也是共享的。当前只开边路 (上面那行是注释的),
-        //   要长期同时跑, 必须先把 dp_device_buffer / break_flag_dev 这两套设备符号
-        //   按路拆开 (EdgeManager 那侧已经是独立的, 只有 dp_device_buffer 是共用的)。
-        threads.emplace_back(dp32_edge_play); 
+        //   同理 break_flag_dev 也是共享的。(EdgeManager 那侧已经是独立的, 只有
+        //   dp_device_buffer 是共用的。) 要长期同时跑, 必须先把这两套设备符号按路拆开。
+        threads.emplace_back(g_use_edge_play ? dp32_edge_play : rho_play);
 
         // 实验田 k40 (沿固定加数链路扫 40 位可分点).
         // 第二个形参 use_mvp 选基准点: false = 扫 k*G, true = 扫 k*MVP

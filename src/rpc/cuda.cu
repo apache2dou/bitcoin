@@ -930,7 +930,8 @@ constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
 //                      这是**暂停/停机的响应延迟**, 也是"断流窗口"的长度 ——
 //                      旗子置起后各线程还要走到下一个检查点才散场, 这段里还会
 //                      再冒出一批 DP 命中, 缓冲余量必须接住它。
-//   RHO_ROUND_BATCHES: 无条件返回点, 决定落盘节奏 (与 W 无关)。
+//   RHO_ROUND_BATCHES_*: 无条件返回点, 决定落盘节奏 (与 W 无关)。
+//                      两条路**分开定**, 理由见下面那两个常量。
 //
 // 轮询掩码原来是 2^18 (= 每 walker 262,144 步), 在 W=24 下单批量 2.6 分钟
 // —— "有人在用机器就停算"这个需求等不起, 所以降到 2^12。
@@ -947,14 +948,28 @@ constexpr size_t dp_buffer_size = 110; // DP 缓冲区大小
 // 外层 `(count_rho & (P-1)) == 0` 这个 AND+分支**原本每一批就有**, 所以改小 P
 // 不增加热路径指令条数, 只是让内层那次 volatile 读更频繁。
 //
-// ⚠ 必须是 2 的幂, 且必须整除 RHO_ROUND_BATCHES (否则那个无条件返回点被短路,
-//   内核永远不自己收工)。两个 static_assert 在下面。
+// ⚠ P 必须是 2 的幂, 且两个 ROUND 都必须整除于 P (否则那个无条件返回点被短路,
+//   内核永远不自己收工)。static_assert 在下面。
 // ---------------------------------------------------------------------------
 constexpr uint64_t RHO_POLL_BATCHES = 1ULL << 12;
-constexpr uint64_t RHO_ROUND_BATCHES = 1ULL << 24;
+
+// 一轮的批数 = 落盘节奏。两条路**分开定** (内核按 EDGE 编译期选中其中一个):
+//
+//   生产路 (EDGE=false, 40 位 DP): 2^21 批。W=24 下一批 ~587 us ⇒ 一轮 ~20 分钟。
+//     原来是 2^24 = ~2.74 小时, 落盘太稀: 意外关机最多丢近 3 小时的计算,
+//     而且状态文件近 3 小时才更新一次, 外面看不出进度。
+//     代价是每轮多一次落盘 —— 282,624 条状态实测 ~1.2 s, 占一轮的 0.1%,
+//     加密 8 倍完全免单。
+//   起点漫游路 (EDGE=true, 32 位边): 保持 2^24。它的几何是 RHO_EDGE_WALKERS
+//     (与生产路分开定档), 产物是边表 + 40 位档案 + 状态三份, 单轮成本高,
+//     且这一路本来就不是按"尽快把进度写下去"设计的, 不动。
+constexpr uint64_t RHO_ROUND_BATCHES_PROD = 1ULL << 21;
+constexpr uint64_t RHO_ROUND_BATCHES_EDGE = 1ULL << 24;
 static_assert((RHO_POLL_BATCHES & (RHO_POLL_BATCHES - 1)) == 0, "RHO_POLL_BATCHES must be a power of two");
-static_assert(RHO_ROUND_BATCHES % RHO_POLL_BATCHES == 0,
-              "RHO_ROUND_BATCHES must be a multiple of RHO_POLL_BATCHES (inner break would be short-circuited)");
+static_assert(RHO_ROUND_BATCHES_PROD % RHO_POLL_BATCHES == 0,
+              "RHO_ROUND_BATCHES_PROD must be a multiple of RHO_POLL_BATCHES (inner break would be short-circuited)");
+static_assert(RHO_ROUND_BATCHES_EDGE % RHO_POLL_BATCHES == 0,
+              "RHO_ROUND_BATCHES_EDGE must be a multiple of RHO_POLL_BATCHES (inner break would be short-circuited)");
 
 // DP 命中后的**预备队** (按"换起点次数"一取出, 一人一个; GLV 之后一条记录
 // 不一定换起点 —— 只有 p 自己命中的那条才换, 见 reset_start_point)。
@@ -1228,6 +1243,11 @@ __constant__ RhoPoint_dev RhoStates_reserve[dp_buffer_size];
 //     states                    376,832 -> 282,624
 //     kRhoState2FrontRecords    376,832 -> 282,624 (自动跟随, 见下面的定义)
 //     每轮落盘                  ~96 MB -> ~72 MB, 单轮 200.6 s -> 153.8 s
+//
+// ⚠ 2026-11-10: 生产路的一轮批数从 2^24 降到 **2^21** (RHO_ROUND_BATCHES_PROD),
+//   所以现在 "一轮" 在 W=24 下是 ~20 分钟而不是 ~2.74 小时 (单 walker 1,702 步/秒
+//   ⇒ 2^21 步 = 1,232 s)。上面/下面所有把 "一轮 = 2^24 批" 当背景的历史表格
+//   都是当时的门径, 数字本身不用重算; 但**不能拿那些表里的"单轮墙钟"当今天的值**。
 //     RhoState2.txt 现有 188,416 条 < 282,624 => 首轮要补 94,208 个点 (一次性)
 constexpr int RHO_GPU_WALKERS = 24;
 
@@ -1307,7 +1327,9 @@ constexpr int RHO_PROD_WARPS_PER_SM = 8;
 // 记录密度 (两套判据分开数, 别加成"3 x"):
 //   40 位档案: 3 x 2^-40 每步 —— 生产路三个代表全进; edge 路只有 βp / β²p 与
 //              空槽上的 p 进 (活槽的 p 走 32 位那条, 见下)。生产路 (W=24, 每 walker
-//              2^24 步) 每轮期望 ~12 条; edge 路断流窗口 (RHO_POLL_BATCHES) 期望
+//              RHO_ROUND_BATCHES_PROD = 2^21 步) 每轮期望 ~1.6 条
+//              (原档 2^24 步时是 ~12 条; 一轮短了 8 倍, 单轮条数同比例下降);
+//              edge 路断流窗口 (RHO_POLL_BATCHES) 期望
 //              3 x states x 2^12 / 2^40 ~= 0.003 条 (上限与余量按 32 位那条算,
 //              见 edge_window_slack)。
 //   32 位边表: 1 x 2^-32 每步, **只由活槽的 p 自己产生** (βp / β²p 不写边),
@@ -2244,24 +2266,26 @@ __global__ void __launch_bounds__(128, 3) rho_w()
                 }
             }
         }
-        // 周期性返回, 让 rho_play 能定期落盘 (意外关机最多丢这一段), 同时给
+        // 周期性返回, 让主机能定期落盘 (意外关机最多丢这一段), 同时给
         // "停算"一个响应点:
         //   每 RHO_POLL_BATCHES (2^12) 批 poll 一次外部 break_flag  -> 暂停/停机延迟;
-        //   第 RHO_ROUND_BATCHES (2^24) 批无条件返回 (= 每条 walker 2^24 步, 与 W 无关)
-        //   -> 落盘节奏。
+        //   第 round_batches 批无条件返回 -> 落盘节奏。round_batches 按 EDGE 分档:
+        //     生产路 2^21 批 (~20 分钟, W=24)  /  起点漫游路 2^24 批 (~2.74 小时)。
+        //     两边都是"每条 walker 走这么多步", 与 W 无关。
         // 时长对齐: 时间目标取 CPU 侧 play() 同一件事的周期 —— 0 号线程 (W0=2)
         //   在 count_try = 2^30 批 (= 2^31 点) 时 pause 落盘 (blockchain.cpp),
         //   按其 ~1.29M pts/s 约 30 分钟。
-        //   ⚠ CPU 侧那 30 分钟与 GPU 侧**不再对齐**: W=24 时单 walker 1,702 步/秒
-        //   => 2^24 步 = 9,858 s = 2.74 小时, 比 CPU 侧的 pause 慢 5.5 倍。两条线程
-        //   各有各的落盘节奏 (barrier 只包含 CPU 线程, 见 play() 的
-        //   std::barrier(n_tasks)), 所以只是 GPU 侧落盘变粗, 不互相阻塞。
+        //   ⚠ CPU 侧那 30 分钟与 GPU 侧**不必对齐**: 两条线程各有各的落盘节奏
+        //   (barrier 只包含 CPU 线程, 见 play() 的 std::barrier(n_tasks)), 所以只是
+        //   各自按自己的节奏写, 不互相阻塞。生产路现在 2^21 = ~20 分钟, 已经和 CPU 侧
+        //   同一个量级 (此前是 2^24 = ~2.74 小时, 比 CPU 侧慢 5.5 倍)。
         // 注意: 内层判断被外层 `(count_rho & (RHO_POLL_BATCHES-1)) == 0` 短路,
-        //       所以 RHO_ROUND_BATCHES 必须是 RHO_POLL_BATCHES 的整数倍
-        //       (2^24 = 4096 x 2^12, 成立; 有 static_assert 兜着)。
+        //       所以 round_batches 必须是 RHO_POLL_BATCHES 的整数倍
+        //       (2^21 / 2^24 都是 2^12 的整数倍; 有 static_assert 兜着)。
         // 注意: count_rho 是批数, 而 printf 打的是点数, 两套单位不要混。
+        constexpr uint64_t round_batches = EDGE ? RHO_ROUND_BATCHES_EDGE : RHO_ROUND_BATCHES_PROD;
         if ((count_rho & (RHO_POLL_BATCHES - 1)) == 0) {
-            if (*break_flag_dev || (count_rho & (RHO_ROUND_BATCHES - 1)) == 0) break;
+            if (*break_flag_dev || (count_rho & (round_batches - 1)) == 0) break;
         }
     }
 #pragma unroll
@@ -2747,11 +2771,12 @@ void rho_rewalk_probe()
         for (int k = N; k < RHO_GPU_WALKERS; k++) s[k] = s[0];
     }
 
-    // 上限取 2^27 = 134217728 步: 单个点最多跨 5 轮的剩余部分, 一轮的上限是
-    // 2^24 批 (rho_w 的自动返回点, 与 W 无关), 所以 8 x 2^24 = 2^27 足够覆盖。
+    // 上限取 2^27 = 134217728 步: 单个点最多跨几轮的剩余部分, 一轮的上限是
+    // 2^21 批 (生产路的 RHO_ROUND_BATCHES_PROD, 与 W 无关), 所以 64 x 2^21 = 2^27
+    // 足够覆盖 (改成 2^21 之前是 8 x 2^24)。
     // ⚠ 耗时按**单 walker** 速度算: W=4 时 8,485 步/秒 => 上限约 4.4 小时;
-    //   生产 W=32 后单 walker 只有 ~1,979 步/秒 => 上限约 18.8 小时。实际命中
-    //   通常落在 1e7 步以内 (约 1.4 小时), 上限只是保证不会死循环。
+    //   生产 W=24 下 ~1,702 步/秒 => 上限约 21.9 小时。实际命中通常落在 1e7 步
+    //   以内 (约 1.6 小时), 上限只是保证不会死循环。
     const uint64_t max_steps = 1ULL << 27;
     std::vector<RewalkWalk> out((size_t)N);
 
@@ -3249,8 +3274,10 @@ static void dp32_edge_session(int gridSize, int blockSize, int total_points)
 }
 
 // rho_play 与 dp32_edge_play 共用的一份实现 —— 只有"判据 / 换什么点 / 落什么账"这三件
-// 事按编译期分档 (EDGE), 其余 (几何选定、线程数、W、一轮的骨架、2^24 批的返回节奏、
-// break_flag、停机) 完全相同。EDGE=false 那一支就是原来的 rho_play, 逻辑逐行未改,
+// 事按编译期分档 (EDGE), 其余 (几何选定、线程数、W、一轮的骨架、break_flag、
+// 停机) 完全相同。⚠ 落盘节奏**不是**共用的: 内核按 EDGE 选
+// RHO_ROUND_BATCHES_PROD / _EDGE (见那两个常量)。
+// EDGE=false 那一支就是原来的 rho_play, 逻辑逐行未改,
 // 只多了一行性能对账 (收工时汇总, 见 flush_round_rate)。
 template <bool EDGE>
 static void rho_play_impl()

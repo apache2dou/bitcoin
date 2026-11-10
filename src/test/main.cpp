@@ -108,6 +108,7 @@ void work() {
     //play<BabyGiant>();
 }
 
+#include <algorithm>
 #include <csignal>
 #include <cctype>
 #include <future>
@@ -450,6 +451,25 @@ private:
         return h != nullptr && ::IsWindowVisible(h) != FALSE;
     }
 
+    // 是不是已知的控制台宿主窗口类 (Windows Terminal 宿主 / 经典 conhost)
+    static bool is_console_host_class(HWND h)
+    {
+        const std::wstring cls = window_class_wide(h);
+        return _wcsicmp(cls.c_str(), L"CASCADIA_HOSTING_WINDOW_CLASS") == 0 ||
+               _wcsicmp(cls.c_str(), L"ConsoleWindowClass") == 0;
+    }
+
+    // 宿主进程是不是控制台宿主 (排除碰巧同名的其它程序)
+    static bool is_console_host_process(HWND h)
+    {
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(h, &pid);
+        const std::wstring proc = process_image_name(pid);
+        return _wcsicmp(proc.c_str(), L"WindowsTerminal.exe") == 0 ||
+               _wcsicmp(proc.c_str(), L"OpenConsole.exe") == 0 ||
+               _wcsicmp(proc.c_str(), L"conhost.exe") == 0;
+    }
+
     // 窗口类名 (宽字符; ConsoleWindowClass / PseudoConsoleWindow / CASCADIA_... )
     static std::wstring window_class_wide(HWND h)
     {
@@ -507,11 +527,7 @@ private:
         HostSearch* s = reinterpret_cast<HostSearch*>(lp);
         if (!::IsWindowVisible(h) || ::IsIconic(h)) return TRUE;      // 只要露着的
         if (::GetWindow(h, GW_OWNER) != nullptr) return TRUE;         // 只要顶层无主窗口
-        const std::wstring cls = window_class_wide(h);
-        if (_wcsicmp(cls.c_str(), L"CASCADIA_HOSTING_WINDOW_CLASS") != 0 &&
-            _wcsicmp(cls.c_str(), L"ConsoleWindowClass") != 0) {
-            return TRUE;
-        }
+        if (!is_console_host_class(h)) return TRUE;
         wchar_t tt[1024] = {0};
         if (::GetWindowTextW(h, tt, (int)(sizeof(tt) / sizeof(tt[0]))) <= 0) return TRUE;
         const bool hit = (s->title != nullptr && !s->title->empty() && _wcsicmp(tt, s->title->c_str()) == 0) ||
@@ -522,6 +538,9 @@ private:
         return TRUE;   // 继续数, 有歧义就放弃
     }
 
+    // 按标题找宿主窗口 —— 这只是一条**兜底**路径, 见 hide_window_impl 开头的说明。
+    // 标题匹配天生不可靠: WT 的主窗口标题是"当前活动标签页"的标题, 我们切到别的
+    // 标签页、或 WT 自己改标题之后就匹配不上了 (这正是"有时候隐藏失败"的主因)。
     HWND find_terminal_host_window() const
     {
         HostSearch s;
@@ -535,56 +554,64 @@ private:
             }
             return nullptr;
         }
-        // 再确认宿主进程确实是控制台宿主 (不是碰巧同名的其它程序)
-        DWORD pid = 0;
-        ::GetWindowThreadProcessId(s.found, &pid);
-        const std::wstring proc = process_image_name(pid);
-        if (_wcsicmp(proc.c_str(), L"WindowsTerminal.exe") != 0 &&
-            _wcsicmp(proc.c_str(), L"OpenConsole.exe") != 0 &&
-            _wcsicmp(proc.c_str(), L"conhost.exe") != 0) {
-            return nullptr;
-        }
+        if (!is_console_host_process(s.found)) return nullptr;
         return s.found;
+    }
+
+    // 藏掉一个窗口并复核。成功返回 true 并把 m_hide_target 记下 (恢复时用)。
+    // 判据是"现在真的不可见了", 不是"ShowWindow 没报错"。
+    bool try_hide_window(HWND h)
+    {
+        if (h == nullptr || !::IsWindow(h)) return false;
+        ::ShowWindow(h, SW_HIDE);
+        if (!is_window_visible(h)) {
+            m_hide_target = h;
+            return true;
+        }
+        // 藏不掉就回滚, 别把用户的窗口弄到半隐身状态
+        ::ShowWindow(h, SW_SHOW);
+        if (::IsIconic(h)) ::ShowWindow(h, SW_RESTORE);
+        return false;
     }
 
     // 隐藏: 窗口**和它的任务栏按钮**一起消失, 进程照常跑。
     // 返回是否真的藏掉了 —— 判据不是"调用没报错", 而是"这个窗口现在不可见了"。
     bool hide_window_impl()
     {
+        // (0) 首选: PseudoConsoleWindow 的 **owner 就是宿主窗口**。
+        //     实测 (2026-11-09 与 11-10 两次抓):
+        //       hwnd=6688204 pid=30548 OWNER=721838 ROOT=6688204 class=PseudoConsoleWindow
+        //       hwnd=721838  pid=19820 OWNER=0      ROOT=721838  class=CASCADIA_HOSTING_WINDOW_CLASS
+        //     我们自己的 0 尺寸影子窗口没被设过 parent, 所以 GA_ROOT 返回它自己 ——
+        //     旧版步骤 (3) 因此永远走不到。而 owner 这条链是**确定性**的, 与标题无关。
+        //     必须走这条: 标题匹配只在"我们的标签页正好是活动页"时才成立, 一旦切页
+        //     或 WT 自己改了标题就匹配不上, 这就是"有时候隐藏失败"的主因。
+        if (m_console_is_pty) {
+            HWND host = ::GetWindow(m_hwnd, GW_OWNER);
+            if (host != nullptr && is_console_host_class(host) && is_console_host_process(host)) {
+                if (try_hide_window(host)) return true;
+            }
+        }
+
         // (1) 经典 conhost: 我们自己的窗口就是屏幕上那个, 直接藏。
         //     ⚠ PTY 下必须跳过这一步: 影子窗口的 WS_VISIBLE 会被 SW_HIDE 清掉,
         //     于是复核"不可见"成立、函数报成功, 但屏幕毫无变化。
         if (!m_console_is_pty && m_win_was_visible) {
-            ::ShowWindow(m_hwnd, SW_HIDE);
-            if (!is_window_visible(m_hwnd)) return true;
+            if (try_hide_window(m_hwnd)) return true;
         }
 
-        // (2) ConPTY (Windows Terminal): 去宿主进程里找真正露着的窗口。
+        // (2) 兜底: 按标题去 EnumWindows 里找 (owner 链拿不到时才会走到这儿)。
         if (m_console_is_pty) {
-            HWND host = find_terminal_host_window();
-            if (host != nullptr) {
-                ::ShowWindow(host, SW_HIDE);
-                if (!is_window_visible(host)) {
-                    m_hide_target = host;
-                    return true;
-                }
-                ::ShowWindow(host, SW_SHOW);   // 藏不掉立刻回滚
-                if (::IsIconic(host)) ::ShowWindow(host, SW_RESTORE);
-            }
+            if (try_hide_window(find_terminal_host_window())) return true;
         }
 
-        // (3) 影子窗口有时挂在真正的宿主窗口下面: 用根窗口再试一次。
+        // (3) 再兜底: 影子窗口万一挂在某个根窗口下面。
         //     必须先确认根窗口是"可见且没最小化"的, 否则可能把用户别的窗口弄没。
         {
             HWND root = ::GetAncestor(m_hwnd, GA_ROOT);
             if (root != nullptr && root != m_hwnd && is_window_visible(root) &&
-                !::IsIconic(root)) {
-                ::ShowWindow(root, SW_HIDE);
-                if (!is_window_visible(root)) {
-                    m_hide_target = root;
-                    return true;
-                }
-                ::ShowWindow(root, SW_SHOW);
+                !::IsIconic(root) && is_console_host_class(root)) {
+                if (try_hide_window(root)) return true;
             }
         }
 
@@ -599,13 +626,20 @@ private:
 
         if (!hide_window_impl() && !m_warned) {
             m_warned = true;
-            cprint() << "[hotkey] 隐藏失败: 控制台窗口是 " << window_class_name(m_hwnd)
-                     << ", 屏幕上那个终端窗口不属于本进程。\n"
-                                "         Windows Terminal (ConPTY) 就是这种情况: 真正露着的窗口\n"
-                                "         在 WindowsTerminal.exe 里 (类名 CASCADIA_HOSTING_WINDOW_CLASS),\n"
-                                "         本进程只能操作那个 0 尺寸的影子窗口, 对它 SW_HIDE 是空操作。\n"
-                                "         已退一步最小化。要真隐藏, 请改用经典控制台:\n"
-                                "         conhost.exe test_EC.exe   或   .bat 里写 start conhost.exe test_EC.exe"
+            // 现在首选路径是 owner 链, 走到这里说明 owner 和标题这两条都没成。
+            // 报出能直接定位问题的三件事: 我们自己是什么窗口、owner 指向谁、owner 的类名。
+            HWND owner = ::GetWindow(m_hwnd, GW_OWNER);
+            cprint() << "[hotkey] 隐藏失败: 本进程窗口类是 " << window_class_name(m_hwnd)
+                     << ", GW_OWNER=" << (unsigned long long)(uintptr_t)owner;
+            if (owner != nullptr) {
+                cprint() << " (类名 " << window_class_name(owner) << ", 可见="
+                         << (is_window_visible(owner) ? 1 : 0) << ")";
+            } else {
+                cprint() << " (无 owner)";
+            }
+            cprint() << "。\n"
+                        "         owner 链、标题匹配、根窗口都失败, 已退一步最小化。\n"
+                        "         把上面这一行发给开发者, 能直接看出宿主窗口挂在哪。"
                      << std::endl;
         }
 
@@ -623,7 +657,9 @@ private:
         // 先放行计算, 再显示 —— 免得窗口已经出来了计算还停着, 让人以为进程卡死。
         resume_compute();
 
-        // 隐藏时若用了宿主窗口 (GA_ROOT), 恢复也得把它带回来
+        // 隐藏时藏的是宿主窗口 (PTY 的 owner / 兜底找到的那个), 恢复也必须把它带回来。
+        // 记下来再清空: 后面抢前台要用这个窗口, 而不是 0 尺寸的影子窗口。
+        HWND shown = m_hide_target;
         if (m_hide_target != nullptr) {
             ::ShowWindow(m_hide_target, SW_SHOW);
             if (::IsIconic(m_hide_target)) ::ShowWindow(m_hide_target, SW_RESTORE);
@@ -631,21 +667,33 @@ private:
         }
         ::ShowWindow(m_hwnd, SW_SHOW);
         if (::IsIconic(m_hwnd)) ::ShowWindow(m_hwnd, SW_RESTORE);
-        bring_to_front();
+        bring_to_front(shown != nullptr ? shown : foreground_target());
         m_hidden = false;
     }
 
-    void bring_to_front()
+    // 屏幕上那个"用户看着的窗口": 优先用刚恢复的那一个; 其次 PTY 下取 owner;
+    // 最后退回自己的窗口 (经典 conhost 就是它)。
+    HWND foreground_target() const
     {
-        if (::SetForegroundWindow(m_hwnd)) return;
+        if (m_console_is_pty) {
+            HWND owner = ::GetWindow(m_hwnd, GW_OWNER);
+            if (owner != nullptr) return owner;
+        }
+        return m_hwnd;
+    }
+
+    void bring_to_front(HWND h)
+    {
+        if (h == nullptr) return;
+        if (::SetForegroundWindow(h)) return;
         // 前台锁 (另一程序正占着前台) 时 SetForegroundWindow 会失败。绕法: 短暂置顶再
         // 取消置顶 —— 这一步把窗口顶到 z 序最前, 之后 SetForegroundWindow 才成功。
-        ::SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+        ::SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        ::SetWindowPos(m_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+        ::SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        if (!::SetForegroundWindow(m_hwnd)) {
-            ::FlashWindow(m_hwnd, TRUE);   // 最后退一步: 任务栏按钮闪一下提醒用户
+        if (!::SetForegroundWindow(h)) {
+            ::FlashWindow(h, TRUE);   // 最后退一步: 任务栏按钮闪一下提醒用户
         }
     }
 
@@ -734,12 +782,33 @@ int main(int argc, char* argv[])
     //   test_bitcoin.exe validate   跑 validate_test()
     // 不带参数时行为与以前完全一致 (走 work())。
     bool run_perf = false, run_validate = false, run_rho_perf = false;
+
+    // 热键开关 (默认开)。Ctrl+Alt+/ 是**整机全局**热键: RegisterHotKey 同一个键
+    // 只能有一个进程注册成功, 先注册的那个独占。
+    //   典型场景: 本机和远程机器各跑一个实例, 用 VNC 连远程。两边都注册的话, 本机
+    //   那个会先把键抢走, 于是在 VNC 窗口里按键只有本机实例响应, 远程的收不到。
+    //   给**本机**那个加 -nohotkey, 热键就留给远程实例 (反过来也一样)。
+    // 用法: test_EC.exe 2 -nohotkey    或    test_EC.exe 2 /nohotkey
+    // (前缀 - 与 / 都收; 大小写不敏感。)
+    bool hotkey_enabled = true;
+
+    // GPU 跑哪一路 (默认 rho_play = 40 位生产路)。两路互斥, 理由见 common.h 的说明。
+    // 用法: test_EC.exe 2 -edge
+    bool want_edge = false;
+
     for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
+        std::string arg = argv[i];
+        if (!arg.empty() && (arg[0] == '-' || arg[0] == '/')) arg.erase(0, 1);
+        if (arg.empty()) continue;
+        std::transform(arg.begin(), arg.end(), arg.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
         if (arg == "perf") run_perf = true;
         else if (arg == "rhoperf") run_rho_perf = true;
         else if (arg == "validate") run_validate = true;
+        else if (arg == "nohotkey") hotkey_enabled = false;
+        else if (arg == "edge") want_edge = true;
     }
+    g_use_edge_play = want_edge;
     if (run_perf && run_validate) {
         cprint() << "perf 与 validate 不能同时跑" << std::endl;
         return 1;
@@ -753,8 +822,15 @@ int main(int argc, char* argv[])
     // 热键被别的程序占着会直接报错, 不换键 (详见 ConsoleToggleHotkey 的注释)。
     // 生命周期绑在 main 上: 跑到末尾那句 cin.get() 等回车时热键仍然有效。
     // 启停过程不打印任何提示 —— 这几行提示已经删掉了, 需要时报错会走 cprint()。
+    // -nohotkey 时整个对象都不启动: 不注册、不起泵线程, 于是"隐藏窗口 + 空闲停算"
+    // 这一整套也一并关闭 (它们全靠这条线程驱动)。
     ConsoleToggleHotkey console_hotkey;
-    console_hotkey.start();
+    if (hotkey_enabled) {
+        console_hotkey.start();
+    } else {
+        cprint() << "热键未注册 (-nohotkey): 本实例不响应 Ctrl+Alt+/, 也不做窗口隐藏/空闲停算"
+                 << std::endl;
+    }
 
     INIT _init;
     if (run_perf) {
@@ -764,6 +840,16 @@ int main(int argc, char* argv[])
     } else if (run_validate) {
         validate_test();
     } else {
+        // 到真正分派的这一层才打路径 —— 它只影响 work(), perf/validate 不看它。
+        // 模式 1 不启动 CUDA, 所以不能报成 "rho_play"。
+        if (g_run_mode == 1) {
+            cprint() << "gpu path: 无 (run mode 1, 只跑 CPU)" << std::endl;
+        } else {
+            cprint() << "gpu path: "
+                     << (g_use_edge_play ? "dp32_edge_play (32 位边表)"
+                                         : "rho_play (40 位 DP)")
+                     << std::endl;
+        }
         work();
     }
 

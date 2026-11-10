@@ -33,11 +33,20 @@ public:
 
 // 运行模式（由 main 命令行参数设置）：
 // 1 = 仅CPU单线程，不启动CUDA
-// 2 = CUDA启动，每核心1线程(multiple=1)，CPU启动 1/4 核数线程
-// 3 = CUDA启动，每核心2线程(multiple=2)，CPU启动 1/2 核数线程（默认）
+// 2 = CUDA启动，每核心1线程(multiple=1)，CPU启动 1/4 核数线程（默认）
+// 3 = CUDA启动，每核心2线程(multiple=2)，CPU启动 1/2 核数线程
 // 4 = CUDA启动，CPU启动 核数-2 线程（blockSize 与运行模式无关, 见 cuda.cu 的
 //     get_optimal_block_size）
 extern int g_run_mode;
+
+// GPU 跑哪一路 (命令行 -edge 切换, 默认 false = 生产路)。
+//   false -> rho_play()       : 40 位判据, 命中进 DistinguishablePoints.txt + 换预备队
+//   true  -> dp32_edge_play() : 32 位判据, 写边表 Dp32Edge.txt, 状态落 Dp32EdgeState.txt
+// ⚠ 两路**互斥**, 不能同时启动: 它们各自在入口构造一个 DpManager, 而 DpManager 的
+//   构造函数往**同一个** __device__ 符号 dp_device_buffer 写设备指针 —— 后构造的会
+//   覆盖前一个, 先构造那条路的 DP 命中就静默落进别人的缓冲区。break_flag_dev 同理。
+//   要长期同时跑, 必须先把这两套设备符号按路拆开。
+extern bool g_use_edge_play;
 
 bool rho_F(secp256k1_context* ctx, RhoState& s);
 void set_int256(unsigned char* cn, const char* n);
