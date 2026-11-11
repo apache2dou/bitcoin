@@ -1267,7 +1267,7 @@ constexpr int RHO_GPU_WALKERS = 24;
 //
 // 其余联动项 (都已核对过, 不需要跟着改):
 //   · dp_buffer_size (110) 是**生产路**的槽位数, 同时决定 RhoStates_reserve 常量内存、
-//     rho.cpp 的预备队账本条数、RhoReserve.txt 的 "slots" 校验 —— 两边已解耦,
+//     rho.cpp 那扇滑窗的点数、RhoReserve.txt 的 "slots" 校验 —— 两边已解耦,
 //     edge 用自己的一套设备内存 (edge_states_dev / edge_src_dev), 不碰 dp_buffer_size。
 //   · total_points = threads x W 由 rho_play_impl 按 EDGE 分档算出并传进来,
 //     dp32_edge_session 用同一个常量, 两处一致。
@@ -1685,7 +1685,7 @@ struct EdgeBuffer {
 };
 static_assert(sizeof(EdgeBuffer) == 80, "EdgeBuffer layout changed");
 
-// "空槽" 哨兵: 只在**状态文件 / 主机侧账本**里用 (每槽当前起点索引 = 它 表示这槽没
+// "空槽" 哨兵: 只在**边表的状态文件**里用 (每槽当前起点索引 = 它 表示这槽没
 // 拿到库起点, 走的是主机补的随机点)。
 // ⚠ 新写出的边表里**不会**再出现这个值: 边只从活槽走出来 (见 rho_w); 旧边文件里有
 //   它, 读侧 (count_edge_lines / testmvp 8 2) 仍当"追不到来源"接受。
@@ -1898,7 +1898,8 @@ public:
     }
 
     // 从设备复制 DP 到主机并保存。返回这一轮的**记录条数** (性能对账用)。
-    // 预备队账本要用的是 last_reset_count() —— GLV 之后记录条数 != 换起点次数。
+    // 预备队结算 (rho.cpp 的 note_reserve_dps) 要用的是 last_reset_count() ——
+    // GLV 之后记录条数 != 换起点次数。
     unsigned int save_dps()
     {
         // 获取当前缓冲区计数 + 换起点次数
@@ -2374,9 +2375,10 @@ void init_adds_pub_dev()
 // 一个 walker 命中可区分点时, 用 RhoStates_reserve 里对应槽位的一份独立点把它的
 // (x, m, n) 整体顶替掉 (见 reset_start_point), 让它从这份新起点继续走。
 //
-// 池里放什么点 (来源与账本) 全在 rpc/rho.cpp —— 那是纯主机侧的逻辑, 不需要一行
+// 池里放什么点 (从哪个来源取) 全在 rpc/rho.cpp —— 那是纯主机侧的逻辑, 不需要一行
 // CUDA 代码; 设备端只负责收下这一块常量内存。上传走下面这个函数 (唯一的跨 TU 接口),
-// "为什么 2、3 类来源要账本" 的完整说明见 common.h 的 ReserveSource 那段。
+// "三条来源分别怎么取点、为什么只有 Special 需要游标" 的完整说明见 common.h 的
+// ReserveSource 那段。
 // ---------------------------------------------------------------------------
 
 // 把主机侧算好的槽位点整块拷进设备常量内存 (110 x 144B 一次 DMA, 每轮一次)。
@@ -2398,9 +2400,9 @@ void upload_RhoStates_reserve(const RhoPoint* points, size_t count)
 }
 extern secp256k1_context* ctx;
 
-// 流水号 0 = "没有队员". 注意: 预备队账本整段已经搬到 rpc/rho.cpp —— 那是纯主机
-// 侧的逻辑, 一行 CUDA 都用不上; 设备侧只剩上面的 upload_RhoStates_reserve 与
-// RhoStates_reserve 那份常量内存。
+// 流水号 0 = "没有队员". 注意: 预备队那整套 (取点/结算/落盘) 全在 rpc/rho.cpp ——
+// 那是纯主机侧的逻辑, 一行 CUDA 都用不上; 设备侧只剩上面的
+// upload_RhoStates_reserve 与 RhoStates_reserve 那份常量内存。
 
 static const std::string _RSFile2_name = data_file("RhoState2.txt");
 int loadRhoState(RhoState* s, int num, const std::string& name);
@@ -3324,7 +3326,7 @@ static void rho_play_impl()
         // 初始化break_flag
         init_break_flag();
         // 预备队: 池子没有账本, 每轮现从来源取一窗点 (逻辑全在 rho.cpp)。
-        // persistent = true: 启动时回读 RhoReserve.txt (只有货源游标 + 轮号)。
+        // persistent = true: 启动时回读 RhoReserve.txt (只有 2 类游标 + 轮号)。
         // 不落盘的话游标重启归零, 头几段点跟上一次 run 逐字节重复 —— 重复的那批 DP
         // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
         // ⚠ 来源配成 Random (当前配置) 时 rho.cpp 会把这条通道整个关掉: 既不回读也不

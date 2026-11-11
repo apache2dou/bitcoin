@@ -1213,11 +1213,15 @@ static ReserveCursors g_cursors;
 // 槽位没有对应的源库记录 (1、2 类 / 3 类回退的随机点)。
 constexpr uint32_t RESERVE_NO_SLOT = 0xFFFFFFFFu;
 
-// 本轮这一窗点。只有 3 类需要 slot_of (轮末销账要知道"第 r 条取自源库哪个槽位");
-// 1、2 类的座标直接由游标算得出来, 不必另记。
+// 本轮这一窗点。三份记录各管一件事, 不能合并:
+//   slot_of      只有 3 类有值 (轮末销账要知道"这个槽位的点取自源库哪一条");
+//   from_source  三类都要能回答 (validate 靠它区分"真取到了"和"回退成随机点");
+//   points       实际灌进设备常量内存的那一窗点。
+// 1、2 类的座标直接由游标算得出来, 所以不需要 slot_of。
 struct ReserveWindow {
     std::vector<RhoPoint> points;                // 槽位 -> 点
     std::vector<uint32_t> slot_of;               // 槽位 -> 源库槽位 (非 3 类恒 RESERVE_NO_SLOT)
+    std::vector<char>     from_source;           // 槽位 -> 这一轮的点是否真来自来源 (回退随机 = 0)
     ReserveSource         source = ReserveSource::Random;
 };
 static ReserveWindow g_window;
@@ -1368,6 +1372,7 @@ static void reserve_pull()
     ReserveWindow& w = g_window;
     w.points.assign(g_slots, RhoPoint());
     w.slot_of.assign(g_slots, RESERVE_NO_SLOT);
+    w.from_source.assign(g_slots, 0);
     w.source = g_reserve_source;
 
     if (w.source == ReserveSource::Dp) {
@@ -1385,6 +1390,9 @@ static void reserve_pull()
             ok = dp_point(scan, w.points[i], &slot);
             if (ok) w.slot_of[i] = slot;
         }
+        // ⚠ 这两个记录必须分开: slot_of 只有 3 类有值, 而"是不是真来自来源"三类都要能
+        // 回答 (validate 靠它判断 2 类会不会整窗都回退成随机点)。
+        w.from_source[i] = ok ? 1 : 0;
         if (!ok) w.points[i].rand();
     }
 }
@@ -1451,14 +1459,15 @@ static RetireResult retire_dp_slot(uint32_t slot, const std::string& who)
 // 1 类也不需要 (随机点没有"进度"可丢)。
 //
 // 存档 (纯文本, RhoReserve.txt, 每轮 rho_play 落一次):
-//     RhoReserve 3                        版本号, 不认就整份丢掉
+//     RhoReserve 2                        版本号, 不认就整份丢掉
 //     round <n>                           当前轮号 (日志轮号跨进程连续)
 //     supply Special <n>                  2 类序列已经发出去的条数
 //     slots <n>                           槽位数 (只做告警: 与 dp_buffer_size 不符时提示)
 //
-// 向后兼容: 读侧接受 1、2、3 三个版本。旧版还会写
-//     supply Dp <游标>                     (2/3 版) —— 已无意义, 读到就忽略
-//     slot <i> <来源> empty|held ...       (1 版)   —— 账本行, 读到就跳过
+// 向后兼容: 读侧只接受 1、2 两个版本 (没有 v3 —— 账本取消时直接把当时那份升成 2,
+// 因为"两个游标"的中间版本从未落过盘)。旧版 v1 还会写
+//     supply Dp <游标>                     —— 已无意义, 读到就忽略 (但名字得认得)
+//     slot <i> <来源> empty|held ...       —— 账本行, 读到就跳过
 // 所以已经跑了一段时间的来源 3 的进度**不需要靠游标继承** —— 墓碑位图本身就是进度,
 // 而从 0 起扫活记录的取点法会自然把旧版那些 "取过但没被征调" 的留用点重新排回队里。
 static bool reserve_state_write(const std::string& path, const ReserveCursors& cur,
@@ -1471,7 +1480,7 @@ static bool reserve_state_write(const std::string& path, const ReserveCursors& c
             std::cout << get_time() << " : reserve state: cannot write " << tmp << std::endl;
             return false;
         }
-        out << "RhoReserve 3\n";
+        out << "RhoReserve 2\n";
         out << "round " << round << '\n';
         out << "supply Special " << cur.special << '\n';
         out << "slots " << slots << '\n';
@@ -1547,10 +1556,8 @@ static bool reserve_state_read(const std::string& path, ReserveCursors& cur,
 
     std::string line;
     if (!std::getline(in, line)) return discard("header");
-    // 1 = 最早那版 (后面跟账本行), 2 = 只有两个游标, 3 = 只有 2 类游标。三种都认。
-    if (line != "RhoReserve 1" && line != "RhoReserve 2" && line != "RhoReserve 3") {
-        return discard("header");
-    }
+    // 1 = 最早那版 (后面跟账本行), 2 = 现在这份 (只有 2 类游标)。两种都认。
+    if (line != "RhoReserve 1" && line != "RhoReserve 2") return discard("header");
 
     bool have_round = false;
     uint64_t r = 0;
@@ -1604,6 +1611,7 @@ void init_reserve_pool(size_t slots, bool persistent)
     g_window = ReserveWindow();
     g_window.points.assign(slots, RhoPoint());
     g_window.slot_of.assign(slots, RESERVE_NO_SLOT);
+    g_window.from_source.assign(slots, 0);
     // 来源是 Random 时**整条存档通道关掉**: 这类池子没有货源游标, 读写只会踩别人的
     // 进度。那份存档**原样留着**, 换回 Dp/Special 时接着用 (只改 g_reserve_source)。
     g_reserve_persistent = persistent && g_reserve_source != ReserveSource::Random;
@@ -1692,9 +1700,10 @@ void note_reserve_dps(unsigned int dp_count)
 }
 
 // 槽位这一轮的点是不是真来自来源 (而不是回退的随机点)。validate 用它, 生产代码不用。
+// 1 类恒 false; 2 类恒 true (阶梯无上限); 3 类源库见底时才会是 false。
 bool reserve_slot_sourced(size_t slot)
 {
-    return slot < g_window.slot_of.size() && g_window.slot_of[slot] != RESERVE_NO_SLOT;
+    return slot < g_window.from_source.size() && g_window.from_source[slot] != 0;
 }
 
 // ===========================================================================
@@ -1840,7 +1849,7 @@ void validate_reserve_state_file()
         RESERVE_CHECK(read(c3b, round3b, 7));
         RESERVE_CHECK(round3b == 9);
 
-        // 现在的写格式 (v3) 只有 2 类游标, 而且自己写得进读得出
+        // 现在的写格式 (v2) 只有 2 类游标, 而且自己写得进读得出
         ReserveCursors c5;
         c5.special = 12345;
         RESERVE_CHECK(write(c5, 7, 4));
@@ -1858,24 +1867,28 @@ void validate_reserve_state_file()
         put("RhoReserve 9\nround 1\n");                                // 版本号不认
         RESERVE_CHECK(!read(c4, r4, 4));
 
-        put("RhoReserve 3\n");                                        // 缺 round
+        // v3 从未落过盘 (账本取消时直接把它升成了 2), 所以必须当坏档拒掉
+        put("RhoReserve 3\nround 1\n");
         RESERVE_CHECK(!read(c4, r4, 4));
 
-        put("RhoReserve 3\nround 1\nsupply Bogus 5\n");                // 来源名不认
+        put("RhoReserve 2\n");                                        // 缺 round
         RESERVE_CHECK(!read(c4, r4, 4));
 
-        put("RhoReserve 3\nround 1\nwhat 1\n");                        // 未知键
+        put("RhoReserve 2\nround 1\nsupply Bogus 5\n");                // 来源名不认
         RESERVE_CHECK(!read(c4, r4, 4));
 
-        put("RhoReserve 3\nround 1\nsupply Special 5000000000000000000\n"); // 游标 > 2^62
+        put("RhoReserve 2\nround 1\nwhat 1\n");                        // 未知键
         RESERVE_CHECK(!read(c4, r4, 4));
 
-        put("RhoReserve 3\nround 1\nsupply Special\n");                // 游标缺失
+        put("RhoReserve 2\nround 1\nsupply Special 5000000000000000000\n"); // 游标 > 2^62
+        RESERVE_CHECK(!read(c4, r4, 4));
+
+        put("RhoReserve 2\nround 1\nsupply Special\n");                // 游标缺失
         RESERVE_CHECK(!read(c4, r4, 4));
     }
 
     std::remove(path.c_str());
-    std::cout << "reserve state file: ok (round-trip / v1v2 compat / discard on corrupt)"
+    std::cout << "reserve state file: ok (round-trip / v1 compat / discard on corrupt)"
               << std::endl;
 }
 
