@@ -4911,7 +4911,11 @@ void play() {
     // 槽位数就是存档文件的条数上限 (RHO_STATE_SLOTS, 见 common.h)
     std::string _logvec[RHO_STATE_SLOTS];
     RhoState rs[RHO_STATE_SLOTS] = {0};
-    bool pause = false;
+    // "这一轮要不要落盘" —— 线程 0 写, 所有线程读, on_barrier 清回 false。
+    // 用 atomic 而不是裸 bool: 这是真实的跨线程读写 (线程 0 置位, 其余线程在同一处
+    // 判断), 裸 bool 在 C++ 内存模型下是 data race。所有用法都是简单读写, 改成
+    // atomic 语义完全一致、没有额外代价。
+    std::atomic<bool> pause{false};
     {
         // 部分加载: 旧档条数不足槽位数时 (比如 256 条的旧档), 只把缺的槽补
         // 随机, 已有进度全部保留。loadRhoState 返回成功加载的条数。

@@ -436,8 +436,36 @@ private:
         set_compute_pause(false);
     }
 
+    // 重取一次控制台窗口句柄。
+    //
+    // 为什么需要: 会话在**本地控制台与远程桌面之间迁移**时, conhost 可能销毁并重建
+    // 那个控制台窗口, 启动时 (start()) 缓存下来的 m_hwnd 就变成失效句柄。之后
+    // IsWindow 一律 false —— 隐藏、复核、最小化、抢前台、PTY 的 GW_OWNER 链全都是
+    // **静默空操作**, 表现为"按热键毫无反应", 只能重启进程才恢复。
+    //
+    // 只在按热键时重取 (而不是每秒轮询): 热键是这套功能的唯一入口, 没有热键的时候
+    // 本来也没有窗口操作要做。
+    //
+    // ⚠ 只刷新"窗口是谁", **不动 m_hidden**: 会话迁移之后窗口通常是露着的, 但把
+    //   m_hidden 改成 false 会连带关掉空闲检测 —— 那正好破坏"隐藏后登远程自动停算"。
+    void refresh_console_window()
+    {
+        HWND cur = ::GetConsoleWindow();
+        if (cur == nullptr || cur == m_hwnd) return;   // 拿不到 / 没变: 沿用旧的
+        m_hwnd = cur;
+        m_hide_target = nullptr;              // 旧宿主窗口已经作废, 别再对它 ShowWindow
+        m_console_class = window_class_wide(cur);
+        m_console_is_pty = (_wcsicmp(m_console_class.c_str(), L"PseudoConsoleWindow") == 0);
+        m_win_was_visible = is_window_visible(cur);
+        m_warned = false;                     // 新窗口: 让"隐藏失败"那条提示重新报一次
+        // 标题要跟着重取 (兜底匹配与 PTY 宿主标签都靠它)
+        wchar_t buf[1024] = {0};
+        if (::GetConsoleTitleW(buf, (DWORD)(sizeof(buf) / sizeof(buf[0]))) > 0) m_console_title = buf;
+    }
+
     void toggle()
     {
+        refresh_console_window();
         if (m_hwnd == nullptr) return;
         if (m_hidden) show_window();
         else hide_window();
