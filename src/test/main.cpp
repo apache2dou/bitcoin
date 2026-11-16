@@ -53,46 +53,6 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME = []() {
 #include <stack>
 #include <cstdlib>
 
-void test()
-{
-    int limit = 10000;
-
-    RhoState tmp_origin;
-    tmp_origin.rand();
-    rho_F(ctx, tmp_origin);
-
-    int count = 0;
-
-    int counts[32] = {0};
-    // 打印一个key 方便测试。
-    auto print_pkey = [&](secp256k1_pubkey* pk) {
-        CPubKey cpk3;
-        size_t clen = CPubKey::SIZE;
-        secp256k1_ec_pubkey_serialize(ctx, (unsigned char*)cpk3.begin(), &clen, pk, SECP256K1_EC_UNCOMPRESSED);
-        std::cout << HexStr(cpk3) << std::endl;
-    };
-
-    while (count < limit) {
-        tmp_origin.rand();
-        // rho_F(ctx, tmp_origin);
-        RhoState ret[32] = {0};
-        int c = rho_Fi(ctx, &tmp_origin, ret);
-        count++;
-        counts[c]++;
-        for (int i = 0; i < c; i++) {
-            RhoState tmp = ret[i];
-            assert(check(ctx, &tmp.x, tmp.m, tmp.n));
-            rho_F(ctx, tmp);
-            assert(secp256k1_ec_pubkey_cmp(ctx, &tmp.x, &tmp_origin.x) == 0);
-        }
-        std::cout << c << " ";
-    }
-    std::cout << "\r\n";
-    for (int i = 0; i < 32; i++) {
-        std::cout << counts[i] << " ";
-    }
-}
-
 #include <csignal>
 // 信号处理函数
 void signalHandler(int signum)
@@ -105,7 +65,6 @@ void signalHandler(int signum)
 void work() {
     std::cout << "game starting..." << std::endl;
     play<Rho>();
-    //play<BabyGiant>();
 }
 
 #include <algorithm>
@@ -120,9 +79,10 @@ void work() {
 // 进程单例: 同一时刻只允许一个 test_bitcoin 进程
 //
 // 为什么要这个: 本程序的生产状态全在**exe 同目录**的那几个固定文件里 (iLog.txt /
-// RhoState2.txt / RhoReserve.txt / Dp32Edge.txt / Dp32EdgeState.txt ...), 而且是
-// **每轮整份重写**。两个实例同时跑, 后启动的那个会拿自己的状态覆盖前一个的落盘,
-// 边表还会互相穿插, 结果两边的进度一起作废 —— 而文件本身看不出是谁写坏的。
+// RhoState 存档 / RhoCpuStart.txt / DistinguishablePoints.txt / Dp32Edge.txt /
+// Dp32EdgeState.txt ...), 而且是**每轮整份重写**。两个实例同时跑, 后启动的那个会拿
+// 自己的状态覆盖前一个的落盘, 边表还会互相穿插, 结果两边的进度一起作废 —— 而文件本身
+// 看不出是谁写坏的。
 //
 // 实现用操作系统内核对象的独占, 不用"锁文件 + 手工删":
 //   Windows: 命名互斥体。进程消失 (正常退出 / Ctrl+C / 被 TerminateProcess) 时
@@ -827,6 +787,12 @@ int main(int argc, char* argv[])
     // 用法: test_EC.exe 2 -edge
     bool want_edge = false;
 
+    // CPU 侧 rho 换起点的来源 (默认 1 = 随机点)。
+    //   1 = 随机点; 2 = 特殊点序列 (adds_pub 的 256 条 + k*G 阶梯)。
+    // 与 GPU 预备队的来源配置是两回事, 详见 common.h 的 g_cpu_start_source。
+    // 用法: test_EC.exe 2 -cpusource 2   (取值只收 1 / 2, 其它值忽略并保持原样)
+    int cpu_source_arg = 0;   // 0 = 命令行没给, 用默认值 (不覆盖 g_cpu_start_source)
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (!arg.empty() && (arg[0] == '-' || arg[0] == '/')) arg.erase(0, 1);
@@ -838,8 +804,27 @@ int main(int argc, char* argv[])
         else if (arg == "validate") run_validate = true;
         else if (arg == "nohotkey") hotkey_enabled = false;
         else if (arg == "edge") want_edge = true;
+        else if (arg == "cpusource") {
+            // 带值参数: 吃掉下一个 argv。只认 1 / 2 —— 写错了宁可保持默认,
+            // 也不要静默跑到一个没人预期的来源上。
+            if (i + 1 < argc) {
+                const int v = std::atoi(argv[++i]);
+                if (v == 1 || v == 2) {
+                    cpu_source_arg = v;
+                } else {
+                    cprint() << "-cpusource 只接受 1 或 2 (收到 \"" << argv[i]
+                             << "\"), 忽略; 保持默认来源 1" << std::endl;
+                }
+            } else {
+                cprint() << "-cpusource 后面缺少取值 (1 或 2), 忽略; 保持默认来源 1" << std::endl;
+            }
+        }
     }
     g_use_edge_play = want_edge;
+    if (cpu_source_arg != 0) g_cpu_start_source = cpu_source_arg;
+    std::cout << "cpu start source: " << g_cpu_start_source << " ("
+              << (g_cpu_start_source == 2 ? "Special: adds_pub + k*G ladder" : "Random")
+              << ")" << std::endl;
     if (run_perf && run_validate) {
         cprint() << "perf 与 validate 不能同时跑" << std::endl;
         return 1;
@@ -883,8 +868,6 @@ int main(int argc, char* argv[])
         }
         work();
     }
-
-    //test();
 
     /* Logger::init();
     test_112_helper();

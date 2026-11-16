@@ -1266,8 +1266,8 @@ constexpr int RHO_GPU_WALKERS = 24;
 //   现在 P=2^12, 20 档早就够了 —— 但余量留着不吃亏 (只占 11 KB), 见 edge_window_slack。
 //
 // 其余联动项 (都已核对过, 不需要跟着改):
-//   · dp_buffer_size (110) 是**生产路**的槽位数, 同时决定 RhoStates_reserve 常量内存、
-//     rho.cpp 那扇滑窗的点数、RhoReserve.txt 的 "slots" 校验 —— 两边已解耦,
+//   · dp_buffer_size (110) 是**生产路**的槽位数, 同时决定 RhoStates_reserve 常量内存
+//     与 rho.cpp 那扇滑窗的点数 —— 两边已解耦,
 //     edge 用自己的一套设备内存 (edge_states_dev / edge_src_dev), 不碰 dp_buffer_size。
 //   · total_points = threads x W 由 rho_play_impl 按 EDGE 分档算出并传进来,
 //     dp32_edge_session 用同一个常量, 两处一致。
@@ -2358,13 +2358,13 @@ void get_optimal_block_size(int& grid_size, int& block_size)
               << ")" << std::endl;
 }
 
-extern RhoPoint adds_pub[2][256];
+extern RhoPoint adds_pub[256];
 
 void init_adds_pub_dev()
 {
     for (int i = 0; i < sizeof(adds_pub_dev) / sizeof(RhoPoint_dev); i++) {
         RhoPoint_dev t;
-        t.from(adds_pub[0][i]);
+        t.from(adds_pub[i]);
         CHECK_CUDA(cudaMemcpyToSymbol(adds_pub_dev, &t, sizeof(RhoPoint_dev), sizeof(RhoPoint_dev) * i, cudaMemcpyHostToDevice));
     }
 }
@@ -2377,8 +2377,7 @@ void init_adds_pub_dev()
 //
 // 池里放什么点 (从哪个来源取) 全在 rpc/rho.cpp —— 那是纯主机侧的逻辑, 不需要一行
 // CUDA 代码; 设备端只负责收下这一块常量内存。上传走下面这个函数 (唯一的跨 TU 接口),
-// "三条来源分别怎么取点、为什么只有 Special 需要游标" 的完整说明见 common.h 的
-// ReserveSource 那段。
+// "两种来源分别怎么取点" 的完整说明见 common.h 的 ReserveSource 那段。
 // ---------------------------------------------------------------------------
 
 // 把主机侧算好的槽位点整块拷进设备常量内存 (110 x 144B 一次 DMA, 每轮一次)。
@@ -2756,10 +2755,10 @@ void rho_rewalk_probe()
         return;
     }
 
-    // 步进表: 与 init_adds_pub_dev / perf_test_cpu 用的是同一份 adds_pub[0][*]。
+    // 步进表: 与 init_adds_pub_dev / perf_test_cpu 用的是同一份 adds_pub[*]。
     std::vector<RhoPoint_dev> adds(256);
     for (int i = 0; i < 256; i++) {
-        adds[i].from(adds_pub[0][i]);
+        adds[i].from(adds_pub[i]);
     }
     const int N = (int)starts.size();
     if (N <= 0) {
@@ -2905,7 +2904,18 @@ void init_RhoStates_test(int total_points)
     for (int i = 0; i < total_points - 1; i++) {
         t.from(r);
         CHECK_CUDA(cudaMemcpy(RhoStates_host + i, &t, sizeof(RhoPoint_dev), cudaMemcpyHostToDevice));
-        rho_F(ctx, r);
+        // 走一步: 以 x 首字节选加数, 加 (adds_pub[t].x), m/n 各累加一次。
+        // 与生产步进 (fun_add_w) 同一条口径, 就在这里内联。times 不参与:
+        // 链上只存 (x, m, n) —— RhoPoint_dev 根本没有 times 字段。
+        const unsigned step_t = (unsigned)r.x.data[0];
+        secp256k1_pubkey pk = r.x;
+        secp256k1_pubkey* ins[2] = {&pk, &adds_pub[step_t].x};
+        if (!secp256k1_ec_pubkey_combine(ctx, &r.x, ins, 2) ||
+            !secp256k1_ec_seckey_tweak_add(ctx, r.m, adds_pub[step_t].m) ||
+            !secp256k1_ec_seckey_tweak_add(ctx, r.n, adds_pub[step_t].n)) {
+            cprintf("init_RhoStates_test: lib call failed at step %d\n", i);
+            break;
+        }
     }
     // 尾槽 (total_points-1) 是独立填充点, 不接在链上, 专门作 DP 判据的被测样点。
     // m/n 取自 DistinguishablePoints.txt 的记录 (见 RHO_DP_TEST_*): 它自己的 x
@@ -3326,11 +3336,9 @@ static void rho_play_impl()
         // 初始化break_flag
         init_break_flag();
         // 预备队: 池子没有账本, 每轮现从来源取一窗点 (逻辑全在 rho.cpp)。
-        // persistent = true: 启动时回读 RhoReserve.txt (只有 2 类游标 + 轮号)。
-        // 不落盘的话游标重启归零, 头几段点跟上一次 run 逐字节重复 —— 重复的那批 DP
-        // 记录一条都排不上用场 (见 rho.cpp 那句 "进程级状态落盘")。
-        // ⚠ 来源配成 Random (当前配置) 时 rho.cpp 会把这条通道整个关掉: 既不回读也不
-        //   写盘, 那份存档原样留着给将来的 Dp/Special 用 (见 init_reserve_pool 的注释)。
+        // persistent = true 只表示"生产路径" —— 它让 3 类能真改盘上那两个 .bin,
+        // 并允许启动对账跑一次。来源配成 Random (当前配置) 时 rho.cpp 会把它关掉,
+        // 因为这一路根本不碰那两个 .bin (见 init_reserve_pool 的注释)。
         init_reserve_pool(dp_buffer_size, true);
         // 32 位 DP 库 (瘦索引: 源库 + 已征召库)。只有 3 类货源 (Dp) 从这儿取点,
         // 所以只在来源配成 Dp 时载索引; 载不进来这一类就回退随机点 (见 rho.cpp 的
@@ -3345,8 +3353,8 @@ static void rho_play_impl()
         (void)round_no;   // 轮号已不再进汇总行 (见 flush_round_rate), 留着只为可选调试
         while (!gameover) {
             // 停算期间停在这里 (有人在用本机, 见 common.h 的 set_compute_pause)。
-            // 上一轮末尾已经 save_reserve_state / save_RhoStates_dev 过, 所以停在这里
-            // 等于"数据落在盘上再停"。顺序与起点漫游路一致: 先等放行, 再清 break_flag。
+            // 上一轮末尾已经 save_RhoStates_dev 过, 所以停在这里等于"数据落在盘上再停"。
+            // 顺序与起点漫游路一致: 先等放行, 再清 break_flag。
             wait_while_paused();
             // ⚠ 必须是 gameover → break, 不能接着往下走: wait_while_paused 也会因为
             //   gameover 而返回, 而下一句 break_rho(false) 会把 stop_game() 刚立起来的
@@ -3361,7 +3369,7 @@ static void rho_play_impl()
             //   内核就会跑满一整轮才收尾。这里再补一次 —— 真立上了也只是在下个 poll 点
             //   (RHO_POLL_BATCHES ≈ 2.4 s) 多走一点点, 比整轮短三个量级。
             if (compute_pause_active() || gameover) break_rho(true);
-            // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由游标 + 来源现算
+            // 补员 + 上传: 这一轮池子里是哪 110 份点, 全由来源现算
             init_RhoStates_reserve();
             const auto t0 = std::chrono::steady_clock::now();
             rho_w<W><<<gridSize, blockSize>>>();
@@ -3376,7 +3384,6 @@ static void rho_play_impl()
             unsigned long long batches = 0;
             CHECK_CUDA(cudaMemcpyFromSymbol(&batches, rho_round_batches, sizeof(unsigned long long)));
             accum_round_rate("rho", secs, batches, total_points, W, gridSize, blockSize, hits);
-            save_reserve_state();
             save_RhoStates_dev(RhoStates_host, total_points, _RSFile2_name);
         }
         CHECK_CUDA(cudaFree(RhoStates_host));
@@ -3627,7 +3634,7 @@ void perf_test_cpu() {
     constexpr int W = RHO_GPU_WALKERS;
     RhoPoint_dev adds_pub_tmp[256];
     for (int i = 0; i < sizeof(adds_pub_tmp) / sizeof(RhoPoint_dev); i++) {
-        adds_pub_tmp[i].from(adds_pub[0][i]);
+        adds_pub_tmp[i].from(adds_pub[i]);
     }
     // 起点与 rho.cpp 的 bench_rho_walkers 一致: 第 k 个 walker 取表项 k
     RhoPoint_dev s[W];
@@ -4316,28 +4323,27 @@ void validate_test()
         }
         // "该不该来自来源"随来源变, 不能写死成"全随机池":
         //   1 类 每轮整窗随机, 所以一个槽位也不该标成来自来源;
-        //   2 类 货源无上限 (阶梯由游标现算), 每个槽位都该来自来源;
         //   3 类 受源库条数所限, 取不到就回退随机点, 只要求至少有一位。
+        // (2 类 Special 已经搬到 CPU 侧, GPU 预备队不再有这一类。)
         const ReserveSource rsrc = reserve_configured_source();
         if (rsrc == ReserveSource::Random) {
             HOST_ASSERT(tracked == 0);
-        } else if (rsrc == ReserveSource::Special) {
-            HOST_ASSERT(tracked == pool.size());
         } else {
             HOST_ASSERT(tracked >= 1);
         }
         printf("reserve pool: %d slots ok (%d sourced, source %s)\n", (int)dp_buffer_size,
                (int)tracked, reserve_source_name(rsrc));
     }
-    // 两条真货源的取点口径、以及状态存档的往返/兼容自测, 都在 rho.cpp 里 ——
-    // 预备队逻辑整段搬过去了。
-    // (上面 init_reserve_pool 用的是默认 persistent = false: 自检绝不碰生产存档。)
+    // 两条真货源的取点口径、CPU 侧换起点序列的口径 (adds_pub + k*G 阶梯) 与它的
+    // 游标存档往返自测, 都在 rho.cpp 里 —— 预备队逻辑整段搬过去了。
+    // (上面 init_reserve_pool 用的是默认 persistent = false: 自检绝不碰生产库/生产存档。)
     validate_reserve_supplies();
-    validate_reserve_state_file();
+    validate_cpu_start_points();
+    validate_cpu_start_state();
     // 32 位 DP 库的瘦索引 (载入 / 升序查找 / 墓碑 / 同索引多桶 / 坏库拒绝 / 真库抽样复算)
     validate_dp32_store();
     // 阶梯口径: create(m=1, n=0) 必须就是设备常量里的生成元 G —— "G, 2G, 3G..."
-    // 这条阶梯要是算错, 2 类来源整批都是废点, 而平时根本看不出来。设备常量 G 只在
+    // 这条阶梯要是算错, CPU 侧换起点整批都是废点, 而平时根本看不出来。设备常量 G 只在
     // 这里可见, 所以对拍只能放在这里。
     {
         RhoPoint one;
@@ -4361,11 +4367,11 @@ void validate_test()
 // 要证的就一条: 按**当前配置**建池 -> 从来源取点 -> 上传设备常量内存之后, 110 个槽位
 // 拿到的都是能独立起步、彼此不同的点; 来源配成 3 类时还必须是源库里的 32 位 DP。
 //
-// 前面几个自检都是拿局部游标验的 (special_point / dp_point 各一段),
-// 只有这里把"真库 + 真游标 + 上传"串成生产那一串 —— 库不在盘上、游标落进
+// 前面几个自检都是拿局部状态验的 (dp_point 一段, CPU 侧的 special_point 在 rho.cpp),
+// 只有这里把"真库 + 真状态 + 上传"串成生产那一串 —— 库不在盘上、扫描落进
 // 墓碑堆、上传偏移写错, 都只有这里看得见。
 //
-// persistent = false: 只读不写, 绝不碰生产存档 RhoReserve.txt。
+// persistent = false: 只读不写, 绝不碰生产库。
 void validate_reserve_prod_config()
 {
     const ReserveSource rsrc = reserve_configured_source();
@@ -4405,11 +4411,6 @@ void validate_reserve_prod_config()
         HOST_ASSERT(is_dp == pool.size());
         cprintf("reserve prod config: ok (%d slots, %d sourced, %d are 32-bit DP)\n",
                 (int)pool.size(), (int)sourced, (int)is_dp);
-    } else if (rsrc == ReserveSource::Special) {
-        // 2 类货源无上限 (阶梯由游标现算), 每个槽位都该来自来源。
-        HOST_ASSERT(sourced == pool.size());
-        printf("reserve prod config: ok (%d slots, %d sourced)\n", (int)pool.size(),
-               (int)sourced);
     } else {
         // 1 类每轮整窗随机: 一个槽位也不该标成来自来源。
         HOST_ASSERT(sourced == 0);

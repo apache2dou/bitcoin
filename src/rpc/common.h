@@ -48,7 +48,6 @@ extern int g_run_mode;
 //   要长期同时跑, 必须先把这两套设备符号按路拆开。
 extern bool g_use_edge_play;
 
-bool rho_F(secp256k1_context* ctx, RhoState& s);
 void set_int256(unsigned char* cn, const char* n);
 void set_int(unsigned char* cn, int64_t n);
 void create(const secp256k1_context* ctx, secp256k1_pubkey* pk, const unsigned char* m, const unsigned char* n);
@@ -65,7 +64,7 @@ std::string get_time();
 //
 // 目录只算一次 (函数内静态, C++11 起线程安全), 结果缓存在 data_dir() 里, **带尾部
 // 路径分隔符**; data_file() 拼叶子文件名, 并且顺手把叶子前面那段子目录建出来
-// (baby_map 这种), 免得调用方各自 create_directory。
+// (lambda_map 这种), 免得调用方各自 create_directory。
 //
 // 代价要知道: 数据跟 exe 绑在一起 —— 换个构建目录 (Debug/Release)、或者重编一次被
 // 清目录, 状态就"看不见"了 (不是丢了, 是在旧 exe 旁边)。所以想在构建目录之间共享
@@ -76,7 +75,7 @@ std::string data_file(const char* leaf);
 
 // 把文件内容真正刷到物理介质 (= POSIX fsync / Windows FlushFileBuffers)。定义在
 // blockchain.cpp。ofstream::flush 只交给操作系统页缓存, 掉电就丢, 所以凡是"重启后
-// 绝不能重发/绝不能丢"的状态 (预备队游标、源库墓碑、已征召库) 写完都要再刷一次。
+// 绝不能重发/绝不能丢"的状态 (CPU 侧换起点游标、源库墓碑、已征召库) 写完都要再刷一次。
 // 写完并 close 之后再调; 返回 false 表示刷不下去 (文件不存在/被占用/介质报错)。
 bool fsync_path(const std::string& path);
 
@@ -185,7 +184,7 @@ void validate_rho_affine();
 void rho_affine_prepare();
 
 // ---------------------------------------------------------------------------
-// 预备队 (RhoStates_reserve) 的来源 (没有账本)
+// 预备队 (RhoStates_reserve) 的来源
 //
 // 池子的唯一用途: 某个 walker 命中可区分点时, 用池里对应槽位的一份独立点把它的
 // (x, m, n) 整体顶替掉 (见 cuda.cu 的 reset_start_point), 让它从这份新起点继续走。
@@ -195,28 +194,24 @@ void rho_affine_prepare();
 // 逻辑全在 rpc/rho.cpp (纯主机侧, 一行 CUDA 代码都不需要)。设备端只保留那份
 // RhoStates_reserve 常量内存, 装载走 upload_RhoStates_reserve。
 //
-// 三条来源都不建账本: 每一轮现从来源处取一窗点, 取完就上传, 不记"谁在哪个槽位",
+// 两种来源都不建账本: 每一轮现从来源处取一窗点, 取完就上传, 不记"谁在哪个槽位",
 // 也不留履历。池子就是一扇滑动的窗 (与起点漫游路的 edge 池同一个套路)。
 // ---------------------------------------------------------------------------
 
 // 点的来源:
 //   Random  每轮整窗换新随机点 (也就是改造前的行为)
-//   Special 特殊点: 序列 = 步进表 adds_pub[0][*] 的 256 条, 之后按需现算 1G, 2G, 3G, ...
-//                   (阶梯无上限, 所以这一类取不完); 第 pos 条由 pos 现算
 //   Dp      可区分点: 32 位 DP 源库 DpSource32.bin 里的活记录 (库里 88.7 万条)。
 //           **每轮都从槽位 0 起扫, 墓碑跳过**, 取前 N 条 —— 不需要任何游标或账本:
 //           被征调用掉的点当场立墓碑, 于是"活记录"就是"还没用过", 上一轮取了没被
 //           征调的下轮仍在队首 (原样重发, 一条不丢)。
 // 当前的生产配置是整池统一 (见 rho.cpp 的 g_reserve_source)。
 //
-// 只有 2 类需要跨进程的游标 (序列走到第几条): 步进是确定性的, 起点定死则整条轨迹定死,
-// 同一个点入池两次走出的 (m,n) 完全相同, 产出的 DP 记录逐字节重复 —— 而碰撞要的是
-// "同一个 x 配不同的 (m,n)", 这种记录一条都排不上用场。所以那个游标每轮写进
-// RhoReserve.txt (格式见 rho.cpp 的"进程级状态落盘"一节)。
-// 3 类不需要游标 (墓碑位图本身就是账本), 1 类也没有进度可丢。
+// ⚠ 原来还有第二种来源 Special (adds_pub 的 256 条 + k*G 阶梯), 已整个搬到 **CPU 侧**
+//   (命令行 -cpusource 2, 见下面 g_cpu_start_source)。GPU 预备队只剩上面两路, 于是
+//   它**不再落任何状态文件** —— 两类都没有跨进程进度可丢 (Random 无进度, Dp 的进度
+//   就是源库墓碑位图)。曾经为 Special 游标准备的 RhoReserve.txt 也已随之取消。
 enum class ReserveSource {
     Random,
-    Special,
     Dp,
 };
 
@@ -225,20 +220,17 @@ ReserveSource reserve_configured_source();
 const char*   reserve_source_name(ReserveSource s);
 
 // 建池。slots = DP 缓冲区的槽位数 (cuda.cu 的 dp_buffer_size, 由 rho_play 传进来),
-// 只建一次 (轮号与 2 类游标跨轮存活)。persistent = true 时启动即回读 RhoReserve.txt
-// (生产路径 rho_play 用; validate 一律不碰盘, 免得自检把生产存档盖掉)。
+// 只建一次。persistent = 是不是生产路径: 只影响"3 类能不能真改盘上那两个 .bin"
+// 与"启动对账要不要跑" (生产路径 rho_play 传 true; validate 一律 false, 免得自检
+// 动到生产库)。
 void init_reserve_pool(size_t slots, bool persistent = false);
 // 每轮开跑前调一次: 从来源现取一窗点 + 整块传进设备常量内存。
 void init_RhoStates_reserve();
 // 轮末结算: 这一轮设备换起点了 dp_count 次 (注意不是**记录条数** —— GLV 之后一条
 // walker 一次命中可产生 1~3 条记录, 但只消费一个池位; 设备端由 reset_start_point
 // 的独立计数器 dp_reset_count 数着, 主机用 DpManager::last_reset_count() 取)。
-// 做两件事: 3 类被消费的那些池位对应的源库记录销账 (立墓碑 + 追加已征召库);
-// 2 类的游标推过被消费的那 dp_count 条 (1、3 类没有游标要推)。
+// 只做一件事: 3 类被消费的那些池位对应的源库记录销账 (立墓碑 + 追加已征召库)。
 void note_reserve_dps(unsigned int dp_count);
-// 把 2 类的货源游标与轮号落盘 (游标丢了 = 重启后重复用点, 所以每轮结束后都要落一次)。
-// 只在 init_reserve_pool(.., true) 之后有作用。
-void save_reserve_state();
 // 生产日志 (iLog.txt) 追加一行 —— 日志文件里的文本一律 UTF-8, 所以不走 cprint/
 // cprintf 那一层。rport 那些会改变两个 .bin 条数的事件 (预备点被征召销账) 走这里。
 // 定义在 blockchain.cpp; 日志没开 (g_log == nullptr) 时静默。
@@ -247,8 +239,9 @@ void ilog_line(const std::string& utf8);
 void upload_RhoStates_reserve(const RhoPoint* points, size_t count);
 
 // 验证用 (都定义在 rho.cpp):
-void validate_reserve_supplies();     // 真货源取点: 座标 -> 点自洽 + 序列不重复
-void validate_reserve_state_file();   // 状态存档往返 + 旧版兼容 + 坏档丢弃 (临时路径)
+void validate_reserve_supplies();     // 3 类取点: 座标 -> 点自洽 + 从 0 起扫的确定性
+void validate_cpu_start_points();     // CPU 侧序列: adds_pub 物化段 + k*G 阶梯口径
+void validate_cpu_start_state();      // CPU 侧游标存档往返 + 坏档丢弃 (临时路径)
 bool reserve_slot_sourced(size_t slot);   // 槽位这一轮的点是不是真来自来源
 // 定义在 cuda.cu: 按**当前配置**把生产启动那一步 (建池 -> 取满 -> 上传) 走一遍并逐槽
 // 核对 —— 换货源之后想知道"这套配置真能跑生产了吗"就调它, 不必跑全量 validate。
@@ -519,7 +512,7 @@ static_assert(RHO_WALKERS >= 1 && RHO_WALKERS <= RHO_WALKERS_MAX, "RHO_WALKERS �
 constexpr int RHO_STATE_SLOTS = 1024;
 
 // 定义在 rpc/rho.cpp: 一次推进连续的 W 个 RhoState (同一线程独占的一段)。
-// 每个 walker 走恰好一步, 语义与 blockchain.cpp 的 rho_F 一致。
+// 每个 walker 走恰好一步 (以 x 首字节选加数, 做一次仿射点加)。
 //
 // 返回 dp_mask: 第 i 位为 1 表示第 i 个 walker 本步命中 DP 点, 此时 rs[i]
 // 已被写回最新状态, 调用方可立即读取/存档; 未命中位对应的 rs[i] 是陈旧的
@@ -532,6 +525,40 @@ uint32_t rho_affine_FW(RhoState* rs);
 // 陈旧数据 (DP 命中率 2^-40, 常规运行中 rs 几乎从不被写)。
 template <int W>
 void rho_affine_flush(RhoState* rs);
+
+// ---------------------------------------------------------------------------
+// CPU 侧 rho 的"换起点来源" (命令行 -cpusource 设置, 默认 1)
+//
+// CPU 侧的 Rho 播放器在某个 walker 命中可区分点之后要给这个 walker 换一份新起点
+// (线程 0 除外 —— 它的轨迹本来就是"尽量长的一条链", 换起点等于把它截断)。
+// 换什么点由下面这个开关决定:
+//   1 = 随机点 (改造前的行为)。
+//   2 = 特殊点序列, 与 GPU 预备队的"来源 2"同一口径:
+//         pos < 256  -> 步进表 adds_pub[pos] 那 256 条
+//         pos >= 256 -> 阶梯第 k = pos - 255 级, 即 k*G
+//       第 pos 条由 pos 现算, 阶梯不物化也没有上限, 所以这一类取不完。
+//
+// ⚠ 这是**独立于** GPU 预备队的一份配置 (GPU 那边见 rho.cpp 的 g_reserve_source),
+//   不要合并: 计划是来源 2 以后只在 CPU 侧跑, GPU 预备队不再使用它。
+// ---------------------------------------------------------------------------
+extern int g_cpu_start_source;
+
+// 定义在 rpc/rho.cpp: 按 g_cpu_start_source 给 CPU 侧的某个 walker 换一份新起点,
+// 成功时**连同 times 一起清零** (线程局部缓存靠 times 判断外部重置, 只改点不改
+// times 会让这次重置静默失效)。
+//   返回 true  = 已换成来源给的点;
+//   返回 false = 当前配置是 1 类 (或者来源 2 的游标异常), 由调用方自己回退随机点。
+// 线程安全: 来源 2 的游标是原子的, 可以从任意 worker 线程调用。
+bool rho_cpu_next_start(RhoState& s);
+
+// 定义在 rpc/rho.cpp: CPU 侧序列游标的落盘 (独立文件 RhoCpuStart.txt; GPU 预备队那边
+// 已经没有需要游标的来源, 不落任何状态文件)。
+//   restore: play() 在起 worker 线程之前调一次, 回读"序列已发到第几条";
+//   save:    与 CPU 状态存档同节奏 (on_barrier / 退出时各一次)。
+// 两者都只在 g_cpu_start_source == 2 时真的读写 —— 1 类没有进度可丢, 碰这份存档只会
+// 把将来那次 run 的进度盖掉。
+void rho_cpu_start_restore();
+void rho_cpu_start_save();
 
 // 定义在 rpc/rho.cpp: 扫描 1/2/4/8 个 walker 的吞吐, 用来选 RHO_WALKERS
 void perf_test_rho_affine_walkers();

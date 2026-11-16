@@ -23,6 +23,7 @@
 #include "common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -233,24 +234,25 @@ static SECP256K1_INLINE void secp256k1_int_cmov(int *r, const int *a, int flag) 
 
 // 由 rpc/blockchain.cpp 定义
 extern secp256k1_context* ctx;
-extern RhoPoint adds_pub[2][256];
+extern RhoPoint adds_pub[256];
 
 // libsecp256k1 版本的点加测试循环: 与 cuda.cu 中 perf_fun 结构一致(80w 次点加 + DP 判定)
-// 点加使用 secp256k1_ec_pubkey_combine + seckey tweak, 与 blockchain.cpp 中 rho_F/fun_add 完全一致
+// 点加使用 secp256k1_ec_pubkey_combine + seckey tweak, 与 rho_affine_batch_selfcheck
+// 里那份参考实现完全一致
 static uint64_t perf_fun_lib(RhoState& s, uint64_t iters)
 {
     uint64_t count_rho = 0;
     uint32_t count_dp = 0;
     while (count_rho < iters) {
-        // 与 rho_F 一致: 以 x 坐标首字节作为加数下标
+        // 与生产/参考路径一律一致: 以 x 坐标首字节作为加数下标
         unsigned char t = s.x.data[0];
         secp256k1_pubkey pk = s.x;
-        secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t].x};
+        secp256k1_pubkey* ins[2] = {&pk, &adds_pub[t].x};
         int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
         assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_add(ctx, s.m, adds_pub[0][t].m);
+        r = secp256k1_ec_seckey_tweak_add(ctx, s.m, adds_pub[t].m);
         assert(r == 1);
-        r = secp256k1_ec_seckey_tweak_add(ctx, s.n, adds_pub[0][t].n);
+        r = secp256k1_ec_seckey_tweak_add(ctx, s.n, adds_pub[t].n);
         assert(r == 1);
         (void)r;
         count_rho++;
@@ -281,9 +283,9 @@ static uint64_t perf_fun_lib(RhoState& s, uint64_t iters)
 void perf_test_libsecp256k1()
 {
     RhoState s;
-    s.x = adds_pub[0][0].x;
-    memcpy(s.m, adds_pub[0][0].m, sizeof(s.m));
-    memcpy(s.n, adds_pub[0][0].n, sizeof(s.n));
+    s.x = adds_pub[0].x;
+    memcpy(s.m, adds_pub[0].m, sizeof(s.m));
+    memcpy(s.n, adds_pub[0].n, sizeof(s.n));
     s.times = 0;
 
     const auto start = std::chrono::steady_clock::now();
@@ -503,17 +505,17 @@ inline void rho_affine_add(secp256k1_fe& X, secp256k1_fe& Y, const RhoAffineAdd&
     Y = ny;
 }
 
-// 一次性把 adds_pub[0][*] 转换成普通域 + 肢体形式
+// 一次性把 adds_pub[*] 转换成普通域 + 肢体形式
 void rho_affine_init_adds()
 {
     if (g_affine_adds_ready) return;
     for (int i = 0; i < 256; ++i) {
         RhoGeStorage st;
-        memcpy(&st, adds_pub[0][i].x.data, sizeof(st));
+        memcpy(&st, adds_pub[i].x.data, sizeof(st));
         secp256k1_fe_from_storage(&g_affine_adds[i].x, &st.x);
         secp256k1_fe_from_storage(&g_affine_adds[i].y, &st.y);
-        be32_to_limbs(g_affine_adds[i].m, adds_pub[0][i].m);
-        be32_to_limbs(g_affine_adds[i].n, adds_pub[0][i].n);
+        be32_to_limbs(g_affine_adds[i].m, adds_pub[i].m);
+        be32_to_limbs(g_affine_adds[i].n, adds_pub[i].n);
     }
     g_affine_adds_ready = true;
 }
@@ -727,7 +729,7 @@ RhoCache<W>& rho_affine_cache()
 
 // 批量路径自检: 同一批 W 个 walker, 一路用 rho_affine_FW<W> (批量求逆) 推进,
 // 另一路逐个用库公开 API 推进 (secp256k1_ec_pubkey_combine + seckey_tweak_add,
-// 与生产 rho_F 的 fun_add 同一条路径), 每步逐项对比
+// 与 libsecp 逐点实现同一条路径), 每步逐项对比
 // 四元组 (x 存储字节 / m / n / times)。
 //
 // 参考侧直接在 RhoState 上步进 (每步一次库公开 API 点加), 与批量路径共用
@@ -739,9 +741,9 @@ bool rho_affine_batch_selfcheck(int steps)
     RhoState ref[W] = {};
 
     for (int i = 0; i < W; ++i) {
-        batch[i].x = adds_pub[0][i].x;
-        memcpy(batch[i].m, adds_pub[0][i].m, sizeof(batch[i].m));
-        memcpy(batch[i].n, adds_pub[0][i].n, sizeof(batch[i].n));
+        batch[i].x = adds_pub[i].x;
+        memcpy(batch[i].m, adds_pub[i].m, sizeof(batch[i].m));
+        memcpy(batch[i].n, adds_pub[i].n, sizeof(batch[i].n));
         batch[i].times = 0;
         ref[i] = batch[i];
     }
@@ -753,10 +755,10 @@ bool rho_affine_batch_selfcheck(int steps)
             // 加数索引与生产路径同口径: data[0] 即 x mod 256 (fe_storage 首字节)
             const unsigned t = (unsigned)ref[i].x.data[0];
             secp256k1_pubkey pk = ref[i].x;
-            secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t].x};
+            secp256k1_pubkey* ins[2] = {&pk, &adds_pub[t].x};
             if (!secp256k1_ec_pubkey_combine(ctx, &ref[i].x, ins, 2) ||
-                !secp256k1_ec_seckey_tweak_add(ctx, ref[i].m, adds_pub[0][t].m) ||
-                !secp256k1_ec_seckey_tweak_add(ctx, ref[i].n, adds_pub[0][t].n)) {
+                !secp256k1_ec_seckey_tweak_add(ctx, ref[i].m, adds_pub[t].m) ||
+                !secp256k1_ec_seckey_tweak_add(ctx, ref[i].n, adds_pub[t].n)) {
                 std::cout << "rho-affine batch selfcheck: W=" << W << " step " << s
                           << " walker " << i << " lib call failed" << std::endl;
                 return false;
@@ -789,9 +791,8 @@ bool rho_affine_batch_selfcheck(int steps)
 // 同线程多 walker 的对外入口
 // ---------------------------------------------------------------------------
 
-// 一次推进同一线程内连续的 W 个 walker。每个 walker 走恰好一步, 语义与
-// blockchain.cpp 的 rho_F 一致 (以 x 首字节选加数, 做一次仿射点加, m/n 各累加
-// 一次并 mod N, times++)。与逐点实现相比有两处不同:
+// 一次推进同一线程内连续的 W 个 walker。每个 walker 走恰好一步 (以 x 首字节选加数,
+// 做一次仿射点加, m/n 各累加一次并 mod N, times++)。与 libsecp 逐点实现相比有两处不同:
 //   1. W 个模逆被摊成了一次 (批量求逆);
 //   2. rs[i] 只在 DP 命中时写回 (概率 2^-40), 未命中步完全不碰那 136 字节 ——
 //      rs 的唯一消费者是 DP 判定和存档, 而存档走 flush 路径。
@@ -872,9 +873,9 @@ void bench_rho_walkers(uint64_t steps)
 {
     RhoState rs[W] = {};
     for (int i = 0; i < W; ++i) {
-        rs[i].x = adds_pub[0][i].x;
-        memcpy(rs[i].m, adds_pub[0][i].m, sizeof(rs[i].m));
-        memcpy(rs[i].n, adds_pub[0][i].n, sizeof(rs[i].n));
+        rs[i].x = adds_pub[i].x;
+        memcpy(rs[i].m, adds_pub[i].m, sizeof(rs[i].m));
+        memcpy(rs[i].n, adds_pub[i].n, sizeof(rs[i].n));
         rs[i].times = 0;
     }
 
@@ -1018,7 +1019,7 @@ void validate_rho_affine()
             rho_affine_store(s, rp);
 
             // combine 会先 memset 输出, 所以输出不能是输入之一
-            secp256k1_pubkey p = adds_pub[0][kJ].x, q = p, want;
+            secp256k1_pubkey p = adds_pub[kJ].x, q = p, want;
             secp256k1_pubkey* ins[2] = {&p, &q};
             if (!secp256k1_ec_pubkey_combine(ctx, &want, ins, 2) ||
                 memcmp(rp.x.data, want.data, sizeof(want.data)) != 0) {
@@ -1062,10 +1063,10 @@ void validate_rho_affine()
 
             // 期望: walker 0 = 2P, 标量取槽位 k 的 (覆盖只动了 x);
             //       walker 1 = 表项 j1 的点 + 表项 t1 的点, 标量取表项 t1 的
-            secp256k1_pubkey p0 = adds_pub[0][kJ].x, q0 = p0, want0;
-            secp256k1_pubkey p1 = adds_pub[0][j1].x, want1;
+            secp256k1_pubkey p0 = adds_pub[kJ].x, q0 = p0, want0;
+            secp256k1_pubkey p1 = adds_pub[j1].x, want1;
             secp256k1_pubkey* ins0[2] = {&p0, &q0};
-            secp256k1_pubkey* ins1[2] = {&p1, &adds_pub[0][t1].x};
+            secp256k1_pubkey* ins1[2] = {&p1, &adds_pub[t1].x};
             const unsigned tidx[2] = {k, t1};
             const secp256k1_pubkey* want[2] = {&want0, &want1};
             if (!secp256k1_ec_pubkey_combine(ctx, &want0, ins0, 2) ||
@@ -1081,8 +1082,8 @@ void validate_rho_affine()
                 limbs_to_be32(be_m, st[i].m);
                 limbs_to_be32(be_n, st[i].n);
                 const bool x_ok = memcmp(rp.x.data, want[i]->data, sizeof(want[i]->data)) == 0;
-                const bool m_ok = memcmp(be_m, adds_pub[0][tidx[i]].m, sizeof(be_m)) == 0;
-                const bool n_ok = memcmp(be_n, adds_pub[0][tidx[i]].n, sizeof(be_n)) == 0;
+                const bool m_ok = memcmp(be_m, adds_pub[tidx[i]].m, sizeof(be_m)) == 0;
+                const bool n_ok = memcmp(be_n, adds_pub[tidx[i]].n, sizeof(be_n)) == 0;
                 if (!x_ok || !m_ok || !n_ok) {
                     std::cout << "rho-affine doubling: walker " << i << " mismatch"
                               << " (x/m/n ok = " << x_ok << "/" << m_ok << "/" << n_ok << ")"
@@ -1109,25 +1110,23 @@ void rho_affine_prepare()
 }
 
 // ===========================================================================
-// 预备队 (RhoStates_reserve) 的来源 —— 没有账本
+// 预备队 (RhoStates_reserve) 的来源
 //
 // 位置说明: 这一整段都是纯主机侧逻辑, 不需要一行 CUDA 代码, 所以就在 rho.cpp;
 // 设备侧 (cuda.cu) 只留 RhoStates_reserve 那份常量内存 + 一个上传函数
 // upload_RhoStates_reserve。池子的用途见 common.h 的 ReserveSource 那段。
 //
-// 三条来源都不建账本: **每一轮现从来源处取一窗点**, 取完就上传, 不记"谁在哪个槽位",
+// 两条来源都不建账本: **每一轮现从来源处取一窗点**, 取完就上传, 不记"谁在哪个槽位",
 // 也不留履历。池子就是一扇滑动的窗 —— 与起点漫游路 (cuda.cu 的 dp32_edge_session)
 // 铺起点池是同一个套路。
 //
 //   1 类 Random   每轮整窗换新随机点 (改造前的行为)。
-//   2 类 Special  序列 = adds_pub[0][*] 的 256 条, 之后接无限阶梯 1G, 2G, 3G, ...
-//                 第 pos 条直接由 pos 现算 (阶梯不物化、没有上限, 所以取不完)。
 //   3 类 Dp       源库 DpSource32.bin 的活记录: **每轮从槽位 0 起扫, 墓碑跳过**。
 //
-// 只有 2 类需要跨进程的游标 (序列走到第几条), 因为它的"用过即退役"是**靠位置**保证的,
-// 位置丢了就只能重发。步进是确定性的: 起点定死则整条轨迹定死, 同一个点入池两次走出的
-// (m, n) 完全相同, 产出的 DP 记录逐字节重复 —— 而碰撞判定要的是"同一个 x 配不同的
-// (m, n)", 重复记录一条都排不上用场。所以游标必须落盘。
+// ⚠ 原来这里还有 "2 类 Special" (adds_pub 的 256 条 + k*G 阶梯), 已整个搬到 CPU 侧
+//   (命令行 -cpusource 2, 见本文件下面的 "CPU 侧换起点的来源" 一节, 取点函数就是
+//   special_point)。GPU 预备队不再有这一类, 于是也**不再需要跨进程游标** ——
+//   1 类没有进度可丢, 3 类的进度就是源库的墓碑位图。
 //
 // 3 类**什么游标都不需要** —— 源库的墓碑位图本身就是账本:
 //   · 被征调用掉的点当场立墓碑 (retire_dp_slot), 墓碑 = "这个点用过了";
@@ -1137,17 +1136,9 @@ void rho_affine_prepare()
 //   被征调的下轮已变墓碑, 自然被扫过 (这就是"不重发")。所以 3 类既不需要账本, 也不需要
 //   游标 —— 旧版存档里那 109 条"取过但一直没被征调"的留用点也会因此自动回到队里。
 //
-// 2 类的游标怎么推进 —— 这是"不记账也不浪费"的关键:
-//   设备端每轮换起点的次数 = dp_reset_count, 而 DpManager::save_dps 读完就把它清零,
-//   reset_start_point 里的 pi 又是从 0 起 atomicAdd, 所以一轮内被消费的池位**集合恰好
-//   是 {0, 1, ..., r-1}** (顺序不定, 但无重复无空洞)。于是下一轮的座标只要推到"本轮
-//   第 r 条取出来的点"那里就行 —— 没被消费的那些下轮原样再取一次; 它们没用过, 重取
-//   不会让轨迹重复, 所以既不浪费库存, 也不会重发。
-//
-// 于是 2、3 类的**来源数据一点不浪费**:
-//   · 2 类: 座标推过的每个点都已经真被用掉, 没推到的下轮原样重发, 一条不丢;
-//   · 3 类: 活记录一条不丢 (下轮仍在队里), 跳过的墓碑都是**以前**被征调用掉的。
-// 1 类是唯一"整窗换新"的来源, 但它的来源是随机数, 没有可浪费的库存。
+// 于是 3 类的**来源数据一点不浪费**: 活记录一条不丢 (下轮仍在队里), 跳过的墓碑都是
+// **以前**被征调用掉的。1 类是唯一"整窗换新"的来源, 但它的来源是随机数, 没有可浪费
+// 的库存。
 //
 // 池子大小是 dp_buffer_size, 而 reset_start_point 取用的池位下标不止到 max_size - 1
 // (max_size = dp_buffer_size - 20, 见 cuda.cu 的 edge_pool_size 那段):
@@ -1161,63 +1152,49 @@ void rho_affine_prepare()
 const char* reserve_source_name(ReserveSource s)
 {
     switch (s) {
-    case ReserveSource::Special: return "Special";
-    case ReserveSource::Dp:      return "Dp";
-    default:                     return "Random";
+    case ReserveSource::Dp: return "Dp";
+    default:                return "Random";
     }
-}
-
-// 反过来 (读状态存档用)。认不出来返回 false, 由调用方整份丢弃。
-static bool reserve_source_by_name(const std::string& s, ReserveSource& out)
-{
-    if (s == "Random")  { out = ReserveSource::Random;  return true; }
-    if (s == "Special") { out = ReserveSource::Special; return true; }
-    if (s == "Dp")      { out = ReserveSource::Dp;      return true; }
-    return false;
 }
 
 // 当前用哪一类来源。要换来源就改这一行 (不提供运行期切换)。
 //
-// 当前配置 = 1 类 (Random): 每轮整窗换新随机点, 不碰 RhoReserve.txt 的货源游标,
-// 也不载 32 位 DP 库 (cuda.cu 的 rho_play 按这个来源跳过 dp32_store_init, 见那边
-// EDGE=false 那一支)。这样生产路与 32 位 DP 库彻底解耦: 库只归起点漫游用。
+// 当前配置 = 1 类 (Random): 每轮整窗换新随机点, 也不载 32 位 DP 库 (cuda.cu 的
+// rho_play 按这个来源跳过 dp32_store_init, 见那边 EDGE=false 那一支)。这样生产路与
+// 32 位 DP 库彻底解耦: 库只归起点漫游用。
 //
-// 换回 3 类 (Dp) 时的前提 (改下面那一行即可, 其余代码不用动): 点从 DpSource32.bin
-// 的源库从 0 起扫活记录取, 库取完 (或库不在盘上) 就整窗回退随机点。换之前只需确认
-// 源库/已征召库在盘上 (不在就静默回退随机 —— 池子照跑, 只是又变回"全随机起点")。
+// 换成 3 类 (Dp) 时 (改下面那一行即可, 其余代码不用动): 点从 DpSource32.bin 的源库
+// 从 0 起扫活记录取, 库取完 (或库不在盘上) 就整窗回退随机点。换之前只需确认源库/
+// 已征召库在盘上 (不在就静默回退随机 —— 池子照跑, 只是又变回"全随机起点")。
 //
 // ⚠ 3 类**没有游标可对**: 状态就是源库的墓碑位图 + 已征召库。重新离线建库之后, 新库
 //   里没有旧墓碑, 于是旧进度就丢了 (那些点会被再发一遍) —— 要么别重建库, 要么重建后
-//   接受这一遍重发 (它不会被立墓碑, 只是白走一趟)。1、2 类与库完全无关, 不受影响。
+//   接受这一遍重发 (它不会被立墓碑, 只是白走一趟)。1 类与库完全无关, 不受影响。
 static ReserveSource g_reserve_source = ReserveSource::Random;
 
 // 给 cuda.cu 的 validate_test 用。
 ReserveSource reserve_configured_source() { return g_reserve_source; }
 
-// 2 类序列里物化段的条数 = 步进表 adds_pub[0][*] 那 256 条 (由声明数出来)。
+// CPU 侧序列里物化段的条数 = 步进表 adds_pub[*] 那 256 条 (由声明数出来)。
 // 越过物化段就是阶梯 (k*G), 不物化也不预生成, 由座标现算。
-constexpr size_t RHO_RESERVE_STEPS = sizeof(adds_pub[0]) / sizeof(adds_pub[0][0]);
+constexpr size_t RHO_SPECIAL_STEPS = sizeof(adds_pub) / sizeof(adds_pub[0]);
 
-// 预备队的**进程级状态**落盘路径 (只有游标 + 轮号, 格式见下面的存档一节)。
-// 只有生产路径 (rho_play) 读写它, validate 一律不碰。
-static const std::string RHO_RESERVE_STATE_FILE = data_file("RhoReserve.txt");
+// CPU 侧换起点序列的游标存档 (与上面那份**完全无关**, 两套配置各存各的)。
+// 只有 -cpusource 2 时读写; 格式见下面的"CPU 侧游标落盘"一节。
+static const std::string RHO_CPU_START_STATE_FILE = data_file("RhoCpuStart.txt");
 
-// 只需要一个跨进程游标: 2 类序列 (address 表 + 阶梯) 的"已经发出去多少条"。
-// 3 类**不需要游标** —— 源库的墓碑位图本身就是账本 (见 reserve_pull 的注释)。
-//   取值越大表示 2 类序列走得越远 (物化段与阶梯共用同一座标)。
-struct ReserveCursors {
-    uint64_t special = 0;
-};
-static ReserveCursors g_cursors;
-
-// 槽位没有对应的源库记录 (1、2 类 / 3 类回退的随机点)。
+// 只需要一个跨进程游标: CPU 侧特殊点序列 (address 表 + 阶梯) 的"已经发出去多少条"。
+// GPU 预备队**不需要任何游标** —— 1 类没有进度可丢, 3 类的墓碑位图本身就是账本
+// (见 reserve_pull 的注释)。CPU 侧那份游标存在 RhoCpuStart.txt, 不在这里。
+//
+// 槽位没有对应的源库记录 (1 类 / 3 类回退的随机点)。
 constexpr uint32_t RESERVE_NO_SLOT = 0xFFFFFFFFu;
 
 // 本轮这一窗点。三份记录各管一件事, 不能合并:
 //   slot_of      只有 3 类有值 (轮末销账要知道"这个槽位的点取自源库哪一条");
-//   from_source  三类都要能回答 (validate 靠它区分"真取到了"和"回退成随机点");
+//   from_source  两路都要能回答 (validate 靠它区分"真取到了"和"回退成随机点");
 //   points       实际灌进设备常量内存的那一窗点。
-// 1、2 类的座标直接由游标算得出来, 所以不需要 slot_of。
+// 1 类不需要 slot_of (它没有源库记录)。
 struct ReserveWindow {
     std::vector<RhoPoint> points;                // 槽位 -> 点
     std::vector<uint32_t> slot_of;               // 槽位 -> 源库槽位 (非 3 类恒 RESERVE_NO_SLOT)
@@ -1225,12 +1202,11 @@ struct ReserveWindow {
     ReserveSource         source = ReserveSource::Random;
 };
 static ReserveWindow g_window;
-// 池子槽位数 (0 = 没建池)。轮号跨轮存活, 只为日志连续。
+// 池子槽位数 (0 = 没建池)。
 static size_t   g_slots = 0;
-static uint64_t g_round = 0;
-// 是否读写状态存档 = 是不是生产路径 (只有 rho_play 打开; validate 一律不碰盘)。
-// 另外: 来源配成 Random 时即使传 persistent = true 也一律关掉 (见 init_reserve_pool) ——
-// 这个池子没有货源游标, 存档里那一项对它没意义, 读写只是在糟鸥别人的进度。
+// 是不是生产路径 (只有 rho_play 打开; validate 一律不碰盘)。
+// 它现在只控两件事: 3 类能不能真的改盘上那两个 .bin (自测必须走 DryRun),
+// 以及启动对账要不要跑。
 static bool g_reserve_persistent = false;
 
 // (m, n) -> 点: 现算 x 并自检。全零的 (m, n) 算出来是个非法点, 而 check() 比的是
@@ -1245,21 +1221,55 @@ static bool reserve_point_from_mn(const unsigned char* m, const unsigned char* n
     return check(ctx, &out.x, out.m, out.n) == 1;
 }
 
-// 2 类序列的第 pos 条 (pos 从 0 起):
-//   pos < 256   物化段: 步进表 adds_pub[0][pos] (它的 x/m/n 三者自洽, 装载时验过)
+// CPU 侧序列的第 pos 条 (pos 从 0 起):
+//   pos < 256   物化段: 步进表 adds_pub[pos] (它的 x/m/n 三者自洽, 装载时验过)
 //   pos >= 256  阶梯第 k = pos - 255 级, 即 k*G (create(m = k, n = 0), 大端)
-// 阶梯由 pos 现算, 不另存"走到第几级", 也没有上限 —— 所以 2 类取不完。
+// 阶梯由 pos 现算, 不另存"走到第几级", 也没有上限 —— 所以这一类取不完。
+//
+// ⚠ 这个函数只归 CPU 侧用 (-cpusource 2)。GPU 预备队已经没有"特殊点"这一类来源。
 static bool special_point(uint64_t pos, RhoPoint& out)
 {
-    if (pos < RHO_RESERVE_STEPS) {
-        return reserve_point_from_mn(adds_pub[0][pos].m, adds_pub[0][pos].n, out);
+    if (pos < RHO_SPECIAL_STEPS) {
+        return reserve_point_from_mn(adds_pub[pos].m, adds_pub[pos].n, out);
     }
-    const uint64_t k = pos - RHO_RESERVE_STEPS + 1;
+    const uint64_t k = pos - RHO_SPECIAL_STEPS + 1;
     if (k > 0x7FFFFFFFFFFFFFFFULL) return false;   // 存档被改坏了, 别让 set_int 截断
     unsigned char m[32] = {0};
     unsigned char n[32] = {0};
     set_int(m, (int64_t)k);
     return reserve_point_from_mn(m, n, out);
+}
+
+// ---------------------------------------------------------------------------
+// CPU 侧换起点的来源 (命令行 -cpusource, 见 common.h 的 g_cpu_start_source)
+//
+// 为什么是单独一份配置: g_reserve_source 管的是 GPU 预备队 (RhoStates_reserve 那份
+// 常量内存), 这里是 CPU 播放器自己给 walker 换起点。两者互不相干 —— 特殊点序列
+// 已经**只**在 CPU 侧存在 (GPU 预备队那边彻底删掉了), 合成一个开关只会让以后
+// 想改 GPU 侧的人莫名其妙地影响 CPU。
+//
+// 取点函数就是 special_point (adds_pub 的 256 条 + k*G 阶梯), 游标落盘在独立的
+// RhoCpuStart.txt 里 (见下面的"CPU 侧游标落盘")。
+// ---------------------------------------------------------------------------
+int g_cpu_start_source = 1;
+
+// "特殊点序列已经发出去多少条"。多个 worker 线程并发取, 所以是原子的;
+// 取值越大表示序列走得越远 (物化段与阶梯共用同一座标, 见 special_point)。
+static std::atomic<uint64_t> g_cpu_special_cursor{0};
+
+bool rho_cpu_next_start(RhoState& s)
+{
+    if (g_cpu_start_source != 2) return false;   // 1 类: 随机点, 由调用方自己 rand()
+    // 先领号再算点: 领了就作废, 不回退 (回退一个原子计数器本身就有竞态,
+    // 而且 special_point 只有在游标被改坏时才会失败, 回退也不解决问题)。
+    const uint64_t pos = g_cpu_special_cursor.fetch_add(1, std::memory_order_relaxed);
+    RhoPoint p;
+    if (!special_point(pos, p)) return false;
+    s.x = p.x;
+    memcpy(s.m, p.m, sizeof(s.m));
+    memcpy(s.n, p.n, sizeof(s.n));
+    s.times = 0;
+    return true;
 }
 
 // 3 类: 从源库槽位 *scan 起往后找下一条活记录 (墓碑跳过), 找到就把 *scan 推到它之后。
@@ -1355,7 +1365,6 @@ static bool reserve_dp_lib_ready()
 // 从来源现取一窗点填进 g_window。
 //
 //   1 类 Random  整窗新随机点, 不看任何状态。
-//   2 类 Special 从游标 g_cursors.special 按序取, 取不到的槽位回退随机点。
 //   3 类 Dp      **每轮都从源库槽位 0 开始扫**, 墓碑跳过, 取前 g_slots 条活记录。
 //
 // 3 类为什么从 0 扫而不延续上轮的扫描位置 —— 这就是"不建账本也不浪费"的全部奥妙:
@@ -1383,15 +1392,13 @@ static void reserve_pull()
     uint64_t scan = 0;                     // 3 类: 本轮的扫描位置 (每轮从 0 起)
     for (size_t i = 0; i < g_slots; ++i) {
         bool ok = false;
-        if (w.source == ReserveSource::Special) {
-            ok = special_point(g_cursors.special + i, w.points[i]);
-        } else if (w.source == ReserveSource::Dp) {
+        if (w.source == ReserveSource::Dp) {
             uint32_t slot = RESERVE_NO_SLOT;
             ok = dp_point(scan, w.points[i], &slot);
             if (ok) w.slot_of[i] = slot;
         }
-        // ⚠ 这两个记录必须分开: slot_of 只有 3 类有值, 而"是不是真来自来源"三类都要能
-        // 回答 (validate 靠它判断 2 类会不会整窗都回退成随机点)。
+        // from_source 与 slot_of 必须分开记: slot_of 只有 3 类有值, 而"是不是真来自
+        // 来源"两路都要能回答 (validate 靠它判断 3 类会不会整窗都回退成随机点)。
         w.from_source[i] = ok ? 1 : 0;
         if (!ok) w.points[i].rand();
     }
@@ -1448,76 +1455,53 @@ static RetireResult retire_dp_slot(uint32_t slot, const std::string& who)
     return RetireResult::Done;
 }
 
-// ============================ 进程级状态落盘 ============================
+// 原子落盘: 写 <path>.tmp -> 刷到物理介质 -> 覆盖式改名到 <path>。
 //
-// 为什么必须落盘: 2 类序列的座标 ("已经发出去多少条") 只在内存里, 进程一重启就归零,
-// 头几段点跟上一次 run **逐字节重复**。重复的危害不是多算了几条 —— 两者算出来的 x
-// 完全相同, 于是 DP 记录里 m/n 也完全相同, 而碰撞要的是"同一个 x 配不同的 (m, n)",
-// 这种记录一条都排不上用场, 纯属白烧算力。
+// 为什么不能直接写目标文件: 存档自己若被写到一半打断就报废, 那它防的"意外关机"
+// 就白防了。为什么 close() 之后还要 fsync: ofstream::flush 只把用户态缓冲交给
+// **操作系统**, 掉电时那些字节还在页缓存里 —— 名字换了、内容却没落盘, 读回来是
+// 空档或旧档。落不进盘就当这一轮没落 (调用方下一轮重试), 宁可重复几条也不假装成功。
 //
-// 3 类**不需要这个存档**: 它的状态就是源库的墓碑位图 + 已征召库, 两者每轮已经落盘。
-// 1 类也不需要 (随机点没有"进度"可丢)。
+// 改名用 std::filesystem::rename 而不是 std::rename: 前者在 Windows 上是
+// MoveFileEx(MOVEFILE_REPLACE_EXISTING), **一步覆盖、没有中间态**; std::rename
+// 目标已存在会直接失败 (EACCES), 那就只能"先删旧的再改名", 而那个窗口里如果改名
+// 也失败了, 存档就真没了 (游标归零 = 序列从头重发一遍)。这是唯一可能丢进度的
+// 路径, 所以必须堵住。
 //
-// 存档 (纯文本, RhoReserve.txt, 每轮 rho_play 落一次):
-//     RhoReserve 2                        版本号, 不认就整份丢掉
-//     round <n>                           当前轮号 (日志轮号跨进程连续)
-//     supply Special <n>                  2 类序列已经发出去的条数
-//     slots <n>                           槽位数 (只做告警: 与 dp_buffer_size 不符时提示)
-//
-// 向后兼容: 读侧只接受 1、2 两个版本 (没有 v3 —— 账本取消时直接把当时那份升成 2,
-// 因为"两个游标"的中间版本从未落过盘)。旧版 v1 还会写
-//     supply Dp <游标>                     —— 已无意义, 读到就忽略 (但名字得认得)
-//     slot <i> <来源> empty|held ...       —— 账本行, 读到就跳过
-// 所以已经跑了一段时间的来源 3 的进度**不需要靠游标继承** —— 墓碑位图本身就是进度,
-// 而从 0 起扫活记录的取点法会自然把旧版那些 "取过但没被征调" 的留用点重新排回队里。
-static bool reserve_state_write(const std::string& path, const ReserveCursors& cur,
-                                uint64_t round, size_t slots)
+// who: 出错时那句提示的前缀 (两份存档共用这一套落盘流程)。
+// 失败路径上**绝不删旧档** —— 旧档里的游标是唯一能让序列不重发的凭据。
+static bool write_text_atomic(const std::string& path, const std::string& body,
+                              const char* who)
 {
     const std::string tmp = path + ".tmp";
     {
         std::ofstream out(tmp, std::ios::trunc);
         if (!out.is_open()) {
-            std::cout << get_time() << " : reserve state: cannot write " << tmp << std::endl;
+            std::cout << get_time() << " : " << who << ": cannot write " << tmp << std::endl;
             return false;
         }
-        out << "RhoReserve 2\n";
-        out << "round " << round << '\n';
-        out << "supply Special " << cur.special << '\n';
-        out << "slots " << slots << '\n';
+        out << body;
         out.flush();
         if (!out) return false;
     }
-    // close() 之后先把它刷到物理介质, 再改名 —— 否则断电时可能出现"名字换了、内容还在
-    // 页缓存里"的中间态, 读回来是空档或旧档。落不进盘就当这一轮没落 (游标留在旧值,
-    // 下轮重试), 宁可重复几条也不假装成功。
     if (!fsync_path(tmp)) {
-        std::cout << get_time() << " : reserve state: fsync failed on " << tmp << std::endl;
+        std::cout << get_time() << " : " << who << ": fsync failed on " << tmp << std::endl;
         std::remove(tmp.c_str());
         return false;
     }
-    // 先写临时文件再原子替换 —— 存档自己若被写到一半打断就报废, 那它防的"意外关机"
-    // 就白防了。
-    //
-    // 用 std::filesystem::rename 而不是 std::rename: 前者在 Windows 上是
-    // MoveFileEx(MOVEFILE_REPLACE_EXISTING), **一步覆盖、没有中间态**; std::rename
-    // 目标已存在会直接失败 (EACCES), 那就只能"先删旧的再改名", 而那个窗口里如果改名
-    // 也失败了, 存档就真没了 (游标归零 = 2 类序列从头重发一遍)。这是唯一可能丢进度的
-    // 路径, 所以必须堵住。
     {
         std::error_code ec;
         std::filesystem::rename(tmp, path, ec);
         if (ec) {
             // 极少数文件系统不支持覆盖式改名: 退回到"旧档挪走 -> 新档就位"。
-            // ⚠ 这里**绝不删旧档**: 旧档里那个游标是唯一能让 2 类序列不重发的凭据,
-            //   为了这一次落盘把它删掉是本末倒置。挪不动就放弃这一轮 (下轮重试),
-            //   最多重复几条点, 绝不会丢进度。
+            // 挪不动就放弃这一轮 (下轮重试), 最多重复几条点, 绝不会丢进度。
             const std::string bak = path + ".bak";
             std::error_code ec2;
             std::filesystem::rename(path, bak, ec2);      // 旧档移到 .bak
             if (ec2) {
                 std::error_code ecr;
                 std::filesystem::remove(tmp, ecr);        // 只清临时档, 不动旧档
-                std::cout << get_time() << " : reserve state: cannot move old archive aside ("
+                std::cout << get_time() << " : " << who << ": cannot move old archive aside ("
                           << ec2.message() << "), skip this round" << std::endl;
                 return false;
             }
@@ -1529,7 +1513,7 @@ static bool reserve_state_write(const std::string& path, const ReserveCursors& c
                 std::filesystem::rename(bak, path, ec4);
                 std::error_code ec5;
                 std::filesystem::remove(tmp, ec5);
-                std::cout << get_time() << " : reserve state: cannot replace " << path
+                std::cout << get_time() << " : " << who << ": cannot replace " << path
                           << " (" << ec3.message() << ")" << std::endl;
                 return false;
             }
@@ -1540,117 +1524,117 @@ static bool reserve_state_write(const std::string& path, const ReserveCursors& c
     return true;
 }
 
-// 回读。任何一处不合都整份放弃 —— 存档担的是"别重复用点", 不该把一次坏存档变成一次
-// 崩溃, 也不该把游标读成另一个值。宁可从头开始 (游标归 0), 也不"尽力恢复"。
-static bool reserve_state_read(const std::string& path, ReserveCursors& cur,
-                               uint64_t& round, size_t slots)
+// ============================ CPU 侧游标落盘 ============================
+//
+// 为什么也要落盘: CPU 侧换起点用特殊点序列时, "序列已经发出去多少条"只在内存里,
+// 进程一重启就归零 —— 头几条特殊点跟上一次 run 走出的轨迹**逐字节相同**, 产出的
+// DP 记录也跟着重复, 而碰撞要的是"同一个 x 配不同的 (m, n)", 重复记录一条都排不
+// 上用场。命中率 2^-40, 量很小, 但既然有专门的存档位就顺手堵上。
+//
+// 为什么是独立文件: 这份存档属于 **CPU 播放器** (命令行 -cpusource 2), GPU 预备队
+// 那边已经没有需要游标的来源了 (1 类无进度, 3 类的进度就是墓碑位图), 它压根不再
+// 落任何状态文件。所以这里不需要跟谁共存 —— RhoCpuStart.txt 就是这一份的全部。
+//
+// 存档 (纯文本, RhoCpuStart.txt, 每次落盘由 play() 的 on_barrier 触发):
+//     RhoCpuStart 1                       版本号, 不认就整份丢掉
+//     cursor <n>                          序列已经发出去的条数
+//
+// 宁可丢进度也不"尽力恢复": 读不进来就从 0 开始 (最坏重发几条点)。
+static bool cpu_start_state_write(const std::string& path, uint64_t cursor)
+{
+    std::ostringstream body;
+    body << "RhoCpuStart 1\n";
+    body << "cursor " << cursor << '\n';
+    return write_text_atomic(path, body.str(), "cpu start state");
+}
+
+static bool cpu_start_state_read(const std::string& path, uint64_t& cursor)
 {
     std::ifstream in(path);
     if (!in.is_open()) return false;
 
     const auto discard = [&](const char* why) -> bool {
-        std::cout << get_time() << " : reserve state: discarded (" << why
+        std::cout << get_time() << " : cpu start state: discarded (" << why
                   << "), starting fresh" << std::endl;
         return false;
     };
 
     std::string line;
     if (!std::getline(in, line)) return discard("header");
-    // 1 = 最早那版 (后面跟账本行), 2 = 现在这份 (只有 2 类游标)。两种都认。
-    if (line != "RhoReserve 1" && line != "RhoReserve 2") return discard("header");
+    if (line != "RhoCpuStart 1") return discard("header");
 
-    bool have_round = false;
-    uint64_t r = 0;
-    ReserveCursors c;
+    bool have_cursor = false;
+    uint64_t c = 0;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         std::istringstream ls(line);
         std::string what;
         if (!(ls >> what)) continue;
-        if (what == "round") {
-            if (!(ls >> r)) return discard("round");
-            have_round = true;
-        } else if (what == "supply") {
-            std::string name;
-            uint64_t cursor = 0;
-            if (!(ls >> name >> cursor)) return discard("supply");
-            ReserveSource src = ReserveSource::Random;
-            if (!reserve_source_by_name(name, src)) return discard("supply name");
-            // 只有 2 类还有游标。旧版写的 "supply Dp <游标>" 已无意义 (3 类的状态
-            // 就是墓碑位图), 读到就忽略 —— 但名字要认得, 否则整份存档会被当成坏的。
-            if (src == ReserveSource::Special) {
-                c.special = cursor;
-                // 座标大得离谱说明存档被改坏了: 别让它变成一次巨大的 set_int。
-                if (c.special > (1ULL << 62)) return discard("cursor range");
-            }
-        } else if (what == "slots") {
-            size_t n = 0;
-            if (!(ls >> n)) return discard("slots");
-            // 槽位数对不上只是提示: 账本没了, 游标跟槽位数无关, 不该因此丢进度。
-            if (n != slots) {
-                std::cout << get_time() << " : reserve state: slots " << n
-                          << " != dp_buffer_size " << slots << " (游标照用)" << std::endl;
-            }
-        } else if (what == "slot") {
-            continue;   // 旧版的账本行: 已经没有账本了, 跳过 —— 兼容就靠这一行
+        if (what == "cursor") {
+            if (!(ls >> c)) return discard("cursor");
+            have_cursor = true;
+            // 座标大得离谱说明存档被改坏了: special_point 会一直失败, 于是每个槽位
+            // 都退化成随机点 —— 那是一种看不出来的静默降级。宁可作废整份存档。
+            if (c > (1ULL << 62)) return discard("cursor range");
         } else {
             return discard("unknown key");
         }
     }
-    if (!have_round) return discard("missing fields");
-    cur = c;
-    round = r;
+    if (!have_cursor) return discard("missing fields");
+    cursor = c;
     return true;
+}
+
+// 启动时回读游标 (只在 -cpusource 2 时)。play() 在起 worker 线程之前调一次。
+void rho_cpu_start_restore()
+{
+    if (g_cpu_start_source != 2) return;   // 1 类没有进度可丢, 也不该碰这份存档
+    uint64_t c = 0;
+    if (!cpu_start_state_read(RHO_CPU_START_STATE_FILE, c)) {
+        g_cpu_special_cursor.store(0, std::memory_order_relaxed);
+        std::cout << get_time() << " : cpu start state: starting fresh (no usable archive at "
+                  << RHO_CPU_START_STATE_FILE << ")" << std::endl;
+        return;
+    }
+    g_cpu_special_cursor.store(c, std::memory_order_relaxed);
+    std::cout << get_time() << " : cpu start state restored from " << RHO_CPU_START_STATE_FILE
+              << ": cursor " << c << std::endl;
+}
+
+// 落一次盘 (play() 的 on_barrier 里跟 CPU 状态存档一起触发, 退出时再落一次)。
+// 只在 -cpusource 2 时写: 1 类的游标恒为 0, 写它只会把将来那次 run 的进度盖掉。
+void rho_cpu_start_save()
+{
+    if (g_cpu_start_source != 2) return;
+    const uint64_t c = g_cpu_special_cursor.load(std::memory_order_relaxed);
+    cpu_start_state_write(RHO_CPU_START_STATE_FILE, c);
 }
 
 void init_reserve_pool(size_t slots, bool persistent)
 {
     g_slots = slots;
-    g_round = 0;
-    g_cursors = ReserveCursors();
     g_window = ReserveWindow();
     g_window.points.assign(slots, RhoPoint());
     g_window.slot_of.assign(slots, RESERVE_NO_SLOT);
     g_window.from_source.assign(slots, 0);
-    // 来源是 Random 时**整条存档通道关掉**: 这类池子没有货源游标, 读写只会踩别人的
-    // 进度。那份存档**原样留着**, 换回 Dp/Special 时接着用 (只改 g_reserve_source)。
-    g_reserve_persistent = persistent && g_reserve_source != ReserveSource::Random;
-    if (!g_reserve_persistent) return;
-
-    if (!reserve_state_read(RHO_RESERVE_STATE_FILE, g_cursors, g_round, slots)) {
-        std::cout << get_time() << " : reserve state: starting fresh (no usable archive at "
-                  << RHO_RESERVE_STATE_FILE << ")" << std::endl;
-        g_cursors = ReserveCursors();
-        g_round = 0;
-        return;
-    }
-    std::cout << get_time() << " : reserve state restored from " << RHO_RESERVE_STATE_FILE
-              << ": round " << g_round << ", cursor Special " << g_cursors.special
-              << std::endl;
-}
-
-// 落一次盘 (每轮 loop 末了一次, 紧跟 note_reserve_dps)。
-// Random 来源下 g_reserve_persistent 恒为 false (见 init_reserve_pool), 这里直接返回 ——
-// 不打开 RhoReserve.txt, 也不写它的 .tmp。
-void save_reserve_state()
-{
-    if (!g_reserve_persistent) return;
-    reserve_state_write(RHO_RESERVE_STATE_FILE, g_cursors, g_round, g_slots);
+    // persistent = 是不是生产路径。它现在只控两件事:
+    //   1) 3 类能不能真的改盘上那两个 .bin (自测必须走 DryRun);
+    //   2) 启动对账 (reserve_reconcile_drafted) 要不要跑 —— 那也会写墓碑。
+    // 来源是 Random 时一律关掉: 这一路根本不碰那两个 .bin。
+    g_reserve_persistent = persistent && g_reserve_source == ReserveSource::Dp;
 }
 
 // 重填预备队 (每轮 loop 开跑前一次): 从来源现取一窗点 + 整块上传 (设备常量内存)。
 void init_RhoStates_reserve()
 {
     if (g_slots == 0) return;
-    ++g_round;
     reserve_pull();
     upload_RhoStates_reserve(g_window.points.data(), g_window.points.size());
 }
 
-// 轮末结算: 这一轮设备实际**换了 dp_count 次起点** (= 被消费的池位数), 于是
-//   1) 3 类: 被消费的那些池位对应的源库记录销账 (立墓碑 + 追加已征召库);
-//   2) 2 类: 游标只推被消费的那几条 —— 没被征调的 [consumed, slots) 下轮原样再取。
-// 1、3 类都不推游标: 1 类每轮整窗随机; 3 类的状态就是墓碑位图本身。
+// 轮末结算: 这一轮设备实际**换了 dp_count 次起点** (= 被消费的池位数)。
+// 3 类销账: 被消费的那些池位对应的源库记录立墓碑 + 追加已征召库。
+// 1 类每轮整窗随机, 没有任何事要记。
 // 不能传记录条数: GLV 之后每步判 p / beta*p / beta^2*p 三个代表, 每个命中各记一条,
 // 但只有 p 自己命中才换起点 (reset_start_point), 所以记录条数 >= 换起点次数。
 // 调用方传 DpManager::last_reset_count()。
@@ -1676,20 +1660,12 @@ void note_reserve_dps(unsigned int dp_count)
         }
     }
 
-    // 2) 推游标。2 类只推被消费的那几条: 池位 {0..consumed-1} 才是真正上了 walker 的,
-    //    所以下轮从"座标 + consumed"接着取 —— 没被征调的 [consumed, slots) 原样再取
-    //    一次, 它们没用过, 重取不会让轨迹重复。于是 2 类也**不会浪费来源**:
-    //    游标推过的每一个点都已经真被用掉, 没推到的点一条不丢。
-    if (w.source == ReserveSource::Special) {
-        g_cursors.special += consumed;
-    }
-    // 1 类不动游标: 每轮整窗换新随机点, 没有"用过即退役"这回事。
-    // 3 类不动游标 (已没有游标): 被征调的那几条当场变墓碑, 下一轮从 0 扫时自然跳过。
+    // 2) 1 类什么都不用做: 每轮整窗换新随机点, 没有"用过即退役"这回事。
+    //    3 类也不推任何游标 —— 被征调的那几条当场变墓碑, 下一轮从 0 扫时自然跳过。
 
     if (consumed != 0) {
         std::cout << get_time() << " : reserve: " << consumed << " slot(s) consumed ("
                   << reserve_source_name(w.source) << ")";
-        if (w.source == ReserveSource::Special) std::cout << ", cursor Special " << g_cursors.special;
         if (w.source == ReserveSource::Dp) {
             const Dp32Store& lib = dp32_store();
             std::cout << ", 源库墓碑 " << lib.src_dead_count() << " 条 / 已征召库 "
@@ -1700,7 +1676,7 @@ void note_reserve_dps(unsigned int dp_count)
 }
 
 // 槽位这一轮的点是不是真来自来源 (而不是回退的随机点)。validate 用它, 生产代码不用。
-// 1 类恒 false; 2 类恒 true (阶梯无上限); 3 类源库见底时才会是 false。
+// 1 类恒 false; 3 类源库见底时才会是 false。
 bool reserve_slot_sourced(size_t slot)
 {
     return slot < g_window.from_source.size() && g_window.from_source[slot] != 0;
@@ -1720,28 +1696,27 @@ bool reserve_slot_sourced(size_t slot)
         } \
     } while (0)
 
-// 两条真货源各取几条, 验"座标 -> 点"的口径 (x/m/n 自洽) 与序列不重复。
-// 一律用**局部游标**, 不碰全局 g_cursors —— 那是生产状态。
-void validate_reserve_supplies()
+// CPU 侧换起点序列的取点口径自测: 物化段 256 条 + 无限阶梯, 座标直接算出点。
+// 这里只验"座标 -> 点", 不碰生产游标 (g_cpu_special_cursor)。
+void validate_cpu_start_points()
 {
-    // ---- 2 类: 物化段 256 条 + 无限阶梯, 座标直接算出点 ----
     {
         RhoPoint p;
-        // 物化段首条就是 adds_pub[0][0] (x/m/n 三者自洽, 装载时验过)
+        // 物化段首条就是 adds_pub[0] (x/m/n 三者自洽, 装载时验过)
         RESERVE_CHECK(special_point(0, p));
         RESERVE_CHECK(check(ctx, &p.x, p.m, p.n) == 1);
-        RESERVE_CHECK(memcmp(p.m, adds_pub[0][0].m, 32) == 0);
-        RESERVE_CHECK(memcmp(p.n, adds_pub[0][0].n, 32) == 0);
+        RESERVE_CHECK(memcmp(p.m, adds_pub[0].m, 32) == 0);
+        RESERVE_CHECK(memcmp(p.n, adds_pub[0].n, 32) == 0);
         // 物化段末条
-        RESERVE_CHECK(special_point(RHO_RESERVE_STEPS - 1, p));
-        RESERVE_CHECK(memcmp(p.m, adds_pub[0][RHO_RESERVE_STEPS - 1].m, 32) == 0);
-        RESERVE_CHECK(memcmp(p.n, adds_pub[0][RHO_RESERVE_STEPS - 1].n, 32) == 0);
+        RESERVE_CHECK(special_point(RHO_SPECIAL_STEPS - 1, p));
+        RESERVE_CHECK(memcmp(p.m, adds_pub[RHO_SPECIAL_STEPS - 1].m, 32) == 0);
+        RESERVE_CHECK(memcmp(p.n, adds_pub[RHO_SPECIAL_STEPS - 1].n, 32) == 0);
 
         // 阶梯第 k 级 = k*G: 连取三级 (k = 1, 2, 3), 验"k 由座标现算"、set_int 的
         // 大端字节序、"n = 0 就得到 k*G"的口径。"create(1,0) 就是设备常量里的 G"
         // 那条对拍要拿设备常量比, 放在 cuda.cu。
         for (unsigned char k = 1; k <= 3; ++k) {
-            RESERVE_CHECK(special_point(RHO_RESERVE_STEPS + k - 1, p));
+            RESERVE_CHECK(special_point(RHO_SPECIAL_STEPS + k - 1, p));
             RESERVE_CHECK(check(ctx, &p.x, p.m, p.n) == 1);
             RESERVE_CHECK(p.m[31] == k && p.m[30] == 0);                // 大端: k 落在最后一个字节
             for (int i = 0; i < 32; ++i) RESERVE_CHECK(p.n[i] == 0);    // n = 0 -> k*G
@@ -1749,14 +1724,19 @@ void validate_reserve_supplies()
 
         // 相邻两级必须不同 (游标只增不减 => 序列不重复)
         RhoPoint a, b;
-        RESERVE_CHECK(special_point(RHO_RESERVE_STEPS, a));
-        RESERVE_CHECK(special_point(RHO_RESERVE_STEPS + 1, b));
+        RESERVE_CHECK(special_point(RHO_SPECIAL_STEPS, a));
+        RESERVE_CHECK(special_point(RHO_SPECIAL_STEPS + 1, b));
         RESERVE_CHECK(memcmp(&a, &b, sizeof(a)) != 0);
 
-        std::cout << get_time() << " : reserve supply Special: " << RHO_RESERVE_STEPS
+        std::cout << get_time() << " : cpu start points: " << RHO_SPECIAL_STEPS
                   << " points (adds_pub) + ladder on demand (k from cursor) ok" << std::endl;
     }
+}
 
+// 3 类真货源的取点口径: 各取几条, 验"座标 -> 点"自洽 (x/m/n) 与从 0 起扫的确定性。
+// 用**局部扫描位置**, 不碰生产状态。
+void validate_reserve_supplies()
+{
     // ---- 3 类: 源库从 0 起扫活记录。库不在就只印一行 ----
     {
         if (!dp32_store_init() || !dp32_store().loaded()) {
@@ -1795,101 +1775,53 @@ void validate_reserve_supplies()
     }
 }
 
-// 状态存档自测: 写 -> 读 -> 逐项对拍, 再验"旧版 (带账本行) 的存档照样读得进来"。
-// 全程用 ".selftest" 临时路径, 绝不碰生产存档 RhoReserve.txt。
-void validate_reserve_state_file()
+// CPU 侧游标存档自测: 往返 + 坏档整份丢弃。全程用 ".selftest" 临时路径,
+// 绝不碰生产存档 RhoCpuStart.txt; 也不动 g_cpu_special_cursor (那是生产状态)。
+void validate_cpu_start_state()
 {
-    const std::string path = RHO_RESERVE_STATE_FILE + ".selftest";
-    const auto write = [&](const ReserveCursors& c, uint64_t r, size_t n) {
-        return reserve_state_write(path, c, r, n);
-    };
-    const auto read = [&](ReserveCursors& c, uint64_t& r, size_t n) {
-        return reserve_state_read(path, c, r, n);
-    };
+    const std::string path = RHO_CPU_START_STATE_FILE + ".selftest";
     const auto put = [&](const std::string& body) {
         std::ofstream out(path, std::ios::trunc);
         out << body;
     };
 
-    // ---- 往返: 游标与轮号一个不差 ----
+    // ---- 往返 ----
     {
-        ReserveCursors c1;
-        c1.special = 366;                 // 假装 2 类已经吃掉 366 条
-        RESERVE_CHECK(write(c1, 12, 4));
-        ReserveCursors c2;
-        uint64_t round = 0;
-        RESERVE_CHECK(read(c2, round, 4));
-        RESERVE_CHECK(c2.special == 366);
-        RESERVE_CHECK(round == 12);
+        RESERVE_CHECK(cpu_start_state_write(path, 987654321));
+        uint64_t c = 0;
+        RESERVE_CHECK(cpu_start_state_read(path, c));
+        RESERVE_CHECK(c == 987654321);
+
+        RESERVE_CHECK(cpu_start_state_write(path, 0));
+        uint64_t c0 = 0;
+        RESERVE_CHECK(cpu_start_state_read(path, c0));
+        RESERVE_CHECK(c0 == 0);
     }
 
-    // ---- 旧版兼容: 已经跑了一段时间的来源 3 (RhoReserve 1 + 账本行) ----
-    // 账本行与 "supply Dp" 都必须被**忽略**, 而 2 类游标照读。3 类的进度不靠这份
-    // 存档继承 (源库墓碑位图就是进度), 所以读不进来也不影响"不浪费"。
+    // ---- 坏档必须整份丢弃 (读不进来 -> 游标归 0, 最坏重发几条点) ----
     {
-        const std::string hexm(64, 'a');
-        const std::string hexn(64, 'b');
-        put("RhoReserve 1\n"
-            "round 9\n"
-            "supply Special 0\n"
-            "supply Dp 122\n"
-            "slots 4\n"
-            "slot 0 Dp empty\n"
-            "slot 1 Dp held 8 " + hexm + " " + hexn + "\n"
-            "slot 2 Dp empty\n");
-        ReserveCursors c3;
-        uint64_t round = 0;
-        RESERVE_CHECK(read(c3, round, 4));
-        RESERVE_CHECK(c3.special == 0);
-        RESERVE_CHECK(round == 9);
+        uint64_t c = 12345;
 
-        // 槽位数不符只告警、不丢进度
-        ReserveCursors c3b;
-        uint64_t round3b = 0;
-        RESERVE_CHECK(read(c3b, round3b, 7));
-        RESERVE_CHECK(round3b == 9);
+        put("RhoCpuStart 9\ncursor 5\n");                      // 版本号不认
+        RESERVE_CHECK(!cpu_start_state_read(path, c));
 
-        // 现在的写格式 (v2) 只有 2 类游标, 而且自己写得进读得出
-        ReserveCursors c5;
-        c5.special = 12345;
-        RESERVE_CHECK(write(c5, 7, 4));
-        ReserveCursors c6;
-        uint64_t round6 = 0;
-        RESERVE_CHECK(read(c6, round6, 4));
-        RESERVE_CHECK(c6.special == 12345 && round6 == 7);
-    }
+        put("RhoCpuStart 1\n");                                // 缺 cursor
+        RESERVE_CHECK(!cpu_start_state_read(path, c));
 
-    // ---- 坏存档必须**整份**丢弃, 而不是"尽力恢复"成一批半真半假的游标 ----
-    {
-        ReserveCursors c4;
-        uint64_t r4 = 0;
+        put("RhoCpuStart 1\ncursor 5\nwhat 1\n");              // 未知键
+        RESERVE_CHECK(!cpu_start_state_read(path, c));
 
-        put("RhoReserve 9\nround 1\n");                                // 版本号不认
-        RESERVE_CHECK(!read(c4, r4, 4));
+        put("RhoCpuStart 1\ncursor\n");                        // 游标缺失
+        RESERVE_CHECK(!cpu_start_state_read(path, c));
 
-        // v3 从未落过盘 (账本取消时直接把它升成了 2), 所以必须当坏档拒掉
-        put("RhoReserve 3\nround 1\n");
-        RESERVE_CHECK(!read(c4, r4, 4));
-
-        put("RhoReserve 2\n");                                        // 缺 round
-        RESERVE_CHECK(!read(c4, r4, 4));
-
-        put("RhoReserve 2\nround 1\nsupply Bogus 5\n");                // 来源名不认
-        RESERVE_CHECK(!read(c4, r4, 4));
-
-        put("RhoReserve 2\nround 1\nwhat 1\n");                        // 未知键
-        RESERVE_CHECK(!read(c4, r4, 4));
-
-        put("RhoReserve 2\nround 1\nsupply Special 5000000000000000000\n"); // 游标 > 2^62
-        RESERVE_CHECK(!read(c4, r4, 4));
-
-        put("RhoReserve 2\nround 1\nsupply Special\n");                // 游标缺失
-        RESERVE_CHECK(!read(c4, r4, 4));
+        // 大于 2^62 会让 special_point 一直失败 -> 每个槽位都静默退化成随机点,
+        // 所以必须当坏档拒掉, 不能"读进来再慢慢坏"。
+        put("RhoCpuStart 1\ncursor 5000000000000000000\n");
+        RESERVE_CHECK(!cpu_start_state_read(path, c));
     }
 
     std::remove(path.c_str());
-    std::cout << "reserve state file: ok (round-trip / v1 compat / discard on corrupt)"
-              << std::endl;
+    std::cout << "cpu start state file: ok (round-trip / discard on corrupt)" << std::endl;
 }
 
 #undef RESERVE_CHECK

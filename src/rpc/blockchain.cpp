@@ -2859,7 +2859,7 @@ std::string data_file(const char* leaf)
     std::string p = data_dir();
     if (leaf != nullptr) p += leaf;
 
-    // 顺手把叶子前面那段子目录建出来 (baby_map / lambda_map 这种)。建不出来不在这里
+    // 顺手把叶子前面那段子目录建出来 (lambda_map 这种)。建不出来不在这里
     // 报 —— 后面打开文件会失败, 那才是真正的失败点; 这里抛异常连静态初始化都会挂。
     const size_t cut = p.find_last_of("\\/");
     if (cut != std::string::npos && cut + 1 > data_dir().size()) {
@@ -2930,19 +2930,6 @@ std::string read_key() {
     return line;
 }
 
-static RecursiveMutex map_mutex;
-template <typename Map>
-void read_map(Map& _map, const std::string& filename)
-{
-    typename Map::key_type key;
-    typename Map::mapped_type value;
-    // 反序列化从文件
-    std::ifstream ifs(filename);
-    while (ifs >> key >> value) {
-        _map.insert({key, value});
-    }
-}
-
 class iLog
 {
 public:
@@ -2960,84 +2947,6 @@ public:
         ofs.close();
     }
 };
-
-template <typename Map>
-void save_map(Map& _map, const std::string& filename)
-{
-    LOCK(map_mutex);
-    // 将map对象序列化到文件中
-    std::ofstream ofs(filename);
-    for (const auto& kv : _map) {
-        ofs << kv.first << " " << kv.second << "\n";
-    }
-    ofs << std::flush; // 确保所有数据都被写入
-}
-
-void read_map(std::vector<uint64_t>& x, std::vector<uint64_t>& m, uint64_t num, const std::string& name)
-{
-    std::string baseFileName = name + "_map";
-    std::string directory = data_file((name + "_map\\").c_str());
-    std::vector<std::ifstream> fileStreams;
-    typedef struct {
-        uint64_t value;
-        int index;
-    } tp;
-    std::multimap<uint64_t, tp> tmp_map;
-    int index = 0;
-    try {
-        for (const auto& entry : fs::directory_iterator(directory)) {
-            if (entry.is_regular_file()) {
-                std::string fileName = entry.path().filename().string();
-                if (fileName.starts_with(baseFileName)) { // C++20 特性
-                    uint64_t base;
-                    std::string tmp = baseFileName + "%llu.txt";
-                    sscanf(fileName.c_str(), tmp.c_str(), &base);
-                    if (num != 0 && base >= num) {
-                        continue;
-                    }
-
-                    std::ifstream file(entry.path());
-                    if (!file.is_open()) {
-                        throw std::runtime_error("Failed to open file: " + fileName);
-                    }
-                    uint64_t key;
-                    uint64_t value;
-                    file >> key >> value;
-                    fileStreams.push_back(std::move(file));
-                    tp _t;
-                    _t.value = value;
-                    _t.index = index++;
-                    tmp_map.insert({key, _t});
-                    std::cout << "Successfully opened file: " << fileName << std::endl;
-                }
-            }
-        }
-        //简单检测一下
-        assert(tmp_map.size() == index);
-        auto it = tmp_map.begin();
-        while (it != tmp_map.end()) {
-            x.push_back(it->first);
-            m.push_back(it->second.value);
-            uint64_t key;
-            uint64_t value;
-            if (fileStreams[it->second.index] >> key >> value) {
-                tp _t;
-                _t.value = value;
-                _t.index = it->second.index;
-                tmp_map.insert({key, _t});
-            }
-            tmp_map.erase(it);
-            it = tmp_map.begin();
-        }
-
-        // 关闭文件
-        for (auto& file : fileStreams) {
-            file.close();
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-    }
-}
 
 #include <util/strencodings.h>
 #include "../../secp256k1/include/secp256k1.h"
@@ -3161,14 +3070,12 @@ int g_run_mode = 2; // 默认模式2：multiple=1，CPU 1/4 核
 bool g_use_edge_play = false;
 void break_rho(bool f);
 
-static int64_t BabyNUM = 0x3fffffff;
 static const CPubKey cpbkeyMVP(ParseHex("048fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
 // 去掉 static: rpc/rho_lab.cpp 的 k40 要拿它的倍数当起点/当基准点 (extern 声明在那边)。
 secp256k1_pubkey pk_mvp;
 
-RhoPoint adds_pub[2][256] = {0};
-
-int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs);
+// 步进表: 256 条 (x, m, n) 自洽的点, 按 x 首字节选下标。
+RhoPoint adds_pub[256] = {0};
 
 // ---------------------------------------------------------------------------
 // 计算暂停 (有人在用机器就停算)。语义见 common.h 的同名声明。
@@ -3234,19 +3141,12 @@ public:
         ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
         secp256k1_ec_pubkey_parse(ctx, &pk_mvp, cpbkeyMVP.data(), cpbkeyMVP.size());
 
-        for (int i = 0; i < sizeof(adds_pub[0]) / sizeof(adds_pub[0][0]); i++) {
-            memcpy(adds_pub[0][i].x.data, ParseHex(steps[i * 3]).data(), sizeof(adds_pub[0][i].x));
-            memcpy(adds_pub[0][i].m, ParseHex(steps[i * 3 + 1]).data(), sizeof(adds_pub[0][i].m));
-            memcpy(adds_pub[0][i].n, ParseHex(steps[i * 3 + 2]).data(), sizeof(adds_pub[0][i].n));
+        for (int i = 0; i < sizeof(adds_pub) / sizeof(adds_pub[0]); i++) {
+            memcpy(adds_pub[i].x.data, ParseHex(steps[i * 3]).data(), sizeof(adds_pub[i].x));
+            memcpy(adds_pub[i].m, ParseHex(steps[i * 3 + 1]).data(), sizeof(adds_pub[i].m));
+            memcpy(adds_pub[i].n, ParseHex(steps[i * 3 + 2]).data(), sizeof(adds_pub[i].n));
 
-            assert(check(ctx, &adds_pub[0][i].x, adds_pub[0][i].m, adds_pub[0][i].n));
-
-            adds_pub[1][i] = adds_pub[0][i];
-            secp256k1_ec_pubkey_negate(ctx, &adds_pub[1][i].x);
-            secp256k1_ec_seckey_negate(ctx, adds_pub[1][i].m);
-            secp256k1_ec_seckey_negate(ctx, adds_pub[1][i].n);
-
-            assert(check(ctx, &adds_pub[1][i].x, adds_pub[1][i].m, adds_pub[1][i].n));
+            assert(check(ctx, &adds_pub[i].x, adds_pub[i].m, adds_pub[i].n));
         }
     }
     ~INIT()
@@ -3272,46 +3172,6 @@ void set_int(unsigned char* cn, int64_t n) {
     cn[25] = p[6];
     cn[24] = p[7];
 };
-
-int64_t buildBabyMap(std::multimap<uint64_t, uint64_t>& _map, int64_t num, uint64_t base)
-{
-    if (num <= 0)
-        return 0;
-    unsigned char cone[33] = {0};
-    cone[31] = 0x01;
-    _map.clear();
-    auto pushKey = [](std::multimap<uint64_t, uint64_t>& m, secp256k1_pubkey& pk, uint64_t n) {
-        static RecursiveMutex _mutex;
-        LOCK(_mutex);
-        uint64_t t = *(uint64_t*)pk.data;
-        m.insert({t, n});
-    };
-    auto calc = [&](uint64_t _n, uint64_t _b) {
-        secp256k1_pubkey pk_tmp = {0};
-        unsigned char cb[33] = {0};
-        set_int(cb, _b);
-        secp256k1_ec_pubkey_create(ctx, &pk_tmp, cb);
-        pushKey(_map, pk_tmp, _b);
-        for (uint64_t i = 1; i < _n; i++) {
-            secp256k1_ec_pubkey_tweak_add(ctx, &pk_tmp, cone);
-            pushKey(_map, pk_tmp, i + _b);
-        }
-    };
-
-    std::vector<std::thread> threads;
-    int n_tasks = std::max(1u, std::thread::hardware_concurrency()/2);
-    threads.reserve(n_tasks);
-    for (int i = 0; i < n_tasks; ++i) {
-        uint64_t n = num / n_tasks;
-        uint64_t b = base + i * n;
-        if (i == n_tasks - 1) n += num % n_tasks;
-        threads.emplace_back(calc, n, b);
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-    return base + num;
-}
 
 bool isZero(const unsigned char* m) {
     char t[32] = {0};
@@ -3347,118 +3207,6 @@ int check(const secp256k1_context* ctx, const secp256k1_pubkey* pk, const unsign
         return ret == 0 ? 1 : -1;
     }
     return 0; 
-}
-
-int64_t find_baby(secp256k1_context* ctx, const std::vector<uint64_t>& _x, const std::vector<uint64_t>& _m, const secp256k1_pubkey& pk)
-{
-    uint64_t t = *(uint64_t*)pk.data;
-    auto i = std::lower_bound(_x.begin(), _x.end(), t);
-    while (i != _x.end() && t == *i) {
-        std::ptrdiff_t index = std::distance(_x.begin(), i);
-        auto n = _m[index];
-
-        unsigned char c0[33] = {0};
-        unsigned char cn[33] = {0};
-
-        if (n > 0) {
-            set_int(cn, n);
-            int c = check(ctx, &pk, cn, c0);
-            if (c != 0)
-                return n * c;
-        }
-        i++;
-    }
-    return 0;
-}
-
-bool giantStep(secp256k1_context* ctx, RhoState& s) {
-    static unsigned char cb[33] = {0};
-    static secp256k1_pubkey pk_b = {0};
-    if (pk_b.data[0] == 0 && pk_b.data[4] == 0) {
-        set_int(cb, BabyNUM * 2);
-        secp256k1_ec_pubkey_create(ctx, &pk_b, cb);
-    }
-    secp256k1_pubkey pk_ = s.x;
-    secp256k1_pubkey* ins[2] = {&pk_, &pk_b};
-    int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
-    assert(r == 1);
-    r = secp256k1_ec_seckey_tweak_add(ctx, s.m, cb);
-    assert(r == 1);
-    s.times++;
-    return true;
-}
-
-int giantStepi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs)
-{
-    int count = 0;
-    secp256k1_pubkey pk_;
-
-    static unsigned char cb_neg[33] = {0};
-    static secp256k1_pubkey pk_b_neg = {0};
-    if (pk_b_neg.data[0] == 0 && pk_b_neg.data[4] == 0) {
-        set_int(cb_neg, BabyNUM * 2);
-        secp256k1_ec_seckey_negate(ctx, cb_neg);
-        secp256k1_ec_pubkey_create(ctx, &pk_b_neg, cb_neg);
-    }
-    const secp256k1_pubkey* ins2[2] = {&src_rs->x, &pk_b_neg};
-    secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
-
-    ret_rs[count].x = pk_;
-    memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
-    memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
-    secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, cb_neg);
-    count++;
-
-    return count;
-}
-
-auto fun_add = [](RhoPoint& s, unsigned char t) {
-    secp256k1_pubkey pk = s.x;
-    secp256k1_pubkey* ins[2] = {&pk, &adds_pub[0][t].x};
-    int r = secp256k1_ec_pubkey_combine(ctx, &s.x, ins, 2);
-    assert(r == 1);
-    r = secp256k1_ec_seckey_tweak_add(ctx, s.m, adds_pub[0][t].m);
-    assert(r == 1);
-    r = secp256k1_ec_seckey_tweak_add(ctx, s.n, adds_pub[0][t].n);
-    assert(r == 1);
-};
-
-auto fun_mul = [](RhoPoint& s, unsigned char t) {
-    unsigned char _mul_n[33] = {0};
-    _mul_n[31] = t;
-    int r = secp256k1_ec_pubkey_tweak_mul(ctx, &s.x, _mul_n);
-    assert(r == 1);
-    r = secp256k1_ec_seckey_tweak_mul(ctx, s.m, _mul_n);
-    assert(r == 1);
-    r = secp256k1_ec_seckey_tweak_mul(ctx, s.n, _mul_n);
-    assert(r == 1);
-};
-bool rho_F(secp256k1_context* ctx, RhoState& s)
-{
-    //printf("%d ", s.x.data[0]);
-    fun_add(s, s.x.data[0]);
-    s.times++;
-    return true;
-}
-
-int rho_Fi(const secp256k1_context* ctx, const RhoState* const src_rs, RhoState* ret_rs)
-{
-    int count = 0;
-    secp256k1_pubkey pk_;
-        
-    for (int i = 0; i < sizeof(adds_pub[0]) / sizeof(adds_pub[0][0]); i++) {
-        const secp256k1_pubkey* ins2[2] = {&src_rs->x, &adds_pub[1][i].x};
-        secp256k1_ec_pubkey_combine(ctx, &pk_, ins2, 2);
-        if (pk_.data[0] == i) {
-            ret_rs[count].x = pk_;
-            memcpy(ret_rs[count].m, src_rs->m, sizeof(src_rs->m));
-            memcpy(ret_rs[count].n, src_rs->n, sizeof(src_rs->n));
-            secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].m, adds_pub[1][i].m);
-            secp256k1_ec_seckey_tweak_add(ctx, ret_rs[count].n, adds_pub[1][i].n);
-            count++;
-        }
-    }
-    return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -3577,7 +3325,7 @@ BingoResult bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp1, con
 }
 
 // 三参数版: 把 m 折成一份 (|m|, 0) 记录再调上面那个 (m < 0 时取负)。只要"解出了 k"
-// 这一个 bit, 所以仍旧返回 bool —— 生产上的 BabyGiant::shoot 用的就是它。
+// 这一个 bit, 所以仍旧返回 bool —— 碰撞判定只需要"成不成"这一个结论。
 bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp, int m)
 {
     SecPair sp2 = {0};
@@ -3589,45 +3337,6 @@ bool bingo(const secp256k1_context* ctx, CKey& r, const SecPair& sp, int m)
 }
 
 #include <chrono>
-// 将vector保存到文件
-template <typename T>
-void saveVectorToFile(const std::vector<T>& vec, const std::string& filename)
-{
-    std::ofstream outFile(filename, std::ios::binary);
-    if (outFile.is_open()) {
-        // 写入vector的大小
-        size_t size = vec.size();
-        outFile.write(reinterpret_cast<const char*>(&size), sizeof(size));
-        // 写入vector的元素
-        outFile.write(reinterpret_cast<const char*>(vec.data()), size * sizeof(T));
-        outFile.close();
-    } else {
-        cprintf("无法打开文件: %s\n", filename.c_str());
-    }
-}
-
-// 从文件加载vector
-template <typename T>
-std::vector<T> loadVectorFromFile(const std::string& filename, uint64_t count = 0)
-{
-    std::vector<T> vec;
-    std::ifstream inFile(filename, std::ios::binary);
-    if (inFile.is_open()) {
-        // 读取vector的大小
-        size_t size;
-        inFile.read(reinterpret_cast<char*>(&size), sizeof(size));
-        if (count != 0 && count < size) {
-            size = count;
-        }
-        vec.resize(size);
-        // 读取vector的元素
-        inFile.read(reinterpret_cast<char*>(vec.data()), size * sizeof(T));
-        inFile.close();
-    } else {
-        cprintf("无法打开文件: %s\n", filename.c_str());
-    }
-    return vec;
-}
 
 
 // ---------------------------------------------------------------------------
@@ -3688,35 +3397,12 @@ static bool dp40_index_matches(const secp256k1_context* ctx, const SecPair& sp, 
     return dp40_index_from_x(pk.data, idx) && stored == idx;
 }
 
-auto loadDP = [](std::ifstream& fs, std::map<uint64_t, SecPair>& dpMap) {
-    std::string line;
-    if (fs.is_open()) {
-        while (std::getline(fs, line)) {
-            uint64_t dp_index;
-            SecPair sp;
-            sscanf(line.c_str(), "%llu", &dp_index);
-            std::getline(fs, line);
-            memcpy(sp.m, ParseHex(line).data(), sizeof(sp.m));
-            std::getline(fs, line);
-            memcpy(sp.n, ParseHex(line).data(), sizeof(sp.n));
-
-            secp256k1_pubkey x_tmp;
-            create(ctx, &x_tmp, sp.m, sp.n);
-            assert(dp40_index_matches(ctx, sp, dp_index));
-            assert(dpMap.find(dp_index) == dpMap.end());
-            dpMap[dp_index] = sp;
-        }
-    }
-};
-
 unsigned char randChar() {
     unsigned char rnd[8];
     GetStrongRandBytes(rnd);
     return rnd[7];
 }
 
-static const std::string _Xvec_name = data_file("baby_map\\Xvec.bin");
-static const std::string _Mvec_name = data_file("baby_map\\Mvec.bin");
 static const std::string _DPFile_name = data_file("DistinguishablePoints.txt");
 
 auto saveDP = [](std::ofstream& fs, uint64_t index, const SecPair& sp) {
@@ -4747,63 +4433,6 @@ void validate_dp32_corpus(Dp32CorpusTarget target)
     DP32_CHECK(verdict != Dp32CorpusVerdict::Mismatch);   // 对不上: 上面两行已写清两边条数
 }
 
-class BabyGiant
-{
-private:
-    std::vector<uint64_t> _Xvec;
-    std::vector<uint64_t> _Mvec;
-    iLog _dplog;
-
-public:
-    // 巨人步每条都要查表, 凑不出批量求逆, 固定单 walker
-    static constexpr int WALKERS0 = 1;
-    static constexpr int WALKERS = 1;
-
-    BabyGiant() : _dplog(_DPFile_name) {}
-    // 它每步都直接写 rs, 无缓存, 无需 flush (接口对齐 Rho)
-    void flush(const int i, RhoState* rs) {}
-    void prepare()
-    {
-        //先load _Mvec, 好让它早点儿被swapout
-        _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
-        _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
-        BabyNUM = _Xvec.size();
-        assert(_Xvec.size() == _Mvec.size());
-    }
-    bool shoot(const int i, RhoState* rs, unsigned int& count_dstg, std::string& log)
-    {
-        giantStep(ctx, rs[0]);
-        auto b = find_baby(ctx, _Xvec, _Mvec, rs[0].x);
-        if (b != 0) {
-            CKey k;
-            if (bingo(ctx, k, rs[0], b)) {
-                save_key(k);
-            } else {
-                log += "!!!!short circulation!!!!\n";
-            }
-            return false;
-        }
-        // GLV: 与 Rho::shoot / 设备端 rho_w 同一口径 —— p / beta*p / beta^2*p 各判一次,
-        // 命中的各记一条, 且存的是**命中那个代表自己的** (m, n) (glv_scale_pair)。
-        // 换起点只看 p 自己是否命中, 与设备端 reset 只有 dp[0] 为真一致。
-        uint64_t orbit[3];
-        dp40_index_orbit(ctx, rs[0], orbit);
-        if (orbit[0] != 0 || orbit[1] != 0 || orbit[2] != 0) {
-            ++count_dstg;   // 与 Rho::shoot 同口径: 一条 walker 命中一次数一次
-            for (int j = 0; j < 3; ++j) {
-                if (orbit[j] == 0) continue;
-                const SecPair sj = glv_scale_pair(ctx, rs[0], glv_lambda_pow(j));
-                saveDP(_dplog.ofs, orbit[j], sj);
-            }
-            if (orbit[0] != 0) {
-                rs[0].rand();
-                fun_mul(rs[0], 2);
-            }
-        }
-        return true;
-    }
-};
-
 class Rho
 {
 private:
@@ -4833,20 +4462,13 @@ public:
     }
     void prepare()
     {
-        // 仿射点加: 预展开 adds_pub[0][*] 到内部 fe 表示。
+        // 仿射点加: 预展开 adds_pub[*] 到内部 fe 表示。
         // 必须在这里 (worker 线程启动前) 做一次。
         rho_affine_prepare();
     }
 
     bool shoot(const int i, RhoState* rs, unsigned int& count_dstg, std::string& log)
     {
-        // ------------------------------------------------------------------
-        // 旧实现: libsecp256k1 公开 API 的点加 (ge 解析 + 完整群运算)。
-        // 保留备查 / 需要对照时启用。注意: 它与 rho_affine_FW 各有自己的线程
-        // 局部状态缓存, 不要在同一个线程里交替调用。
-        // ------------------------------------------------------------------
-        // rho_F(ctx, rs[0]);
-
         // 同一线程内 WALKERS 个 walker 交错走一步: WALKERS 次模逆 -> 1 次。
         // 返回值是 DP 命中掩码; 未命中的 walker 状态留在 rho.cpp 的线程局部
         // cache 里, rs[k] 的 x/m/n 只在命中时才是新值 (times 始终每步递增)。
@@ -4871,7 +4493,10 @@ public:
                 saveDP(_dplog.ofs, orbit[j], sj);
             }
             // 换起点: 只有 p 自己命中 (orbit[0] != 0) 才换, 与设备端 reset_start_point
-            // 的条件一致。CPU 侧没有预备队池, 直接换一个随机点。
+            // 的条件一致。CPU 侧换什么点由 -cpusource 决定 (见 common.h 的
+            // g_cpu_start_source):
+            //   1 类 -> 随机点 (改造前就是这一种)
+            //   2 类 -> 特殊点序列 (adds_pub 的 256 条 + k*G 阶梯)
             //
             // ⚠ 只有**非 0 线程**换:** 线程 0 命中后不换, 继续从当前点往前走。
             //   线程 0 是"单链速度优先"那一档 (RHO_WALKERS0 = 2, 见 common.h), 它的
@@ -4883,9 +4508,12 @@ public:
             // 成新起点。⚠ times 必须一并清零: 线程局部 cache 靠
             // "cache.synced_times[i] != rs[i].times" 判断外部重置, 只改点不改 times
             // 的话下次 rho_affine_FW 会继续用缓存里的旧状态, 这次重置静默失效。
+            // (2 类那条路自己在 rho_cpu_next_start 里就清了 times; 随机这一条在这里清。)
             if (i != 0 && orbit[0] != 0) {
-                rs[k].rand();
-                rs[k].times = 0;
+                if (!rho_cpu_next_start(rs[k])) {
+                    rs[k].rand();
+                    rs[k].times = 0;
+                }
             }
         }
         return true;
@@ -4930,6 +4558,9 @@ void play() {
     }
     PLAYER _player;
     _player.prepare();
+    // CPU 侧换起点序列的游标: 必须在**起 worker 线程之前**回读, 否则头几条特殊点
+    // 会跟上一次 run 逐字节重复。只在 -cpusource 2 时真的读写 (见 rho.cpp)。
+    rho_cpu_start_restore();
     // 每个线程交错推进 W 个 walker (见 rpc/rho.cpp 的批量求逆)。
     // 线程0 用窄批 W0 (单条链推进快, 单线程模式也只有它), 其余线程用宽批 W
     // (总吞吐高), 宽度由 PLAYER 按线程号分派。
@@ -4959,6 +4590,10 @@ void play() {
             iLog _dplog(_DPFile_name);
         }
         saveStates();
+        // CPU 侧游标与状态存档同节奏落盘: 两者都是"这一轮走到哪儿"的凭据,
+        // 分开落会出现"点存档新、游标旧"的中间态 (最坏重发几条点, 不算错,
+        // 但没必要)。只在 -cpusource 2 时真写。
+        rho_cpu_start_save();
         pause = false;
     };
     std::barrier barrier(n_tasks, on_barrier);
@@ -5058,6 +4693,9 @@ void play() {
         t.join();
     }
     saveStates();
+    // 退出前再落一次游标: 最后一次 on_barrier 之后 worker 线程还走了几步 (命中换
+    // 起点会推游标), 不落的话重启后那几条会被重发。只在 -cpusource 2 时真写。
+    rho_cpu_start_save();
     g_log->ofs << get_time() << " : ";
     for (int i = 0; i < n_tasks; i++) {
         g_log->ofs << _logvec[i];
@@ -5325,25 +4963,6 @@ static RPCHelpMan testmvp()
                 }
                 assert(chars[0] != chars[1] || chars[2] != chars[3] || chars[1] != chars[4]);
 
-                //测试 saveDP 和 loadDP                
-                /* {
-                    iLog _testlog(data_file("test.txt"));
-                    std::map<uint64_t, SecPair> _testMap;
-                    RhoState rss[1024];
-                    for (RhoState& r : rss) {
-                        r.rand();
-                        uint64_t t = *(uint64_t*)r.x.data;
-                        saveDP(_testlog.ofs, t, r);
-                    }
-                    loadDP(_testlog.ifs, _testMap);
-                    for (RhoState& r : rss) {
-                        uint64_t t = *(uint64_t*)r.x.data;
-                        auto it = _testMap.find(t);
-                        assert(it != _testMap.end() && it->second == r);
-                    }
-                }
-                std::remove(data_file("test.txt").c_str());*/
-
                 //测试CUDA
                 //validate_test();
             }
@@ -5358,153 +4977,6 @@ static RPCHelpMan testmvp()
                 std::string strSecret = read_key();
                 CKey key2 = DecodeSecret(strSecret);
                 assert(key2.VerifyPubKey(pbkey));
-            }
-
-            auto judge = [&node]() {
-                while (!gameover) {
-                    try {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-                        node.rpc_interruption_point();
-                    } catch (...) {
-                        stop_game();
-                    }
-                }
-            };
-
-            // 写入文件的lambda
-            auto write_num = [](const std::string& filename, uint64_t num) {
-                std::ofstream file(filename);
-                file << num << " ";
-            };
-
-            // 读取文件的lambda
-            auto read_num = [](const std::string& filename) -> uint64_t {
-                uint64_t num = 0;
-                std::ifstream file(filename);
-                if (file.is_open()) {
-                    file >> num;
-                }
-                return num;
-            };
-
-            const std::string babynum_file = data_file("baby_map\\babynum.txt");
-            //生成babystep
-            if (ta == 118) {
-                assert(ta2 > 0);
-                BabyNUM = ta2;
-                
-                int times = 6;
-                uint64_t batch = (ta2 + times - 1) / times;
-                int64_t total = 0;
-                uint64_t base = 1;
-                for (int i = 0; i < times; i++) {
-                    if (i == times - 1) {
-                        batch = ta2 - batch * i;
-                    }
-                    std::multimap<uint64_t, uint64_t> theMap;
-                    char filename[256] = {0};
-                    snprintf(filename, sizeof(filename), "%s",
-                             data_file(("baby_map\\baby_map" + std::to_string(base) + ".txt").c_str()).c_str());
-                    base = buildBabyMap(theMap, batch, base);
-                    //检测key冲突,这里需要进一步的解决方案
-                    assert(theMap.size() == batch);
-                    save_map(theMap, filename);
-                    total += batch;
-                }
-                write_num(babynum_file, total);
-                unspent.pushKV("num", total);
-            }
-            //加载babystep 并简单测试
-            if (ta == 119) {
-                std::vector<uint64_t> _Xvec;
-                std::vector<uint64_t> _Mvec;
-                if (ta2 == 888) {
-                    BabyNUM = read_num(babynum_file);
-                    _Xvec.reserve(BabyNUM);
-                    _Mvec.reserve(BabyNUM);
-                    read_map(_Xvec, _Mvec, 0, "baby");
-                    std::cout << "read_map finished!" << std::endl;
-                    saveVectorToFile<uint64_t>(_Xvec, _Xvec_name);
-                    saveVectorToFile<uint64_t>(_Mvec, _Mvec_name);
-                    assert(_Xvec.size() == BabyNUM); 
-                } else {
-                    _Mvec = loadVectorFromFile<uint64_t>(_Mvec_name);
-                    _Xvec = loadVectorFromFile<uint64_t>(_Xvec_name);
-                    BabyNUM = _Xvec.size();
-                }
-                assert(_Xvec.size() == _Mvec.size());
-                //4GG
-                CPubKey cpbkey1(ParseHex("04100f44da696e71672791d0a09b7bde459f1215a29b3c03bfefd7835b39a48db0dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"));
-                secp256k1_pubkey pk_parsed;
-                secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey1.data(), cpbkey1.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0);
-                //1G
-                CPubKey cpbkey2(ParseHex("0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"));
-                secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2.data(), cpbkey2.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 1);
-                //-(0x123G )
-                CPubKey cpbkey2neg(ParseHex("049bdf9e67a5d0c9956a075a010fe762beb633500431dee78efebc527e53313b336bd9b9de5a69f1f11db3d86d90e9352d6f80d9c989d172a5e816b5017162d07f"));
-                secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey2neg.data(), cpbkey2neg.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == -0x123);
-                // fffffffG
-                CPubKey cpbkey3(ParseHex("045091541f5851647a93df0c14152a4516169b5bd6acf793dee8c9dfa27710e4b0ec29eeaf3d880023f13d2608200ec283c971081ee88ec05247bf6d65b57e8537"));
-                secp256k1_ec_pubkey_parse(ctx, &pk_parsed, cpbkey3.data(), cpbkey3.size());
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_parsed) == 0xfffffff);
-                unspent.pushKV("num", _Xvec.size());
-                //BabyNUM G
-                secp256k1_pubkey pk_babynum;
-                unsigned char cm[33] = {0};                
-                set_int(cm, BabyNUM);
-                secp256k1_ec_pubkey_create(ctx, &pk_babynum, cm);
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_babynum) == BabyNUM);
-                secp256k1_ec_pubkey_negate(ctx, &pk_babynum);
-                assert(find_baby(ctx, _Xvec, _Mvec, pk_babynum) == -BabyNUM);
-                //检查最大m
-                auto maxIt = std::max_element(_Mvec.begin(), _Mvec.end());
-                assert(*maxIt == BabyNUM);
-                //检查排序
-                assert(std::is_sorted(_Xvec.begin(), _Xvec.end()));
-                //测试重复的x元素
-                auto it = std::adjacent_find(_Xvec.begin(), _Xvec.end());
-                if (it != _Xvec.end()) {
-                    std::ptrdiff_t index = std::distance(_Xvec.begin(), it);
-                    auto m = _Mvec[index];
-                    unsigned char c_dup[33] = {0};
-                    set_int(c_dup, m);
-                    secp256k1_pubkey pk_dup = {0};
-                    secp256k1_ec_pubkey_create(ctx, &pk_dup, c_dup);
-                    assert(find_baby(ctx, _Xvec, _Mvec, pk_dup) == m);
-                } else {
-                    assert(BabyNUM < 0x2FFFFFFFF);
-                }
-
-
-                //测试 giantStep
-                unsigned char c_babynum_neg[33] = {0};
-                set_int(c_babynum_neg, BabyNUM);
-                secp256k1_ec_seckey_negate(ctx, c_babynum_neg);
-
-                auto N_1 = ParseHex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140");
-                int64_t find_ret[3] = {BabyNUM - 1, -1, -BabyNUM};
-                RhoState rs = {0};
-                memcpy(rs.m, N_1.data(), N_1.size());
-                for (int j = 0; j < 3; j++) {
-                    secp256k1_ec_seckey_tweak_add(ctx, rs.m, c_babynum_neg);
-                    if (j == 2) {
-                        unsigned char c_one[33] = {0};
-                        c_one[31] = 0x01;
-                        secp256k1_ec_seckey_tweak_add(ctx, rs.m, c_one);
-                    }
-                    create(ctx, &rs.x, rs.m, rs.n);                    
-                    RhoState tmp = rs;
-                    assert(find_baby(ctx, _Xvec, _Mvec, tmp.x) == 0);
-                    giantStep(ctx, tmp);
-                    assert(find_baby(ctx, _Xvec, _Mvec, tmp.x) == find_ret[j]);
-                }
-
-                if (ta2 == 0) {
-                    g_log->ofs << "BabyNUM: " << BabyNUM << std::endl;
-                }
             }
 
             //32 位 DP 库跟 data 语料的对账自检 —— 两种库侧口径:
@@ -5537,32 +5009,6 @@ static RPCHelpMan testmvp()
             //testmvp 120 892
             if (ta == 120 && ta2 == 892) {
                 rho_rewalk_probe();
-            }
-            //测试 rho_F 与 rho_Fi 或者 giantStep 与 giantStepi
-            if (ta == 121) {
-                RhoState rs[RHO_STATE_SLOTS] = {0};
-                loadRhoState(rs, sizeof(rs) / sizeof(RhoState), _RSFile1_name);
-                auto f = rho_F;
-                auto fi = rho_Fi;
-                if (ta2 == 1) {
-                    f = giantStep;
-                    fi = giantStepi;
-                }
-                for (int ii = 0; ii < 32; ii++) {
-                    int i = 10000;
-                    while (--i > 0) {
-                        assert(check(ctx, &rs[ii].x, rs[ii].m, rs[ii].n));
-                        RhoState tmp = rs[ii];
-                        f(ctx, rs[ii]);
-                        RhoState ret[32] = {0};
-                        int c = fi(ctx, &rs[ii], ret);
-                        bool b = false;
-                        for (int j = 0; j < c; j++) {
-                            b = b || (secp256k1_ec_pubkey_cmp(ctx, &ret[j].x, &tmp.x) == 0);
-                        }
-                        assert(b);
-                    }
-                }
             }
             if (ta == 8) {
                 // ta2 == 1: 40 位 DP 文本归档 DistinguishablePoints.txt (三行一条)
@@ -5856,53 +5302,6 @@ static RPCHelpMan testmvp()
                             }
                         }
                     }
-                    /*
-                    // 2) 继续读取 ../../../../data 下的额外DP文件
-                    //    - DistinguishablePoints_rho.txt
-                    //    - DistinguishablePoints_rhoN.txt (N为数字)
-                    const std::string dataDir = "../../../../data/";
-                    const fs::path dataDirPath = fs::u8path(dataDir);
-                    if (!stop && fs::exists(dataDirPath)) {
-                        const std::string prefix = "DistinguishablePoints_rho";
-                        const std::string suffix = ".txt";
-
-                        // 统一枚举 ../../../../data 下所有 DistinguishablePoints_rho*.txt 文件
-                        //   * 为空   → DistinguishablePoints_rho.txt
-                        //   * 为数字 → DistinguishablePoints_rhoN.txt
-                        // 每个文件只处理一次，避免重复读取导致的短循环误判
-                        {
-                            std::vector<fs::path> rho_files;
-                            for (const auto& entry : fs::directory_iterator(dataDirPath)) {
-                                if (!entry.is_regular_file()) continue;
-                                std::string fname = entry.path().filename().string();
-                                if (!fname.starts_with(prefix) || !fname.ends_with(suffix)) continue;
-                                std::string mid = fname.substr(prefix.size(),
-                                                               fname.size() - prefix.size() - suffix.size());
-                                // mid 为空(rho.txt) 或纯数字(rhoN.txt) 才是目标文件
-                                bool valid = mid.empty();
-                                if (!valid) {
-                                    valid = true;
-                                    for (char c : mid) {
-                                        if (c < '0' || c > '9') { valid = false; break; }
-                                    }
-                                }
-                                if (valid) {
-                                    rho_files.push_back(entry.path());
-                                }
-                            }
-                            std::sort(rho_files.begin(), rho_files.end());
-                            for (const auto& f : rho_files) {
-                                std::ifstream ifs(f);
-                                if (ifs.is_open()) {
-                                    if (processDPStream(ifs) != 0) {
-                                        stop = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    */
                     unspent.pushKV("num", dpMap.size());
                     unspent.pushKV("idx_dup_diff", n_idx_dup_diff);
                     unspent.pushKV("k40_files", n_k40_files);
@@ -6074,10 +5473,7 @@ static RPCHelpMan testmvp()
                     unspent.pushKV("src_none", n_src_none);
                     unspent.pushKV("str2", first_bad);
                     unspent.pushKV("num", n_lines);
-                } /* else {
-                    std::thread t(judge);
-                    play<Rho>();
-                }*/
+                }
             }
 
             return unspent;
