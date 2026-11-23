@@ -300,17 +300,18 @@ constexpr uint32_t    DP32_VERSION       = 1;
 //                     而是改判 40 位落进 DistinguishablePoints.txt (见 cuda.cu 的 rho_w)。
 //                     ⚠ **旧文件兼容**: 盘上现有文件里有约 7 万行起点列 = 2^64-1
 //                     (EDGE_SRC_NONE) 的记录 —— 那是过去 βp / β²p 命中写下的, 新代码不再
-//                     产生这类行, 但读侧 (count_edge_lines / testmvp 8 2) 必须继续接受,
-//                     当成"追不到来源"计数。因此行数**不能**再拿来跟游标互校。
+//                     产生这类行, 但读侧 (testmvp 8 2) 必须继续接受, 当成“追不到来源”计数。
 //   Dp32EdgeState.txt 每槽 4 行: x / m / n / 起点索引, 与 RhoState 文本格式逐字一致
 //                     (第 4 行的 times 字段在这里被借用来存起点索引: 起点漫游不数
 //                     步数, 所以 times 空着, 直接拿来放索引, 就能白嫖
-//                     loadRhoState / saveRhoState 这一对读写函数)。
-//                     库游标就藏在这一列里: 库位置是按游标递增发的, 派出去的最大那个
-//                     索引值还握在某个活槽手上, 所以"把它换算成库位置再 + 1"就是游标,
-//                     不必另存一份。注意索引值 (x 的 bit 32..95) 能到 9e17, **不能**直接
-//                     当位置用 —— 换算靠库内二分 (库按索引升序), 见 cuda.cu 的
-//                     dp32_edge_session。
+//                     loadRhoState / save_RhoStates_dev 这一对读写函数)。
+//                     这一列现在只用来区分两种槽: 非哨兵 = 活槽 (手上仍握着某个库 DP
+//                     当起点, 还会再产一条可追溯的边), 哨兵 = 空槽 (随机起点, 只能命中
+//                     40 位档案)。库里的起点已经全部派发完毕, 所以**不再从库里取新起点**,
+//                     也没有游标要维护 —— 活槽命中一次就换成随机起点 (变空槽), 活槽数
+//                     单调下降, 到 0 即收工。
+//                     ⚠ 因此这份状态文件是**唯一**的活槽凭据 (库已不再发放起点, 丢了
+//                     就没处再补)。备份/保住它比以往更重要。
 // 起点索引的哨兵值 EDGE_SRC_NONE 见 cuda.cu。
 constexpr const char* DP32_EDGE_NAME       = "Dp32Edge.txt";
 constexpr const char* DP32_EDGE_STATE_NAME = "Dp32EdgeState.txt";
